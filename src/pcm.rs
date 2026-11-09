@@ -24,6 +24,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::agents::Agent;
 use crate::celmux::Client;
 
 /// The client's opening line.
@@ -38,17 +39,22 @@ pub const FRAME_INTERVAL: Duration = Duration::from_millis(20);
 pub const SAMPLE_RATE: u32 = 8_000;
 
 /// Accept PCM connections until the listener closes.
-pub fn serve(listener: TcpListener, client: Arc<Client>) {
+///
+/// One listener per agent: a PCM stream is a bare socket with a handshake and
+/// no request framing, so it cannot carry an id that would let several agents
+/// share a port.
+pub fn serve(listener: TcpListener, client: Arc<Client>, agent: Arc<Agent>) {
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let client = Arc::clone(&client);
+        let agent = Arc::clone(&agent);
         std::thread::spawn(move || {
-            let _ = handle(stream, client);
+            let _ = handle(stream, client, agent);
         });
     }
 }
 
-fn handle(mut stream: TcpStream, client: Arc<Client>) -> std::io::Result<()> {
+fn handle(mut stream: TcpStream, client: Arc<Client>, agent: Arc<Agent>) -> std::io::Result<()> {
     let _ = stream.set_nodelay(true);
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
@@ -67,16 +73,21 @@ fn handle(mut stream: TcpStream, client: Arc<Client>) -> std::io::Result<()> {
     // audio, so the gateway learns it from the first frame's owner. Until then
     // it has nothing to bridge, which is the honest state right after the
     // handshake.
-    let call_id = client.active_call_id();
+    // The gateway belongs to one agent, so it bridges that agent's line: a
+    // second phone on the same port would otherwise be handed someone else's
+    // audio.
+    let line = agent.config.line_id.clone();
+    let call_id = client.active_call_id(&line);
 
     let read_half = stream.try_clone()?;
     let reader = {
         let client = Arc::clone(&client);
-        std::thread::spawn(move || read_loop(read_half, client, call_id))
+        let line_id = line.clone();
+        std::thread::spawn(move || read_loop(read_half, client, call_id, line_id))
     };
     let writer = {
         let client = Arc::clone(&client);
-        std::thread::spawn(move || write_loop(stream, client, call_id))
+        std::thread::spawn(move || write_loop(stream, client, call_id, line))
     };
     // Either direction ending means the call is over for this client.
     let _ = reader.join();
@@ -85,7 +96,7 @@ fn handle(mut stream: TcpStream, client: Arc<Client>) -> std::io::Result<()> {
 }
 
 /// Phone -> Celmux: 320-byte frames in, resampled by Celmux on the way out.
-fn read_loop(mut stream: TcpStream, client: Arc<Client>, call_id: Option<u64>) {
+fn read_loop(mut stream: TcpStream, client: Arc<Client>, call_id: Option<u64>, line_id: String) {
     let mut frame = vec![0_u8; FRAME_BYTES];
     loop {
         match stream.read_exact(&mut frame) {
@@ -98,7 +109,7 @@ fn read_loop(mut stream: TcpStream, client: Arc<Client>, call_id: Option<u64>) {
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 ) =>
             {
-                if !client.call_still_active(call_id) {
+                if !client.call_still_active(&line_id, call_id) {
                     return;
                 }
                 continue;
@@ -113,11 +124,11 @@ fn read_loop(mut stream: TcpStream, client: Arc<Client>, call_id: Option<u64>) {
 }
 
 /// Celmux -> phone: pull a block, pace it to 20 ms, write it.
-fn write_loop(mut stream: TcpStream, client: Arc<Client>, call_id: Option<u64>) {
+fn write_loop(mut stream: TcpStream, client: Arc<Client>, call_id: Option<u64>, line_id: String) {
     loop {
         let Some(call_id) = call_id else {
             std::thread::sleep(FRAME_INTERVAL);
-            if !client.call_still_active(None) {
+            if !client.call_still_active(&line_id, None) {
                 return;
             }
             continue;
@@ -138,7 +149,7 @@ fn write_loop(mut stream: TcpStream, client: Arc<Client>, call_id: Option<u64>) 
             // from spinning against Celmux while an idle call holds the line.
             Ok(None) => std::thread::sleep(FRAME_INTERVAL),
             Err(_) => {
-                if !client.call_still_active(Some(call_id)) {
+                if !client.call_still_active(&line_id, Some(call_id)) {
                     return;
                 }
                 std::thread::sleep(FRAME_INTERVAL);

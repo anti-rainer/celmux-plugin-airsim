@@ -61,6 +61,9 @@ impl std::fmt::Display for AuthError {
 }
 
 /// Verifies requests and remembers the nonces it has accepted.
+///
+/// One verifier per agent: the nonce memo is scoped to the key that accepted it,
+/// and two agents never share a secret.
 pub struct Verifier {
     key: Vec<u8>,
     /// Accepted nonces, each with the instant it stops being interesting.

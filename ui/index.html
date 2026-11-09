@@ -1,0 +1,391 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AirSIM 桥接设置</title>
+<style>
+  :root {
+    --bg: #ffffff; --fg: #1f2937; --muted: #6b7280; --border: #e5e7eb;
+    --accent: #7c3aed; --ok: #059669; --warn: #d97706; --err: #dc2626;
+    --panel: #f9fafb;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #111827; --fg: #f3f4f6; --muted: #9ca3af; --border: #374151;
+      --panel: #1f2937;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 16px; background: var(--bg); color: var(--fg);
+    font: 14px/1.5 -apple-system, system-ui, "Segoe UI", "Noto Sans SC", sans-serif;
+  }
+  h2 { font-size: 15px; margin: 0 0 4px; }
+  h3 { font-size: 13px; margin: 20px 0 8px; color: var(--muted);
+       text-transform: uppercase; letter-spacing: .04em; }
+  p.hint { color: var(--muted); font-size: 12px; margin: 0 0 12px; }
+  .card { border: 1px solid var(--border); border-radius: 10px;
+          padding: 14px; margin-bottom: 12px; }
+  .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .row + .row { margin-top: 10px; }
+  .grow { flex: 1; min-width: 160px; }
+  label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+  input, select {
+    width: 100%; padding: 7px 9px; border-radius: 7px; font: inherit;
+    border: 1px solid var(--border); background: var(--bg); color: var(--fg);
+  }
+  input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  button {
+    padding: 7px 14px; border-radius: 7px; font: inherit; cursor: pointer;
+    border: 1px solid var(--border); background: var(--panel); color: var(--fg);
+  }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.danger { color: var(--err); border-color: var(--err); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  .tag { font-size: 11px; padding: 2px 8px; border-radius: 999px;
+         border: 1px solid var(--border); color: var(--muted); }
+  .tag.ok { color: var(--ok); border-color: var(--ok); }
+  .tag.warn { color: var(--warn); border-color: var(--warn); }
+  .code {
+    font: 600 26px/1 ui-monospace, monospace; letter-spacing: .18em;
+    padding: 12px; text-align: center; background: var(--panel);
+    border-radius: 8px; border: 1px dashed var(--accent); color: var(--accent);
+  }
+  .mono { font-family: ui-monospace, monospace; font-size: 12px; }
+  .err { color: var(--err); font-size: 12px; }
+  .muted { color: var(--muted); font-size: 12px; }
+  .agent { border: 1px solid var(--border); border-radius: 10px;
+           padding: 12px; margin-bottom: 10px; }
+  .agent-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+  .agent-name { font-weight: 600; }
+</style>
+</head>
+<body>
+  <h2>AirSIM 桥接</h2>
+  <p class="hint">
+    每条 Celmux 线路对应一个 agent。AirSIM 的模型是一台设备一张卡，
+    所以想在手机上看到几条线路，就在这里建几个 agent。
+  </p>
+
+  <h3>线路分配</h3>
+  <div id="assignment"></div>
+  <div class="row" style="margin-top:8px">
+    <button id="add-line">+ 添加线路</button>
+    <button id="save" class="primary">保存并应用</button>
+  </div>
+  <p class="hint" id="save-note" style="margin-top:8px"></p>
+
+  <h3>已运行的 agent</h3>
+  <div id="agents"><p class="muted">载入中…</p></div>
+
+  <h3>在 AirSIM 客户端里配对</h3>
+  <div class="card">
+    <p class="hint">
+      点「开始配对」后这里会显示一个 6 位验证码。在 iOS 的 AirSIM 里选
+      「手动地址配对」，填入本机地址、对应 agent 的控制端口，再输入这个验证码。
+      验证码 5 分钟内有效，只显示这一次。
+    </p>
+    <div id="pairing"></div>
+  </div>
+
+  <script>
+  // The page runs inside Celmux's settings, served from this plugin's own
+  // listener. It talks to that listener directly for its own state, and to
+  // Celmux for the line list and the plugin configuration.
+  const PLUGIN_BASE = '';
+
+  const state = {
+    lines: [],       // Celmux lines available to assign
+    assignment: [],  // [{line_id, name, control_port, pcm_port}]
+    agents: [],
+    codes: {},       // agent_id -> {code, expires_at}
+    pluginUrl: '',
+    token: '',
+  };
+
+  function el(tag, props = {}, children = []) {
+    const node = document.createElement(tag);
+    Object.assign(node, props);
+    for (const child of children) {
+      node.append(child instanceof Node ? child : document.createTextNode(String(child)));
+    }
+    return node;
+  }
+
+  /**
+   * Where Celmux's API lives.
+   *
+   * The page is same-origin with Celmux (Celmux serves the file), so relative
+   * paths reach it. The plugin's own endpoints are on its own port, so the host
+   * is this window's host with the plugin's port.
+   */
+  function celmuxApi(path) {
+    return path;
+  }
+
+  async function getToken() {
+    // Celmux's SPA keeps the session token in localStorage under "token". The
+    // iframe shares the origin, so the same key is readable here.
+    try {
+      const direct = localStorage.getItem('token') || sessionStorage.getItem('token');
+      if (direct) return direct;
+    } catch {}
+    return '';
+  }
+
+  async function celmuxFetch(path, options = {}) {
+    const token = await getToken();
+    const response = await fetch(celmuxApi(path), {
+      ...options,
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        ...(options.headers || {}),
+      },
+    });
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(text || `HTTP ${response.status}`);
+    }
+    return response.json();
+  }
+
+  async function pluginFetch(path, options = {}) {
+    const response = await fetch(PLUGIN_BASE + path, {
+      ...options,
+      headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
+    });
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(text || `HTTP ${response.status}`);
+    }
+    return response.json();
+  }
+
+  function lineLabel(line) {
+    const operator = line.n_standby ? (line.operator_name || '') : (line.operator_name || '');
+    const parts = [line.device_name];
+    if (operator) parts.push(operator);
+    if (line.local_phone) parts.push(line.local_phone);
+    return parts.filter(Boolean).join(' · ') || line.line_id;
+  }
+
+  async function loadLines() {
+    const data = await celmuxFetch('/api/plugin-api/__self__/lines').catch(() => null);
+    return data;
+  }
+
+  function render() {
+    // Assignment rows
+    const container = document.getElementById('assignment');
+    container.replaceChildren();
+    if (!state.assignment.length) {
+      container.append(el('p', { className: 'muted' }, ['还没有分配线路。点下面的按钮添加一条。']));
+    }
+    state.assignment.forEach((row, index) => {
+      const select = el('select', { className: 'grow' });
+      for (const line of state.lines) {
+        const option = el('option', { value: line.line_id }, [lineLabel(line)]);
+        option.selected = line.line_id === row.line_id;
+        select.append(option);
+      }
+      if (!state.lines.some((line) => line.line_id === row.line_id)) {
+        const option = el('option', { value: row.line_id }, [row.line_id + '（当前不可用）']);
+        option.selected = true;
+        select.append(option);
+      }
+      select.onchange = () => { row.line_id = select.value; };
+
+      const name = el('input', { className: 'grow', value: row.name || '', placeholder: '手机显示的名称（留空用线路名）' });
+      name.oninput = () => { row.name = name.value; };
+
+      const control = el('input', { type: 'number', value: row.control_port, style: 'width:110px' });
+      control.oninput = () => { row.control_port = Number(control.value) || 0; };
+
+      const pcm = el('input', { type: 'number', value: row.pcm_port, style: 'width:110px' });
+      pcm.oninput = () => { row.pcm_port = Number(pcm.value) || 0; };
+
+      const remove = el('button', { className: 'danger' }, ['移除']);
+      remove.onclick = () => { state.assignment.splice(index, 1); render(); };
+
+      container.append(el('div', { className: 'card' }, [
+        el('div', { className: 'row' }, [
+          el('div', { className: 'grow' }, [el('label', {}, ['线路']), select]),
+          el('div', { className: 'grow' }, [el('label', {}, ['名称']), name]),
+        ]),
+        el('div', { className: 'row' }, [
+          el('div', {}, [el('label', {}, ['控制端口']), control]),
+          el('div', {}, [el('label', {}, ['PCM 端口']), pcm]),
+          remove,
+        ]),
+      ]));
+    });
+
+    // Agents
+    const agents = document.getElementById('agents');
+    agents.replaceChildren();
+    if (!state.agents.length) {
+      agents.append(el('p', { className: 'muted' }, ['还没有运行的 agent。分配线路并保存后启动。']));
+    }
+    for (const agent of state.agents) {
+      const paired = agent.paired
+        ? el('span', { className: 'tag ok' }, ['已配对'])
+        : el('span', { className: 'tag warn' }, ['未配对']);
+      agents.append(el('div', { className: 'agent' }, [
+        el('div', { className: 'agent-head' }, [
+          el('span', { className: 'agent-name' }, [agent.name]),
+          paired,
+        ]),
+        el('div', { className: 'mono muted' }, [
+          `id=${agent.agent_id}  控制=${agent.control_port}  PCM=${agent.pcm_port}  线路=${agent.line_id}`,
+        ]),
+      ]));
+    }
+
+    // Pairing controls
+    const pairing = document.getElementById('pairing');
+    pairing.replaceChildren();
+    if (!state.agents.length) {
+      pairing.append(el('p', { className: 'muted' }, ['先让至少一个 agent 运行起来。']));
+    }
+    for (const agent of state.agents) {
+      const row = el('div', { className: 'row' });
+      row.append(el('span', { className: 'grow' }, [agent.name]));
+      const start = el('button', { className: 'primary' }, ['开始配对']);
+      start.onclick = () => startPairing(agent.agent_id);
+      row.append(start);
+      if (agent.paired) {
+        const unpair = el('button', { className: 'danger' }, ['解除配对']);
+        unpair.onclick = () => unpairAgent(agent.agent_id);
+        row.append(unpair);
+      }
+      pairing.append(row);
+
+      const code = state.codes[agent.agent_id];
+      if (code) {
+        const remaining = Math.max(0, Math.round((code.expires_at - Date.now()) / 1000));
+        pairing.append(el('div', { className: 'code' }, [code.code]));
+        pairing.append(el('p', { className: 'hint', style: 'text-align:center' }, [
+          `在上方 ${agent.name} 的配对页输入此验证码`,
+        ]));
+        pairing.append(el('p', { className: 'hint' }, [
+          `地址 ${location.hostname}  控制端口 ${agent.control_port}  剩余 ${remaining} 秒`,
+        ]));
+      }
+    }
+  }
+
+  async function startPairing(agentId) {
+    try {
+      const data = await pluginFetch('/api/pair', {
+        method: 'POST',
+        body: JSON.stringify({ agent_id: agentId }),
+      });
+      state.codes[agentId] = { code: data.code, expires_at: data.expires_at };
+      render();
+      setTimeout(() => {
+        // A code that is no longer live must stop being shown; the window
+        // itself is closed by the plugin, this only clears the display.
+        if (state.codes[agentId] && state.codes[agentId].expires_at <= Date.now()) {
+          delete state.codes[agentId];
+          render();
+        }
+      }, Math.max(1000, data.ttl_seconds * 1000));
+    } catch (error) {
+      alert('开始配对失败：' + error.message);
+    }
+  }
+
+  async function unpairAgent(agentId) {
+    if (!confirm('解除配对？手机需要重新配对才能再使用这个 agent。')) return;
+    try {
+      await pluginFetch('/api/unpair', {
+        method: 'POST',
+        body: JSON.stringify({ agent_id: agentId }),
+      });
+      await refreshStatus();
+    } catch (error) {
+      alert('解除配对失败：' + error.message);
+    }
+  }
+
+  async function refreshStatus() {
+    try {
+      const data = await pluginFetch('/api/status');
+      state.agents = data.agents || [];
+      render();
+    } catch (error) {
+      console.error(error);
+    }
+  }
+
+  async function loadConfig() {
+    // The assignment lives in Celmux's plugin configuration, so Celmux is what
+    // saves and returns it.
+    const data = await celmuxFetch('/api/plugins/airsim');
+    const raw = (data.plugin.config || {}).agents || '';
+    if (!raw.trim()) { state.assignment = []; return; }
+    try {
+      state.assignment = JSON.parse(raw);
+    } catch {
+      state.assignment = [];
+    }
+  }
+
+  async function save() {
+    const note = document.getElementById('save-note');
+    note.className = 'hint';
+    note.textContent = '保存中…';
+    try {
+      // Ports have to be free and distinct, which the plugin enforces by
+      // failing to bind; the page checks the obvious cases first so a save
+      // does not silently produce an agent that cannot start.
+      const seen = new Set();
+      for (const row of state.assignment) {
+        if (!row.line_id) throw new Error('有线路未选择');
+        if (row.control_port === row.pcm_port) throw new Error(`${row.line_id} 的控制端口与 PCM 端口相同`);
+        if (seen.has(row.control_port)) throw new Error(`控制端口 ${row.control_port} 重复`);
+        seen.add(row.control_port);
+      }
+      await celmuxFetch('/api/plugins/airsim/config', {
+        method: 'POST',
+        body: JSON.stringify({ values: { agents: JSON.stringify(state.assignment) } }),
+      });
+      note.textContent = '已保存。插件需要重启后按新分配重建 agent。';
+    } catch (error) {
+      note.className = 'err';
+      note.textContent = '保存失败：' + error.message;
+    }
+  }
+
+  document.getElementById('add-line').onclick = () => {
+    const used = new Set(state.assignment.map((row) => row.line_id));
+    const next = state.lines.find((line) => !used.has(line.line_id));
+    const base = 8642 + state.assignment.length * 10;
+    state.assignment.push({
+      line_id: next ? next.line_id : '',
+      name: '',
+      control_port: base,
+      pcm_port: base + 3,
+    });
+    render();
+  };
+  document.getElementById('save').onclick = save;
+
+  (async function init() {
+    try {
+      state.lines = (await celmuxFetch('/api/lines')).lines || [];
+    } catch (error) {
+      state.lines = [];
+    }
+    try {
+      await loadConfig();
+    } catch (error) {
+      console.error(error);
+    }
+    await refreshStatus();
+  })();
+  </script>
+</body>
+</html>

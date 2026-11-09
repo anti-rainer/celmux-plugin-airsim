@@ -14,19 +14,15 @@ use std::sync::Arc;
 
 use serde_json::{Value, json};
 
-use crate::auth::Verifier;
+use crate::agents::Agent;
 use crate::celmux::{Client, Line};
 use crate::http::{Request, Response};
 
 pub struct Control {
-    pub client: Client,
-    pub verifier: Verifier,
-    pub agent_id: String,
-    /// The host and ports this bridge advertised, so the phone can be told what
-    /// to dial for media.
+    pub client: Arc<Client>,
+    pub agent: Arc<Agent>,
+    /// The host the phone can reach, so it can be told what to dial for media.
     pub host: String,
-    pub control_port: u16,
-    pub pcm_port: u16,
 }
 
 /// One device as the phone understands it: a thing with a name that can place
@@ -72,8 +68,25 @@ impl Control {
         if request.path == "/healthz" {
             return Response::ok(json!({"ok": true}));
         }
+        // Before this agent has paired there is no secret, so nothing can be
+        // verified and the only thing worth answering is the pairing exchange.
+        // Read through the agent rather than a field set at startup: pairing
+        // happens while this listener is already running, and a verifier fixed
+        // at startup would keep the agent refusing the secret pairing just gave
+        // it.
+        let Some(verifier) = self.agent.verifier() else {
+            if let Some(response) = crate::pair_endpoint::handle(&self.agent, &request) {
+                return response;
+            }
+            return Response::error(
+                503,
+                "Service Unavailable",
+                "not_paired",
+                "该 agent 尚未配对，请先在 Celmux 插件设置中开始配对",
+            );
+        };
         let now = std::time::SystemTime::now();
-        if let Err(error) = self.verifier.verify(
+        if let Err(error) = verifier.verify(
             &request.method,
             &request.path,
             &request.body,
@@ -100,12 +113,18 @@ impl Control {
             .get(crate::auth::HEADER_NONCE)
             .cloned()
             .unwrap_or_default();
+        let agent_id = self.agent.id();
+        let proof = self
+            .agent
+            .verifier()
+            .map(|verifier| verifier.health_proof(&nonce, &agent_id))
+            .unwrap_or_default();
         Response::ok(json!({
             "ok": true,
-            "agent_id": self.agent_id,
-            "proof": self.verifier.health_proof(&nonce, &self.agent_id),
-            "control_port": self.control_port,
-            "pcm_port": self.pcm_port,
+            "agent_id": agent_id,
+            "proof": proof,
+            "control_port": self.agent.config.control_port,
+            "pcm_port": self.agent.config.pcm_port,
         }))
     }
 
@@ -122,8 +141,12 @@ impl Control {
                 );
             }
         };
+        // Only this agent's line: AirSIM's model is one card per agent, and a
+        // second entry would be a device the phone could dial but whose
+        // identity it could never ask about.
         let devices: Vec<Value> = devices(lines)
             .into_iter()
+            .filter(|device| device.line.line_id == self.agent.config.line_id)
             .map(|device| {
                 json!({
                     "id": device.id,

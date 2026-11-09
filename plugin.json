@@ -1,36 +1,15 @@
 {
   "id": "airsim",
   "name": "AirSIM 桥接",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "让 AirSIM iOS 客户端拨打本机的 VoWiFi/VoLTE 线路",
   "settings": [
     {
-      "key": "pairing_secret",
-      "label": "配对密钥",
-      "kind": "secret",
-      "default": "",
-      "hint": "32 字节 base64url。填进 AirSIM 客户端的配对页，手机用它给每个请求签名。"
-    },
-    {
-      "key": "agent_id",
-      "label": "设备名称",
-      "kind": "string",
-      "default": "celmux",
-      "hint": "手机设备列表里显示的名字。留空则用 celmux。"
-    },
-    {
-      "key": "control_port",
-      "label": "控制端口",
+      "key": "port",
+      "label": "插件端口",
       "kind": "number",
-      "default": "8642",
-      "hint": "AirSIM 客户端控制接口监听的端口。"
-    },
-    {
-      "key": "pcm_port",
-      "label": "PCM 端口",
-      "kind": "number",
-      "default": "8643",
-      "hint": "通话音频使用的端口。"
+      "default": "7593",
+      "hint": "插件设置的监听端口（仅 HTTP）。公网访问请自行在 nginx / Cloudflare Tunnel 中反代到这个端口。"
     },
     {
       "key": "advertise",
@@ -38,6 +17,13 @@
       "kind": "boolean",
       "default": "true",
       "hint": "关闭后需要在手机里手动填写地址。"
+    },
+    {
+      "key": "agents",
+      "label": "线路分配",
+      "kind": "secret",
+      "default": "",
+      "hint": "由插件自己的设置页面维护，手动编辑会破坏 JSON 结构。"
     }
   ],
   "permissions": [

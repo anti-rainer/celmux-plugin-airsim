@@ -191,13 +191,18 @@ impl Client {
     /// request that answered a call, so it has to learn which call it belongs
     /// to. Calling the call list is enough: a plugin carries one call at a time
     /// and the active one is the only call in a talking state.
-    pub fn active_call_id(&self) -> Option<u64> {
+    pub fn active_call_id(&self, line_id: &str) -> Option<u64> {
         let value = self.calls().ok()?;
         value
             .get("calls")
             .and_then(Value::as_array)?
             .iter()
             .find_map(|call| {
+                // Scoped to this agent's line: two agents bridge two calls at
+                // once, and each has to pick its own.
+                if call.get("line_id").and_then(Value::as_str) != Some(line_id) {
+                    return None;
+                }
                 let state = call.get("state").and_then(Value::as_str)?;
                 if !matches!(state, "active" | "connected" | "talking") {
                     return None;
@@ -214,8 +219,8 @@ impl Client {
     ///
     /// Passing `None` asks "is there any active call", which is what the gateway
     /// needs before it knows its own id.
-    pub fn call_still_active(&self, call_id: Option<u64>) -> bool {
-        match (self.active_call_id(), call_id) {
+    pub fn call_still_active(&self, line_id: &str, call_id: Option<u64>) -> bool {
+        match (self.active_call_id(line_id), call_id) {
             (Some(active), Some(expected)) => active == expected,
             (Some(_), None) => true,
             (None, _) => false,
