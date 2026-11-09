@@ -78,6 +78,9 @@ pub struct Agent {
     /// `None` until the phone pairs: pairing is what creates it, because the
     /// phone generates the secret and sends it inside the encrypted claim.
     secret: Mutex<Option<Vec<u8>>>,
+    /// Where this agent's secret is persisted, so a restart does not require
+    /// pairing again.
+    store: Option<crate::secrets::Store>,
     /// An open pairing window, if the operator started one.
     pairing: Mutex<Option<Session>>,
     /// The verifier for the current secret.
@@ -93,8 +96,40 @@ impl Agent {
         Self {
             config,
             secret: Mutex::new(secret),
+            store: None,
             pairing: Mutex::new(None),
             verifier: Mutex::new(None),
+        }
+    }
+
+    /// The same agent, but remembering its secret under `root`.
+    pub fn with_store(mut self, root: &std::path::Path) -> Self {
+        self.store = Some(crate::secrets::Store::new(root));
+        self
+    }
+
+    /// Forget the persisted secret, so the next restart does not read it back.
+    pub fn forget_secret(&self) {
+        let Some(store) = self.store.as_ref() else {
+            return;
+        };
+        if let Err(error) = store.forget(&self.id()) {
+            crate::log_warn!("celmux-plugin-airsim: 无法清除配对密钥: {error}");
+        }
+    }
+
+    /// Persist the current secret. Called by pairing, after it sets one.
+    pub fn persist_secret(&self) {
+        let Some(store) = self.store.as_ref() else {
+            return;
+        };
+        let Some(secret) = self.secret() else {
+            return;
+        };
+        if let Err(error) = store.save(&self.id(), &secret) {
+            // Not fatal: this process still has the pairing, and the operator
+            // learns on the next restart rather than losing it now.
+            crate::log_warn!("celmux-plugin-airsim: 配对密钥未能保存: {error}");
         }
     }
 
@@ -191,9 +226,29 @@ impl Agent {
 /// Shared behind an `Arc` because the control listener, the PCM listener and the
 /// settings page all reach it, and a pairing that starts in one must be visible
 /// to the others immediately.
-#[derive(Default)]
 pub struct Fleet {
     agents: Mutex<BTreeMap<String, Arc<Agent>>>,
+    /// The plugin's own directory, where pairing secrets are kept.
+    root: std::path::PathBuf,
+}
+
+impl Fleet {
+    /// A fleet that remembers its pairings under `root`.
+    pub fn new(root: &std::path::Path) -> Self {
+        Self {
+            agents: Mutex::new(BTreeMap::new()),
+            root: root.to_path_buf(),
+        }
+    }
+}
+
+impl Default for Fleet {
+    fn default() -> Self {
+        // Tests and probes get a fleet that forgets when it is dropped: a
+        // default that wrote to disk would let one test's pairing leak into
+        // another through a file neither of them named.
+        Self::new(std::path::Path::new("."))
+    }
 }
 
 impl Fleet {
@@ -207,18 +262,20 @@ impl Fleet {
             .agents
             .lock()
             .map_err(|_| "agent 表不可用".to_owned())?;
+        // Secrets live on disk as well as in memory, so an agent rebuilt for a
+        // renamed port - or one rebuilt after a restart - is still the agent the
+        // phone paired with.
+        let stored = crate::secrets::Store::new(&self.root).load();
         let mut next: BTreeMap<String, Arc<Agent>> = BTreeMap::new();
         for config in configs {
-            if let Some(existing) = agents.get(&config.line_id) {
-                // Same line, possibly renamed ports: keep the secret, adopt the
-                // new ports by rebuilding with the old secret.
-                next.insert(
-                    config.line_id.clone(),
-                    Arc::new(Agent::new(config, existing.secret())),
-                );
-            } else {
-                next.insert(config.line_id.clone(), Arc::new(Agent::new(config, None)));
+            let agent = Agent::new(config, None).with_store(&self.root);
+            let in_memory = agents
+                .get(&agent.config.line_id)
+                .and_then(|existing| existing.secret());
+            if let Some(secret) = in_memory.or_else(|| stored.get(&agent.id()).cloned()) {
+                agent.set_secret(secret);
             }
+            next.insert(agent.config.line_id.clone(), Arc::new(agent));
         }
         *agents = next;
         Ok(())
@@ -387,6 +444,30 @@ mod tests {
         assert_eq!(again.secret(), Some(vec![7; 32]));
         // The new ports are adopted, the secret is not lost.
         assert_eq!(again.config.control_port, 8652);
+    }
+
+    /// The whole reason secrets are written to disk: a new process - which is
+    /// what a restart, a config save and an upgrade all produce - must find the
+    /// pairing already there instead of asking the operator for six digits.
+    #[test]
+    fn a_restart_finds_the_pairing_on_disk() {
+        let root = std::env::temp_dir().join("celmux-airsim-restart");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        {
+            let fleet = Fleet::new(&root);
+            fleet.reconcile(vec![config("dji1", 8642)]).unwrap();
+            let agent = fleet.list().into_iter().next().unwrap();
+            agent.set_secret(vec![5; 32]);
+            agent.persist_secret();
+        }
+        // A fresh fleet over the same directory is what the next process has.
+        let restarted = Fleet::new(&root);
+        restarted.reconcile(vec![config("dji1", 8642)]).unwrap();
+        let agent = restarted.list().into_iter().next().unwrap();
+        assert_eq!(agent.secret(), Some(vec![5; 32]));
+        assert!(agent.verifier().is_some(), "the pairing must be usable");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Adding a line must not disturb the ones already paired.

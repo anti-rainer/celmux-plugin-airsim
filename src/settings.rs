@@ -203,6 +203,10 @@ fn unpair(fleet: &Arc<Fleet>, request: &Request) -> Response {
         return Response::error(404, "Not Found", "unknown_agent", "该 agent 不存在");
     };
     agent.clear_secret();
+    // Also from disk: clearing only memory would leave the old secret to be
+    // read back at the next restart, and an "unpaired" agent would start
+    // accepting requests from the phone it was just detached from.
+    agent.forget_secret();
     agent.close_pairing();
     Response::ok(json!({"ok": true, "agent_id": agent.id()}))
 }

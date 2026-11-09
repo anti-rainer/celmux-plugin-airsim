@@ -200,6 +200,145 @@ impl Client {
         self.request("GET", "/calls", None)
     }
 
+    /// Subscribe to the events Celmux pushes.
+    ///    /// One connection, held open, one JSON object per line. Celmux owns this
+    /// direction: an incoming call or a received message happens while the phone
+    /// is not asking, so the plugin has to be told rather than ask.
+    ///
+    /// The response is `Transfer-Encoding: chunked` and never ends, so the body
+    /// has to be decoded chunk by chunk: reading it line by line would hand the
+    /// JSON parser the chunk-size line instead of the frame.
+    pub fn subscribe<F>(&self, mut on_event: F) -> Result<(), Error>
+    where
+        F: FnMut(&Value),
+    {
+        let url = self.url("/events");
+        let parsed = split_url(&url)?;
+        let head = format!(
+            "GET {target} HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer {token}\r\n\
+             Accept: application/x-ndjson\r\nConnection: keep-alive\r\n\r\n",
+            target = parsed.target,
+            host = parsed.host,
+            token = self.token,
+        );
+        let mut stream = std::net::TcpStream::connect((parsed.host.as_str(), parsed.port))
+            .map_err(|error| Error::Transport(error.to_string()))?;
+        // No read timeout: this connection is supposed to sit idle for long
+        // stretches, and a timeout would look like a disconnect whenever nothing
+        // happened.
+        let _ = stream.set_read_timeout(None);
+        {
+            use std::io::Write;
+            stream
+                .write_all(head.as_bytes())
+                .map_err(|error| Error::Transport(error.to_string()))?;
+            stream.flush().ok();
+        }
+        use std::io::BufRead;
+        let mut reader = std::io::BufReader::new(stream);
+        // The status line is checked before anything else: a refused stream would
+        // otherwise look like an endless run of unparseable frames.
+        let mut status_line = String::new();
+        if reader
+            .read_line(&mut status_line)
+            .map_err(|error| Error::Transport(error.to_string()))?
+            == 0
+        {
+            return Err(Error::Transport("事件流没有响应".to_owned()));
+        }
+        let status: u16 = status_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
+        if !(200..300).contains(&status) {
+            return Err(Error::Transport(format!(
+                "事件流被拒绝: {}",
+                status_line.trim()
+            )));
+        }
+        let mut chunked = false;
+        loop {
+            let mut line = String::new();
+            if reader
+                .read_line(&mut line)
+                .map_err(|error| Error::Transport(error.to_string()))?
+                == 0
+            {
+                return Err(Error::Transport("事件流响应头不完整".to_owned()));
+            }
+            let trimmed = line.trim_end_matches(['\r', '\n']);
+            if trimmed.is_empty() {
+                break;
+            }
+            if let Some((name, value)) = trimmed.split_once(':')
+                && name.eq_ignore_ascii_case("transfer-encoding")
+                && value.to_ascii_lowercase().contains("chunked")
+            {
+                chunked = true;
+            }
+        }
+        // Frames accumulate here and are dispatched on whole lines: a chunk may
+        // split a JSON object in the middle, and a frame may span two chunks.
+        let mut pending = Vec::new();
+        loop {
+            if chunked && !read_chunk(&mut reader, &mut pending)? {
+                return Ok(());
+            }
+            if !chunked {
+                // No chunking: the body is the frames, read as it arrives.
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) => return Ok(()),
+                    Ok(_) => pending.extend_from_slice(line.as_bytes()),
+                    Err(error) => return Err(Error::Transport(error.to_string())),
+                }
+            }
+            while let Some(index) = pending.iter().position(|byte| *byte == b'\n') {
+                let line: Vec<u8> = pending.drain(..=index).collect();
+                let text = String::from_utf8_lossy(&line);
+                let trimmed = text.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+                    on_event(&value);
+                }
+            }
+        }
+    }
+
+    /// The state a plugin that just (re)connected has missed.
+    ///
+    /// The push stream only carries what happens while it is open, so a plugin
+    /// that started a moment ago would otherwise wait for the next call before
+    /// knowing one is already ringing.
+    pub fn events_snapshot(&self) -> Result<Value, Error> {
+        self.request("GET", "/events/once", None)
+    }
+
+    /// Recent messages as Celmux reports them, newest first.
+    pub fn messages(&self) -> Result<Value, Error> {
+        self.request("GET", "/sms", None)
+    }
+
+    /// Send one message on one line.
+    pub fn send_sms(&self, line_id: &str, to: &str, text: &str) -> Result<Value, Error> {
+        // Celmux's names, not the phone's: it wants `number` and `content` for a
+        // message, where the app says `phone` and `message`. Sending the app's
+        // words through unchanged is rejected with a missing-field error that
+        // names neither the field nor the caller.
+        self.request(
+            "POST",
+            "/sms",
+            Some(serde_json::json!({
+                "line_id": line_id,
+                "number": to,
+                "content": text,
+            })),
+        )
+    }
+
     /// What the phone's line card shows about the module and the card.
     ///
     /// Read from Celmux's device list, which is the only place that knows a
@@ -325,6 +464,59 @@ fn split_url(url: &str) -> Result<ParsedUrl, Error> {
 }
 
 /// Read one HTTP response with `Connection: close` semantics.
+/// Read one `Transfer-Encoding: chunked` chunk into `out`.
+///
+/// Returns `false` at the terminating zero-length chunk. The sizes are hex, and a
+/// chunk's trailing CRLF is part of the framing rather than the payload, so it is
+/// consumed here and never reaches the JSON parser.
+fn read_chunk(
+    reader: &mut impl std::io::BufRead,
+    out: &mut Vec<u8>,
+) -> Result<bool, Error> {
+    let mut size_line = String::new();
+    if reader
+        .read_line(&mut size_line)
+        .map_err(|error| Error::Transport(error.to_string()))?
+        == 0
+    {
+        return Ok(false);
+    }
+    // A chunk size may carry an extension after a semicolon; it is not part of
+    // the length.
+    let size_text = size_line.trim().split(';').next().unwrap_or("").trim();
+    if size_text.is_empty() {
+        // A blank line between chunks is framing noise, not the end of the body.
+        return Ok(true);
+    }
+    let size = usize::from_str_radix(size_text, 16)
+        .map_err(|_| Error::Transport(format!("分块长度无效: {size_text}")))?;
+    if size == 0 {
+        // Consume the trailer and the blank line that follows it.
+        loop {
+            let mut trailer = String::new();
+            if reader
+                .read_line(&mut trailer)
+                .map_err(|error| Error::Transport(error.to_string()))?
+                == 0
+            {
+                return Ok(false);
+            }
+            if trailer.trim().is_empty() {
+                return Ok(false);
+            }
+        }
+    }
+    let mut chunk = vec![0_u8; size];
+    reader
+        .read_exact(&mut chunk)
+        .map_err(|error| Error::Transport(error.to_string()))?;
+    out.extend_from_slice(&chunk);
+    // The CRLF after the payload.
+    let mut crlf = String::new();
+    let _ = reader.read_line(&mut crlf);
+    Ok(true)
+}
+
 fn read_http(stream: &mut dyn std::io::Read) -> Result<(u16, Vec<u8>), Error> {
     let mut raw = Vec::new();
     stream
@@ -347,6 +539,48 @@ fn read_http(stream: &mut dyn std::io::Read) -> Result<(u16, Vec<u8>), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Celmux answers a stream with `Transfer-Encoding: chunked`, so the frames
+    /// arrive wrapped in hex sizes. Reading them as plain lines hands the JSON
+    /// parser the size line instead of the frame - which is a silent stall, not a
+    /// visible error.
+    #[test]
+    fn a_chunked_stream_is_decoded_into_frames() {
+        let first = "{\"event\":\"call\",\"payload\":1}\n";
+        let second = "{\"event\":\"sms\",\"payload\":22}\n";
+        // The sizes are computed rather than written out, so the fixture cannot
+        // drift from what it claims to contain.
+        let input = format!(
+            "{:x}\r\n{first}\r\n{:x}\r\n{second}\r\n0\r\n\r\n",
+            first.len(),
+            second.len()
+        );
+        let mut reader = std::io::BufReader::new(input.as_bytes());
+        let mut out = Vec::new();
+        while read_chunk(&mut reader, &mut out).unwrap() {}
+        let text = String::from_utf8(out).unwrap();
+        let frames: Vec<&str> = text.lines().filter(|line| !line.is_empty()).collect();
+        assert_eq!(frames.len(), 2);
+        assert!(frames[0].contains("\"call\""));
+        assert!(frames[1].contains("\"sms\""));
+    }
+
+    /// A frame split across two chunks must still come out whole: the network
+    /// chooses where a chunk ends, not the writer.
+    #[test]
+    fn a_frame_split_across_chunks_is_reassembled() {
+        let first = "{\"event\":\"ca";
+        let second = "ll\"}\n";
+        let input = format!(
+            "{:x}\r\n{first}\r\n{:x}\r\n{second}\r\n0\r\n\r\n",
+            first.len(),
+            second.len()
+        );
+        let mut reader = std::io::BufReader::new(input.as_bytes());
+        let mut out = Vec::new();
+        while read_chunk(&mut reader, &mut out).unwrap() {}
+        assert_eq!(String::from_utf8(out).unwrap(), "{\"event\":\"call\"}\n");
+    }
 
     #[test]
     fn a_url_splits_into_host_port_and_target() {

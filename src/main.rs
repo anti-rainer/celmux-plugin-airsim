@@ -23,12 +23,16 @@ mod auth;
 mod celmux;
 mod config;
 mod control;
+mod control_api;
 mod discovery;
 mod http;
 mod logging;
 mod pair_endpoint;
+mod pair_probe;
 mod pairing;
 mod pcm;
+mod revision;
+mod secrets;
 mod settings;
 
 use std::collections::BTreeMap;
@@ -38,6 +42,12 @@ use agents::{Agent, Fleet};
 use config::Config;
 
 fn main() {
+    // The pairing probe is an operator tool, not a plugin run: it needs no
+    // environment and must work before anything else has been configured.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("pair-probe") {
+        std::process::exit(pair_probe::main(args.into_iter().skip(1).collect()));
+    }
     let mut config = match Config::from_env() {
         Ok(config) => config,
         Err(error) => {
@@ -92,7 +102,7 @@ fn main() {
         }
     }
 
-    let fleet = Arc::new(Fleet::default());
+    let fleet = Arc::new(Fleet::new(&root));
     // The assignment lives in Celmux's plugin configuration, so it survives a
     // restart of this process. Read it before opening any listener: a bridge
     // that starts with no agents accepts connections and answers none of them.
@@ -193,7 +203,10 @@ fn start_control_listener(agent: Arc<Agent>, client: Arc<celmux::Client>, host: 
     let control = Arc::new(control::Control {
         client,
         agent: Arc::clone(&agent),
+        revision: Arc::new(revision::Revision::default()),
     });
+    // Celmux pushes calls and messages; this is the thread that hears it.
+    Arc::clone(&control).follow_celmux();
     crate::log_info!(
         "celmux-plugin-airsim: agent {} 控制接口 http://{host}:{port}",
         agent.id()

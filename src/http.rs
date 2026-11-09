@@ -22,6 +22,13 @@ pub struct Request {
     pub method: String,
     /// Path without the query string.
     pub path: String,
+    /// The request target as sent, query string included.
+    ///
+    /// Routes match on `path`; the few that take parameters (the event long poll
+    /// asks for `after` and `timeout_ms`) read them from here, because a route
+    /// that cannot see its own query would have to hard-code the behaviour the
+    /// caller is asking for.
+    pub query: String,
     pub headers: HashMap<String, String>,
     pub body: Vec<u8>,
 }
@@ -108,9 +115,11 @@ pub fn read_request(stream: TcpStream) -> Result<Request, ReadError> {
     let target = parts.next().ok_or(ReadError::Malformed)?.to_owned();
     // The query string is dropped: no route this serves reads one, and a caller
     // that appended one would only be matching against a path it did not mean.
-    let path = target
+    let (path, query) = target
         .split_once('?')
-        .map_or(target.clone(), |(path, _)| path.to_owned());
+        .map_or((target.clone(), String::new()), |(path, query)| {
+            (path.to_owned(), query.to_owned())
+        });
     let mut headers = HashMap::new();
     loop {
         let mut line = String::new();
@@ -144,6 +153,7 @@ pub fn read_request(stream: TcpStream) -> Result<Request, ReadError> {
     Ok(Request {
         method,
         path,
+        query,
         headers,
         body,
     })

@@ -181,8 +181,14 @@ fn claim(agent: &Arc<Agent>, request: &Request) -> Response {
         );
     }
     // Store the secret before answering: a proof the phone accepts while the
-    // agent cannot verify its next request would drop the very first call.
+    // agent cannot verify its next request would drop the very first call. It
+    // is also written to disk, because a restart that forgot the pairing would
+    // make the operator walk to the web UI and read six new digits every time.
     agent.set_secret(secret.clone());
+    // Written through the agent, which knows where it lives: a restart that
+    // forgot the pairing would make the operator read six new digits every
+    // time the plugin restarts, which is every config save and every upgrade.
+    agent.persist_secret();
     agent.close_pairing();
     let proof = pairing::route_proof(
         &secret,
@@ -248,6 +254,7 @@ mod tests {
         Request {
             method: method.to_owned(),
             path: path.to_owned(),
+            query: String::new(),
             headers: std::collections::HashMap::new(),
             body: body.as_bytes().to_vec(),
         }
