@@ -81,7 +81,6 @@
   <nav class="tabs" id="tabs">
     <button class="tab active" data-tab="home">主页</button>
     <button class="tab" data-tab="lines">线路</button>
-    <button class="tab" data-tab="agents">Agent 配置</button>
     <button class="tab" data-tab="logs">插件日志</button>
     <button class="tab" data-tab="info">插件信息</button>
   </nav>
@@ -94,21 +93,11 @@
 
   <section class="panel" id="panel-lines">
     <p class="hint">
-      每条线路一个 Agent。想清手机上显示几条线路，就在这里把哪几条线路暴露出去。
-      点线路卡片可以配置这个 Agent 并开始配对。
+      点开一条线路，就能把它接入 AirSIM：每条线路一个 Agent，手机上有几条线路由此决定。
+      接入后 Celmux 会重启插件，让新的分配生效。
     </p>
     <div id="lines-list"></div>
-  </section>
-
-  <section class="panel" id="panel-agents">
-    <h3>线路分配</h3>
-    <p class="hint">保存后插件进程需要重启，才会按新的分配重建 Agent。</p>
-    <div id="assignment"></div>
-    <div class="row" style="margin-top:10px">
-      <button id="add-line">+ 添加线路</button>
-      <button id="save-assignment" class="primary">保存并应用</button>
-    </div>
-    <p class="hint" id="save-note" style="margin-top:8px"></p>
+    <p class="hint" id="save-note" style="margin-top:12px"></p>
   </section>
 
   <section class="panel" id="panel-logs">
@@ -125,7 +114,7 @@
   </section>
 
 <script>
-const state = { lines: [], agents: [], assignment: [], codes: {}, info: {}, openLine: '', token: '' };
+const state = { lines: [], agents: [], assignment: [], codes: {}, info: {}, openLine: '' };
 
 function el(tag, props = {}, children = []) {
   const node = document.createElement(tag);
@@ -134,28 +123,6 @@ function el(tag, props = {}, children = []) {
     node.append(child instanceof Node ? child : document.createTextNode(String(child)));
   }
   return node;
-}
-
-async function celmuxToken() {
-  if (state.token) return state.token;
-  try {
-    state.token = localStorage.getItem('token') || sessionStorage.getItem('token') || '';
-  } catch { state.token = ''; }
-  return state.token;
-}
-
-async function celmuxFetch(path, options = {}) {
-  const token = await celmuxToken();
-  const response = await fetch(path, {
-    ...options,
-    headers: {
-      'Content-Type': 'application/json',
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
-      ...(options.headers || {}),
-    },
-  });
-  if (!response.ok) throw new Error((await response.text()) || `HTTP ${response.status}`);
-  return response.json();
 }
 
 /**
@@ -171,8 +138,27 @@ const RUNTIME_BASE = (() => {
   return match ? `/api/plugins/${match[1]}/runtime` : '';
 })();
 
+/**
+ * The credential Celmux handed this page when it loaded it.
+ *
+ * An iframe navigation cannot carry a header, so Celmux put a short-lived token
+ * in this page's URL. Requests this page makes afterwards do not inherit it -
+ * the browser sends them afresh - so it has to be read back out and attached.
+ * Without it every relay call is refused as an unauthorised page.
+ */
+const PAGE_TOKEN = (() => {
+  try {
+    return new URLSearchParams(location.search).get('page_token') || '';
+  } catch {
+    return '';
+  }
+})();
+
 async function pluginFetch(path, options = {}) {
-  const response = await fetch(RUNTIME_BASE + path, {
+  const url = PAGE_TOKEN
+    ? `${RUNTIME_BASE}${path}${path.includes('?') ? '&' : '?'}page_token=${encodeURIComponent(PAGE_TOKEN)}`
+    : RUNTIME_BASE + path;
+  const response = await fetch(url, {
     ...options,
     headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
   });
@@ -228,7 +214,7 @@ function renderHome() {
   const container = document.getElementById('home-agents');
   container.replaceChildren();
   if (!state.agents.length) {
-    container.append(el('p', { className: 'hint' }, ['还没有暴露任何线路。到「线路」标签选一条，或在「Agent 配置」里分配。']));
+    container.append(el('p', { className: 'hint' }, ['还没有接入任何线路。到「线路」标签点开一条线路接入。']));
     return;
   }
   for (const agent of state.agents) {
@@ -296,6 +282,28 @@ function renderLineDetail(line) {
         `id ${agent.agent_id} · 控制端口 ${agent.control_port} · PCM 端口 ${agent.pcm_port}`,
       ])
     );
+    // Ports are edited here rather than on a separate page: they belong to this
+    // agent, and an operator changing one wants to see which line it serves.
+    const assignment = state.assignment.find((entry) => entry.line_id === line.line_id);
+    if (assignment) {
+      const control = el('input', { type: 'number', value: assignment.control_port, style: 'width:110px' });
+      control.onclick = (event) => event.stopPropagation();
+      control.onchange = () => {
+        assignment.control_port = Number(control.value) || 0;
+        void saveAssignment();
+      };
+      const pcm = el('input', { type: 'number', value: assignment.pcm_port, style: 'width:110px' });
+      pcm.onclick = (event) => event.stopPropagation();
+      pcm.onchange = () => {
+        assignment.pcm_port = Number(pcm.value) || 0;
+        void saveAssignment();
+      };
+      detail.append(el('div', { className: 'row', style: 'margin-top:10px' }, [
+        el('div', { style: 'width:130px' }, [el('label', {}, ['控制端口']), control]),
+        el('div', { style: 'width:130px' }, [el('label', {}, ['PCM 端口']), pcm]),
+      ]));
+    }
+
     const row = el('div', { className: 'row', style: 'margin-top:10px' });
     const pair = el('button', { className: 'primary' }, ['开始配对']);
     pair.onclick = (event) => { event.stopPropagation(); void startPairing(agent.agent_id); };
@@ -305,6 +313,9 @@ function renderLineDetail(line) {
       unpair.onclick = (event) => { event.stopPropagation(); void unpairAgent(agent.agent_id); };
       row.append(unpair);
     }
+    const removeLine = el('button', { className: 'danger' }, ['移出 AirSIM']);
+    removeLine.onclick = (event) => { event.stopPropagation(); void exposeLine(line); };
+    row.append(removeLine);
     detail.append(row);
 
     const code = state.codes[agent.agent_id];
@@ -317,24 +328,46 @@ function renderLineDetail(line) {
       );
     }
   } else {
-    detail.append(el('p', { className: 'hint' }, ['这条线路还没有暴露给 AirSIM。']));
-    const button = el('button', { className: 'primary' }, ['暴露给 AirSIM']);
-    button.onclick = (event) => { event.stopPropagation(); exposeLine(line); };
+    detail.append(el('p', { className: 'hint' }, ['这条线路还没有接入 AirSIM。']));
+    const button = el('button', { className: 'primary' }, ['接入 AirSIM']);
+    button.onclick = (event) => { event.stopPropagation(); void exposeLine(line); };
     detail.append(button);
   }
   return detail;
 }
 
-function exposeLine(line) {
-  const base = 8642 + state.assignment.length * 10;
-  state.assignment.push({
-    line_id: line.line_id,
-    name: line.device_name || line.line_id,
-    control_port: base,
-    pcm_port: base + 3,
-  });
-  switchTab('agents');
-  renderAssignment();
+/**
+ * The next free port pair.
+ *
+ * Each agent owns two ports - control and PCM - and they must not collide with
+ * one already assigned, or the second agent fails to bind at startup.
+ */
+function nextPorts() {
+  const used = new Set();
+  for (const row of state.assignment) {
+    used.add(Number(row.control_port));
+    used.add(Number(row.pcm_port));
+  }
+  let control = 8642;
+  while (used.has(control) || used.has(control + 3)) control += 10;
+  return { control, pcm: control + 3 };
+}
+
+/** Take a line into or out of the set AirSIM sees, and apply it. */
+async function exposeLine(line) {
+  const existing = state.assignment.findIndex((row) => row.line_id === line.line_id);
+  if (existing >= 0) state.assignment.splice(existing, 1);
+  else {
+    const ports = nextPorts();
+    state.assignment.push({
+      line_id: line.line_id,
+      name: line.device_name || line.line_id,
+      control_port: ports.control,
+      pcm_port: ports.pcm,
+    });
+  }
+  await saveAssignment();
+  await refresh();
 }
 
 async function startPairing(agentId) {
@@ -359,54 +392,10 @@ async function unpairAgent(agentId) {
   }
 }
 
-function renderAssignment() {
-  const container = document.getElementById('assignment');
-  container.replaceChildren();
-  if (!state.assignment.length) {
-    container.append(el('p', { className: 'hint' }, ['还没有分配线路。']));
-    return;
-  }
-  state.assignment.forEach((row, index) => {
-    const select = el('select');
-    for (const line of state.lines) {
-      const option = el('option', { value: line.line_id }, [lineLabel(line)]);
-      option.selected = line.line_id === row.line_id;
-      select.append(option);
-    }
-    if (!state.lines.some((line) => line.line_id === row.line_id)) {
-      const option = el('option', { value: row.line_id }, [`${row.line_id}（当前不可用）`]);
-      option.selected = true;
-      select.append(option);
-    }
-    select.onchange = () => { row.line_id = select.value; };
-
-    const name = el('input', { value: row.name || '', placeholder: '手机显示的名称' });
-    name.oninput = () => { row.name = name.value; };
-    const control = el('input', { type: 'number', value: row.control_port });
-    control.oninput = () => { row.control_port = Number(control.value) || 0; };
-    const pcm = el('input', { type: 'number', value: row.pcm_port });
-    pcm.oninput = () => { row.pcm_port = Number(pcm.value) || 0; };
-    const remove = el('button', { className: 'danger' }, ['移除']);
-    remove.onclick = () => { state.assignment.splice(index, 1); renderAssignment(); };
-
-    container.append(el('div', { className: 'card', style: 'margin-bottom:10px' }, [
-      el('div', { className: 'row' }, [
-        el('div', { className: 'grow' }, [el('label', {}, ['线路']), select]),
-        el('div', { className: 'grow' }, [el('label', {}, ['名称']), name]),
-      ]),
-      el('div', { className: 'row' }, [
-        el('div', { style: 'width:130px' }, [el('label', {}, ['控制端口']), control]),
-        el('div', { style: 'width:130px' }, [el('label', {}, ['PCM 端口']), pcm]),
-        remove,
-      ]),
-    ]));
-  });
-}
-
+/** Persist the assignment and apply it. */
 async function saveAssignment() {
   const note = document.getElementById('save-note');
-  note.className = 'hint';
-  note.textContent = '保存中…';
+  if (note) { note.className = 'hint'; note.textContent = '保存中…'; }
   try {
     const seen = new Set();
     for (const row of state.assignment) {
@@ -415,15 +404,19 @@ async function saveAssignment() {
       if (seen.has(row.control_port)) throw new Error(`控制端口 ${row.control_port} 重复`);
       seen.add(row.control_port);
     }
-    await celmuxFetch('/api/plugins/airsim/config', {
+    // Through the relay, so this page needs nothing but the token it was
+    // opened with: Celmux owns the config, and the relay applies it as the
+    // operator who opened the page.
+    await pluginFetch('/api/config', {
       method: 'POST',
       body: JSON.stringify({ values: { agents: JSON.stringify(state.assignment) } }),
     });
-    note.textContent = '已保存。重启插件后按新分配重建 Agent。';
-    await refresh();
+    if (note) note.textContent = '已保存。Celmux 会重启插件让新的分配生效。';
   } catch (error) {
-    note.className = 'err';
-    note.textContent = '保存失败：' + error.message;
+    if (note) {
+      note.className = 'err';
+      note.textContent = '保存失败：' + error.message;
+    }
   }
 }
 
@@ -485,26 +478,12 @@ async function refresh() {
 
 async function loadConfig() {
   try {
-    const data = await celmuxFetch('/api/plugins/airsim');
-    const raw = (data.plugin.config || {}).agents || '';
+    const data = await pluginFetch('/api/config');
+    const raw = (data.config || {}).agents || '';
     state.assignment = raw.trim() ? JSON.parse(raw) : [];
   } catch { state.assignment = []; }
-  renderAssignment();
 }
 
-document.getElementById('add-line').onclick = () => {
-  const used = new Set(state.assignment.map((row) => row.line_id));
-  const next = state.lines.find((line) => !used.has(line.line_id));
-  const base = 8642 + state.assignment.length * 10;
-  state.assignment.push({
-    line_id: next ? next.line_id : '',
-    name: next ? next.device_name : '',
-    control_port: base,
-    pcm_port: base + 3,
-  });
-  renderAssignment();
-};
-document.getElementById('save-assignment').onclick = saveAssignment;
 document.getElementById('refresh-logs').onclick = loadLogs;
 
 (async function init() {
