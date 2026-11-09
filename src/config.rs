@@ -16,17 +16,15 @@ use std::collections::BTreeMap;
 /// this process makes carries it.
 pub const PLUGIN_ID: &str = "airsim";
 
-/// The port this plugin listens on by default: one plain-HTTP listener serving
-/// its own settings page and the pairing endpoints.
+/// The port this plugin listens on by default: its AirSIM-facing API.
 ///
-/// Deliberately its own port rather than anything Celmux already uses. A plugin
-/// that borrowed Celmux's listener would have to be routed by SNI or path inside
-/// Celmux's TLS terminator, and Celmux would grow a plugin router for something
-/// an operator can point nginx at in one line.
+/// This is the port the settings page reaches and the port an operator forwards
+/// if the phone is not on the LAN. Deliberately its own port rather than
+/// anything Celmux already uses: a plugin that borrowed Celmux's listener would
+/// have to be routed by SNI or path inside Celmux's TLS terminator, and Celmux
+/// would grow a plugin router for something an operator can point nginx at in
+/// one line.
 pub const DEFAULT_PORT: u16 = 7593;
-
-/// The default control port for the first agent, above the base port.
-pub const DEFAULT_AGENT_CONTROL_PORT: u16 = 8642;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -34,7 +32,8 @@ pub struct Config {
     pub celmux_url: String,
     /// The private token Celmux minted at install time.
     pub celmux_token: String,
-    /// The port this plugin listens on: settings page and pairing.
+    /// The AirSIM-facing port: the API the settings page drives, and the
+    /// pairing endpoints.
     pub port: u16,
     /// Whether to advertise agents on Bonjour.
     pub advertise: bool,

@@ -36,11 +36,28 @@ pub struct AgentConfig {
 impl AgentConfig {
     /// The id the phone stores a credential under, and the name in Bonjour.
     ///
-    /// Derived from the line rather than configurable: an id that could be
-    /// typed twice would let two agents claim the same credential slot, and the
-    /// phone keeps exactly one secret per id.
+    /// Derived from the name rather than typed, so two agents cannot claim the
+    /// same credential slot - the phone keeps exactly one secret per id.
+    ///
+    /// A line label is not usable as an id on its own: it can be `读卡器1`, and
+    /// stripping the non-ASCII characters the phone's Keychain account key
+    /// cannot carry leaves `1`, which two different devices would share. So the
+    /// readable part is kept when it survives, and a digest of the whole label
+    /// is appended whenever the readable part could be ambiguous.
     pub fn agent_id(&self) -> String {
-        format!("celmux-{}", sanitize(&self.line_id))
+        let label = if self.name.is_empty() {
+            &self.line_id
+        } else {
+            &self.name
+        };
+        let readable = sanitize(label);
+        if readable == "line" || !is_distinctive(&readable, label) {
+            // Nothing usable survived, or what survived is a fragment: name the
+            // agent by a digest instead of by a fragment that collides.
+            format!("celmux-{}", short_digest(&self.line_id))
+        } else {
+            format!("celmux-{readable}")
+        }
     }
 
     fn display_name(&self) -> &str {
@@ -222,26 +239,35 @@ impl Fleet {
             .find(|agent| agent.id() == agent_id)
             .cloned()
     }
+}
 
-    /// The agent whose control listener is on `port`, for a pairing request.
-    ///
-    /// The phone pairs by dialling a host and port, so the port is the only
-    /// identity it presents.
-    pub fn by_port(&self, port: u16) -> Option<Arc<Agent>> {
-        self.agents
-            .lock()
-            .ok()?
-            .values()
-            .find(|agent| agent.config.control_port == port)
-            .cloned()
-    }
+/// Whether the sanitised form still identifies the label it came from.
+///
+/// A label whose non-ASCII characters all vanished keeps only the digits and
+/// ASCII that happened to sit beside them, so `读卡器1` and `读卡器2` become `1`
+/// and `2` and `读卡器10` and `打印机10` would both become `10`. Treating a form
+/// that carries less than half the label's bytes as a fragment keeps the
+/// readable case readable and the ambiguous case unambiguous.
+fn is_distinctive(sanitised: &str, label: &str) -> bool {
+    let kept = sanitised
+        .chars()
+        .filter(|character| *character != '-')
+        .count();
+    let total = label.chars().count();
+    total > 0 && kept * 2 >= total
+}
 
-    pub fn is_empty(&self) -> bool {
-        self.agents
-            .lock()
-            .map(|agents| agents.is_empty())
-            .unwrap_or(true)
+/// A stable digest of a label, short enough to sit in an id.
+fn short_digest(label: &str) -> String {
+    use sha2::{Digest, Sha256};
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest: [u8; 32] = Sha256::digest(label.as_bytes()).into();
+    let mut encoded = String::with_capacity(16);
+    for byte in &digest[..8] {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
+    encoded
 }
 
 /// Turn a line label into something usable as an id and a Bonjour name.
@@ -302,10 +328,50 @@ mod tests {
         assert_eq!(dji1, "celmux-dji1");
     }
 
+    /// The real labels on this installation are Chinese, and stripping the
+    /// non-ASCII characters leaves only a digit - which two devices would
+    /// share. A label whose readable part is a fragment has to be named by a
+    /// digest instead.
+    #[test]
+    fn chinese_labels_do_not_collapse_to_a_shared_digit() {
+        let first = config("读卡器1", 8642).agent_id();
+        let second = config("读卡器2", 8644).agent_id();
+        let tenth = config("打印机10", 8646).agent_id();
+        assert_ne!(first, second);
+        assert_ne!(first, tenth);
+        assert_ne!(second, tenth);
+        assert_ne!(first, "celmux-1");
+        // Still an id the phone's Keychain can key on.
+        for id in [&first, &second, &tenth] {
+            assert!(
+                id.chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '-'),
+                "{id} must be ascii"
+            );
+        }
+    }
+
+    /// A label that is mostly ASCII keeps its readable form.
+    #[test]
+    fn a_readable_label_keeps_its_readable_id() {
+        assert_eq!(config("dji1", 8642).agent_id(), "celmux-dji1");
+        assert_eq!(config("simreader2", 8642).agent_id(), "celmux-simreader2");
+    }
+
+    /// The same label always yields the same id, or a restart would orphan the
+    /// phone's credential.
+    #[test]
+    fn an_agent_id_is_stable_across_calls() {
+        let first = config("读卡器1", 8642).agent_id();
+        let second = config("读卡器1", 9999).agent_id();
+        assert_eq!(first, second);
+    }
+
     #[test]
     fn a_label_with_nothing_usable_still_yields_an_id() {
-        assert_eq!(sanitize("###"), "line");
-        assert_eq!(sanitize(""), "line");
+        let id = config("###", 8642).agent_id();
+        assert!(id.starts_with("celmux-"));
+        assert!(id.len() > "celmux-".len());
     }
 
     /// AirSIM keeps one secret per agent id, so a line that keeps its
@@ -356,14 +422,14 @@ mod tests {
         assert!(fleet.by_id("celmux-dji1").is_none());
     }
 
-    /// The phone pairs by host and port, so the port is the only identity a
-    /// pairing request carries.
+    /// The phone addresses an agent by its id, which is what it stores a
+    /// credential under.
     #[test]
-    fn an_agent_is_reachable_by_its_control_port() {
+    fn an_agent_is_reachable_by_its_id() {
         let fleet = Fleet::default();
         fleet.reconcile(vec![config("dji1", 8642)]).unwrap();
-        assert!(fleet.by_port(8642).is_some());
-        assert!(fleet.by_port(9999).is_none());
+        assert!(fleet.by_id("celmux-dji1").is_some());
+        assert!(fleet.by_id("celmux-nothing").is_none());
     }
 
     /// Once a window expires it stops answering, rather than accepting a claim

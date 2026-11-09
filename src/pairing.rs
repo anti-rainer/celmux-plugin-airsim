@@ -24,8 +24,8 @@
 //! with. So pairing is what *creates* the credential - there is no secret to
 //! type in beforehand.
 
+use aes_gcm::Aes256Gcm;
 use aes_gcm::aead::{Aead, KeyInit, Payload};
-use aes_gcm::{Aes256Gcm, Nonce};
 use hkdf::Hkdf;
 use sha2::Sha256;
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -106,9 +106,14 @@ impl Session {
             return Err("配对密文过短".to_owned());
         }
         let (nonce, body) = sealed.split_at(12);
+        // AES-GCM's nonce is 12 bytes, so the slice splits and converts
+        // without a fallible step beyond the length check above.
+        let nonce_bytes: [u8; 12] = nonce
+            .try_into()
+            .map_err(|_| "配对密文 nonce 无效".to_owned())?;
         cipher
             .decrypt(
-                Nonce::from_slice(nonce),
+                (&nonce_bytes).into(),
                 Payload {
                     msg: body,
                     aad: self.id.as_bytes(),
@@ -155,9 +160,6 @@ pub struct Claim {
     pub session_id: String,
     pub client_public_key: [u8; 32],
     pub sealed_registration: Vec<u8>,
-    /// The phone wants a direct route, which is the only kind this agent
-    /// offers: there is no relay in between.
-    pub want_direct_route: bool,
 }
 
 /// The registration the phone seals into a claim.
@@ -170,7 +172,6 @@ pub struct Registration {
     /// The secret every later request is signed with. Its presence is what
     /// makes pairing succeed.
     pub vowlan_secret: Option<String>,
-    pub bundle_id: String,
 }
 
 pub fn parse_registration(bytes: &[u8]) -> Result<Registration, String> {
@@ -191,7 +192,6 @@ pub fn parse_registration(bytes: &[u8]) -> Result<Registration, String> {
             .get("vowlan_secret")
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned),
-        bundle_id: text("bundle_id"),
     })
 }
 
@@ -236,17 +236,17 @@ mod tests {
         let shared = client_secret.diffie_hellman(&server_public);
         let key = derive_key(shared.as_bytes(), &session.id, &session.code).unwrap();
         let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
-        let nonce = Nonce::from_slice(&[1_u8; 12]);
+        let nonce_bytes = [1_u8; 12];
         let sealed = cipher
             .encrypt(
-                nonce,
+                (&nonce_bytes).into(),
                 Payload {
                     msg: plaintext,
                     aad: session.id.as_bytes(),
                 },
             )
             .unwrap();
-        let mut combined = nonce.to_vec();
+        let mut combined = nonce_bytes.to_vec();
         combined.extend_from_slice(&sealed);
         (combined, client_public)
     }
@@ -330,7 +330,6 @@ mod tests {
                 .unwrap();
         assert_eq!(registration.device_id, "p2");
         assert_eq!(registration.vowlan_secret.as_deref(), Some("abc"));
-        assert_eq!(registration.bundle_id, "com.x");
     }
 
     #[test]

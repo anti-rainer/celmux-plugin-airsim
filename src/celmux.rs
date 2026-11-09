@@ -26,10 +26,11 @@ pub struct Client {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Line {
     pub line_id: String,
+    /// Which module carries this line. The card joins it to the device row to
+    /// show which module and SIM are behind the line.
+    #[serde(default)]
     pub device_id: String,
     pub device_name: String,
-    #[serde(default)]
-    pub iccid: String,
     #[serde(default)]
     pub profile_name: String,
     /// Who operates the line; what the phone shows under the device name.
@@ -43,6 +44,50 @@ pub struct Line {
     pub online: bool,
     #[serde(default)]
     pub n_standby: bool,
+}
+
+/// One module as Celmux reports it, reduced to what a line card shows.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Device {
+    pub id: String,
+    /// Whether the module answers on its control channel.
+    #[serde(default)]
+    pub running: bool,
+    /// `vocall`, `qmi_voice` or `unavailable`.
+    #[serde(default)]
+    pub voice_route: String,
+    /// Why the route is what it is, in Celmux's own words.
+    #[serde(default)]
+    pub voice_route_reason: String,
+    #[serde(default)]
+    pub vowifi_n_standby_active: bool,
+    #[serde(default)]
+    pub vowifi_n_standby_online: usize,
+    #[serde(default)]
+    pub vowifi_n_standby_total: usize,
+    #[serde(default)]
+    pub vowifi_active: bool,
+    #[serde(default)]
+    pub network_enabled: bool,
+    /// The module's own voice-over-USB stack rather than a SIP call.
+    #[serde(default)]
+    pub at_module_ims: bool,
+    #[serde(default)]
+    pub modem: Option<Modem>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Modem {
+    #[serde(default)]
+    pub iccid: Option<String>,
+    #[serde(default)]
+    pub imsi: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub registration_state_text: Option<String>,
+    #[serde(default)]
+    pub signal_dbm: Option<i32>,
 }
 
 #[derive(Debug)]
@@ -153,6 +198,19 @@ impl Client {
 
     pub fn calls(&self) -> Result<Value, Error> {
         self.request("GET", "/calls", None)
+    }
+
+    /// What the phone's line card shows about the module and the card.
+    ///
+    /// Read from Celmux's device list, which is the only place that knows a
+    /// module's registration state and a card's operator at the same time.
+    pub fn devices(&self) -> Result<Vec<Device>, Error> {
+        let value = self.request("GET", "/devices", None)?;
+        let devices = value
+            .get("devices")
+            .cloned()
+            .unwrap_or_else(|| Value::Array(Vec::new()));
+        serde_json::from_value(devices).map_err(|error| Error::Decode(error.to_string()))
     }
 
     /// Pull the carrier's next block: signed 16-bit LE mono, base64 encoded.

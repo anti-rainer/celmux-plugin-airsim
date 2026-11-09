@@ -89,7 +89,10 @@ fn claim(agent: &Arc<Agent>, request: &Request) -> Response {
         .get("sealed_registration")
         .and_then(Value::as_str)
         .unwrap_or("");
-    let want_direct_route = payload
+    // `want_direct_route` is read but not acted on: a direct route is the only
+    // kind this agent has, so there is nothing to choose between. Reading it
+    // keeps a payload missing the field from being a parse error.
+    let _want_direct_route = payload
         .get("want_direct_route")
         .and_then(Value::as_bool)
         .unwrap_or(false);
@@ -123,7 +126,6 @@ fn claim(agent: &Arc<Agent>, request: &Request) -> Response {
         session_id: session_id.to_owned(),
         client_public_key: client_key,
         sealed_registration: sealed,
-        want_direct_route,
     };
     // The window is consumed under its own lock: two claims must not both
     // succeed against one window, or a second phone could pair with a code that
@@ -190,7 +192,7 @@ fn claim(agent: &Arc<Agent>, request: &Request) -> Response {
         agent.config.control_port,
         agent.config.pcm_port,
     );
-    eprintln!(
+    crate::log_info!(
         "celmux-plugin-airsim: agent {} 配对成功 device={}",
         agent.id(),
         if registration.device_id.is_empty() {
@@ -246,7 +248,6 @@ mod tests {
         Request {
             method: method.to_owned(),
             path: path.to_owned(),
-            query: String::new(),
             headers: std::collections::HashMap::new(),
             body: body.as_bytes().to_vec(),
         }

@@ -139,18 +139,6 @@ impl Verifier {
         let message = format!("AIRSIM-HEALTH1\n{nonce}\n{agent_id}");
         crate::config::base64_url_encode(&sign(&self.key, message.as_bytes()))
     }
-
-    /// The proof attached to a dial operation.
-    pub fn dial_proof(
-        &self,
-        nonce: &str,
-        operation_id: &str,
-        android_id: &str,
-        backend_id: &str,
-    ) -> String {
-        let message = format!("AIRSIM-DIAL1\n{nonce}\n{operation_id}\n{android_id}\n{backend_id}");
-        crate::config::base64_url_encode(&sign(&self.key, message.as_bytes()))
-    }
 }
 
 fn header<'a>(

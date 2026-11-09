@@ -21,8 +21,6 @@ use crate::http::{Request, Response};
 pub struct Control {
     pub client: Arc<Client>,
     pub agent: Arc<Agent>,
-    /// The host the phone can reach, so it can be told what to dial for media.
-    pub host: String,
 }
 
 /// One device as the phone understands it: a thing with a name that can place
@@ -247,7 +245,6 @@ mod tests {
             line_id: id.to_owned(),
             device_id: device.to_owned(),
             device_name: device.to_owned(),
-            iccid: String::new(),
             profile_name: profile.to_owned(),
             operator_name: operator.to_owned(),
             local_phone: "+100".to_owned(),

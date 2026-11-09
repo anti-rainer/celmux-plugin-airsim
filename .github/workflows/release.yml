@@ -1,0 +1,108 @@
+name: release
+
+# A plugin is installed by Celmux from a release asset, so this workflow is what
+# makes a plugin installable. It builds every supported architecture and attaches
+# both to the release; the Celmux catalog picks the asset for its own machine.
+on:
+  # Manual only. A release is a decision about what the installer may hand an
+  # operator, so it is made deliberately rather than by pushing a tag: the tag is
+  # typed into the run, which is also what names the version.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "发布标签，例如 v0.2.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-unknown-linux-musl
+            asset: celmux-plugin-airsim-aarch64
+          - target: x86_64-unknown-linux-musl
+            asset: celmux-plugin-airsim-x86_64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          # cargo-zigbuild links musl and glibc targets without a full
+          # cross-compiling toolchain; Zig ships both.
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
+            sudo apt-get install -y gcc-aarch64-linux-gnu
+          fi
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Test
+        # Tests run on the host target: the code under test is the protocol and
+        # the pairing crypto, and neither depends on the target architecture.
+        run: cargo test --release
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          staging="$(mktemp -d)"
+          mkdir -p "$staging/celmux-plugin-airsim/ui"
+          cp "target/${{ matrix.target }}/release/celmux-plugin-airsim" "$staging/celmux-plugin-airsim/"
+          cp ui/index.html "$staging/celmux-plugin-airsim/ui/"
+          cp plugin.json "$staging/celmux-plugin-airsim/"
+          cp README.md "$staging/celmux-plugin-airsim/" 2>/dev/null || true
+          chmod +x "$staging/celmux-plugin-airsim/celmux-plugin-airsim"
+          tar -czf "${{ matrix.asset }}.tar.gz" -C "$staging" celmux-plugin-airsim
+          ls -la "${{ matrix.asset }}.tar.gz"
+
+      - name: Upload asset
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}.tar.gz
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The tag typed into the run is what the release is named after, and
+          # the checkout has to carry the same commit.
+          ref: ${{ github.ref }}
+
+      - name: Download assets
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          # The tag comes from the run's input, so the release exists even when
+          # the tag was not pushed beforehand.
+          tag_name: ${{ inputs.tag }}
+          files: "*.tar.gz"
+          generate_release_notes: true
+          # The asset name carries the architecture only; the tag names the
+          # version, which is what Celmux reads back.
+          fail_on_unmatched_files: true

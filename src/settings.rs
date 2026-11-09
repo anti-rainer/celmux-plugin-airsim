@@ -76,62 +76,24 @@ fn parse_assignment(raw: &str) -> Result<Vec<AgentConfig>, String> {
 }
 
 /// Route one request on the settings listener.
-pub fn handle(fleet: &Arc<Fleet>, client: &Arc<Client>, host: &str, request: Request) -> Response {
+pub fn handle(
+    fleet: &Arc<Fleet>,
+    client: &Arc<Client>,
+    advertisements: &Arc<
+        std::sync::Mutex<std::collections::BTreeMap<String, crate::discovery::Advertisement>>,
+    >,
+    host: &str,
+    request: Request,
+) -> Response {
     match (request.method.as_str(), request.path.as_str()) {
-        ("GET", "/") | ("GET", "/index.html") => page("index.html"),
         ("GET", "/api/status") => status(fleet, host),
-        ("POST", "/api/pair") => open_pairing(fleet, &request),
+        ("POST", "/api/pair") => open_pairing(fleet, advertisements, &request),
         ("POST", "/api/unpair") => unpair(fleet, &request),
-        ("GET", "/api/lines") => lines(client),
-        // The page is a single document with no build step, so anything it asks
-        // for beyond the API is either the page itself or a 404.
-        ("GET", path) if !path.starts_with("/api/") => page(path.trim_start_matches('/')),
+        ("GET", "/api/lines") => lines(fleet, client),
+        ("GET", "/api/logs") => logs(&request),
+        ("GET", "/api/config") => config_read(client),
+        ("GET", "/api/info") => info_page(),
         _ => Response::error(404, "Not Found", "not_found", "接口不存在"),
-    }
-}
-
-/// Serve a file from the plugin's own page directory.
-fn page(name: &str) -> Response {
-    // Only plain names: the page is a directory of files, not a filesystem
-    // browser. Checked before the directory is even looked for, so a traversal
-    // attempt is answered the same way whether or not a page is installed.
-    if name.contains("..") || name.starts_with('/') || name.contains('\\') {
-        return Response::error(403, "Forbidden", "forbidden", "禁止访问");
-    }
-    let Some(root) = page_root() else {
-        return Response::error(
-            500,
-            "Internal Server Error",
-            "no_page",
-            "找不到插件页面目录",
-        );
-    };
-    match std::fs::read(root.join(name)) {
-        Ok(bytes) => Response {
-            status: 200,
-            reason: "OK",
-            content_type: content_type(name),
-            body: bytes,
-        },
-        Err(_) => Response::error(404, "Not Found", "not_found", "页面不存在"),
-    }
-}
-
-fn page_root() -> Option<std::path::PathBuf> {
-    let executable = std::env::current_exe().ok()?;
-    let directory = executable.parent()?;
-    let candidate = directory.join("ui");
-    candidate.is_dir().then_some(candidate)
-}
-
-fn content_type(name: &str) -> &'static str {
-    match name.rsplit('.').next().unwrap_or("") {
-        "html" => "text/html; charset=utf-8",
-        "js" | "mjs" => "text/javascript; charset=utf-8",
-        "css" => "text/css; charset=utf-8",
-        "json" => "application/json",
-        "svg" => "image/svg+xml",
-        _ => "application/octet-stream",
     }
 }
 
@@ -169,7 +131,13 @@ struct PairRequest {
 ///
 /// The code is returned once, here, and never stored anywhere readable: it is
 /// only ever a component of the key derived from it.
-fn open_pairing(fleet: &Arc<Fleet>, request: &Request) -> Response {
+fn open_pairing(
+    fleet: &Arc<Fleet>,
+    advertisements: &Arc<
+        std::sync::Mutex<std::collections::BTreeMap<String, crate::discovery::Advertisement>>,
+    >,
+    request: &Request,
+) -> Response {
     let payload: PairRequest = match serde_json::from_slice(&request.body) {
         Ok(payload) => payload,
         Err(error) => {
@@ -184,13 +152,36 @@ fn open_pairing(fleet: &Arc<Fleet>, request: &Request) -> Response {
         Err(error) => return Response::error(500, "Internal Server Error", "random", &error),
     };
     match agent.open_pairing(PAIRING_TTL, session_id) {
-        Ok((code, expires_at)) => Response::ok(json!({
-            "ok": true,
-            "code": code,
-            "expires_at": expires_at,
-            "agent_id": agent.id(),
-            "ttl_seconds": PAIRING_TTL.as_secs(),
-        })),
+        Ok((code, expires_at)) => {
+            // Advertise the window so the phone finds it by browsing. Without
+            // this only manual addressing works, and the window would be
+            // invisible to an operator who never configured an address.
+            let agent_id = agent.id();
+            if let Ok(mut advertisements) = advertisements.lock()
+                && let Some(advertisement) = advertisements.get_mut(&agent_id)
+            {
+                let public_key = agent
+                    .with_pairing(|session| session.public_key)
+                    .unwrap_or_default();
+                if let Err(error) = advertisement.add_pairing_window(
+                    &agent_id,
+                    &agent
+                        .with_pairing(|session| session.id.clone())
+                        .unwrap_or_default(),
+                    &public_key,
+                    expires_at,
+                ) {
+                    crate::log_warn!("celmux-plugin-airsim: 配对广播失败: {error}");
+                }
+            }
+            Response::ok(json!({
+                "ok": true,
+                "code": code,
+                "expires_at": expires_at,
+                "agent_id": agent_id,
+                "ttl_seconds": PAIRING_TTL.as_secs(),
+            }))
+        }
         Err(error) => Response::error(500, "Internal Server Error", "pairing", &error),
     }
 }
@@ -217,26 +208,142 @@ fn unpair(fleet: &Arc<Fleet>, request: &Request) -> Response {
 }
 
 /// The lines this installation can offer, read from Celmux.
-fn lines(client: &Arc<Client>) -> Response {
-    match client.lines() {
-        Ok(lines) => {
-            let rows: Vec<Value> = lines
-                .into_iter()
-                .map(|line| {
-                    json!({
-                        "line_id": line.line_id,
-                        "device_name": line.device_name,
-                        "operator_name": line.operator_name,
-                        "local_phone": line.local_phone,
-                        "n_standby": line.n_standby,
-                        "online": line.online,
-                    })
-                })
-                .collect();
-            Response::ok(json!({"ok": true, "lines": rows}))
+/// Every line, joined with what the card's own module and SIM look like.
+///
+/// A line alone says which subscriber it is; an operator choosing which lines
+/// to expose needs to know which module carries it and whether its voice route
+/// is actually up. Celmux keeps those two facts in two routes, so they are
+/// joined here rather than by the page.
+fn lines(fleet: &Arc<Fleet>, client: &Arc<Client>) -> Response {
+    let lines = match client.lines() {
+        Ok(lines) => lines,
+        Err(error) => {
+            return Response::error(502, "Bad Gateway", "celmux_unavailable", &error.to_string());
         }
+    };
+    let devices = client.devices().unwrap_or_default();
+    let by_id: std::collections::BTreeMap<&str, &crate::celmux::Device> = devices
+        .iter()
+        .map(|device| (device.id.as_str(), device))
+        .collect();
+    let agents = fleet.list();
+    let rows: Vec<Value> = lines
+        .into_iter()
+        .map(|line| {
+            let device = line.device_id.as_str();
+            let module = by_id.get(device);
+            // Which agent carries this line, if the operator exposed it.
+            let agent = agents
+                .iter()
+                .find(|agent| agent.config.line_id == line.line_id)
+                .map(|agent| {
+                    json!({
+                        "agent_id": agent.id(),
+                        "name": agent.name(),
+                        "control_port": agent.config.control_port,
+                        "pcm_port": agent.config.pcm_port,
+                        "paired": agent.paired(),
+                    })
+                });
+            json!({
+                "line_id": line.line_id,
+                "device_id": device,
+                "device_name": line.device_name,
+                "operator_name": line.operator_name,
+                "local_phone": line.local_phone,
+                "n_standby": line.n_standby,
+                "online": line.online,
+                "profile_name": line.profile_name,
+                // The route this line's voice takes: the module's own VoLTE,
+                // this host's VoWiFi, or an N-standby Profile's VoWiFi.
+                "voice_route": module.map(|device| device.voice_route.clone()).unwrap_or_default(),
+                "voice_route_reason": module.map(|device| device.voice_route_reason.clone()).unwrap_or_default(),
+                "vowifi_active": module.map(|device| device.vowifi_active).unwrap_or(false),
+                "n_standby_active": module.map(|device| device.vowifi_n_standby_active).unwrap_or(false),
+                "registration": module
+                    .and_then(|device| device.modem.as_ref())
+                    .and_then(|modem| modem.registration_state_text.clone())
+                    .unwrap_or_default(),
+                // What the module is doing right now, which is what tells an
+                // operator why a line is not callable.
+                "module_running": module.map(|device| device.running).unwrap_or(false),
+                "network_enabled": module.map(|device| device.network_enabled).unwrap_or(false),
+                "module_ims": module.map(|device| device.at_module_ims).unwrap_or(false),
+                "n_standby_online": module.map(|device| device.vowifi_n_standby_online).unwrap_or(0),
+                "n_standby_total": module.map(|device| device.vowifi_n_standby_total).unwrap_or(0),
+                "signal_dbm": module
+                    .and_then(|device| device.modem.as_ref())
+                    .and_then(|modem| modem.signal_dbm),
+                "iccid": module
+                    .and_then(|device| device.modem.as_ref())
+                    .and_then(|modem| modem.iccid.clone())
+                    .unwrap_or_default(),
+                "imsi": module
+                    .and_then(|device| device.modem.as_ref())
+                    .and_then(|modem| modem.imsi.clone())
+                    .unwrap_or_default(),
+                "module_model": module
+                    .and_then(|device| device.modem.as_ref())
+                    .and_then(|modem| modem.model.clone())
+                    .unwrap_or_default(),
+                "agent": agent,
+            })
+        })
+        .collect();
+    Response::ok(json!({"ok": true, "lines": rows}))
+}
+
+/// The plugin's own configuration, as Celmux holds it.
+///
+/// Read through the plugin token rather than from the environment: the page has
+/// to show what the operator saved, and the environment the process started with
+/// may predate the last save.
+fn config_read(client: &Arc<Client>) -> Response {
+    match client.config() {
+        Ok(value) => Response::ok(json!({
+            "ok": true,
+            "config": value.get("config").cloned().unwrap_or_else(|| json!({})),
+        })),
         Err(error) => Response::error(502, "Bad Gateway", "celmux_unavailable", &error.to_string()),
     }
+}
+
+/// The tail of this plugin's own log.
+fn logs(request: &Request) -> Response {
+    let lines: usize = request
+        .path
+        .split_once('?')
+        .and_then(|(_, query)| {
+            query
+                .split('&')
+                .filter_map(|pair| pair.split_once('='))
+                .find(|(key, _)| *key == "lines")
+                .and_then(|(_, value)| value.parse().ok())
+        })
+        .unwrap_or(300)
+        .clamp(20, 2000);
+    Response::ok(json!({
+        "ok": true,
+        "level": crate::logging::level().as_str(),
+        "lines": crate::logging::tail(lines),
+    }))
+}
+
+/// What the plugin is, for its own information tab.
+fn info_page() -> Response {
+    Response::ok(json!({
+        "ok": true,
+        "id": config::PLUGIN_ID,
+        "version": env!("CARGO_PKG_VERSION"),
+        "repository": env!("CARGO_PKG_REPOSITORY"),
+        "log_level": crate::logging::level().as_str(),
+        "protocol": {
+            "pairing": crate::pairing::PROTOCOL_VERSION,
+            "product": crate::pairing::PRODUCT,
+            "pcm_sample_rate": crate::pcm::SAMPLE_RATE,
+            "pcm_frame_bytes": crate::pcm::FRAME_BYTES,
+        },
+    }))
 }
 
 fn random_session_id() -> Result<String, String> {
@@ -289,20 +396,6 @@ mod tests {
     fn a_malformed_assignment_names_the_problem() {
         let error = parse_assignment("not json").unwrap_err();
         assert!(error.contains("JSON"));
-    }
-
-    /// The page is a directory of files, not a filesystem browser.
-    #[test]
-    fn a_page_request_cannot_escape_its_directory() {
-        assert!(page("../secret").status == 403);
-        assert!(page("/etc/passwd").status == 403);
-    }
-
-    #[test]
-    fn the_page_content_types_cover_what_it_ships() {
-        assert!(content_type("index.html").starts_with("text/html"));
-        assert!(content_type("app.js").starts_with("text/javascript"));
-        assert_eq!(content_type("x.bin"), "application/octet-stream");
     }
 
     /// A window is what makes pairing possible at all; it has to last long

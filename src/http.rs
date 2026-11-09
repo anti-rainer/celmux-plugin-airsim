@@ -22,7 +22,6 @@ pub struct Request {
     pub method: String,
     /// Path without the query string.
     pub path: String,
-    pub query: String,
     pub headers: HashMap<String, String>,
     pub body: Vec<u8>,
 }
@@ -107,10 +106,11 @@ pub fn read_request(stream: TcpStream) -> Result<Request, ReadError> {
     let mut parts = request_line.split_whitespace();
     let method = parts.next().ok_or(ReadError::Malformed)?.to_owned();
     let target = parts.next().ok_or(ReadError::Malformed)?.to_owned();
-    let (path, query) = match target.split_once('?') {
-        Some((path, query)) => (path.to_owned(), query.to_owned()),
-        None => (target, String::new()),
-    };
+    // The query string is dropped: no route this serves reads one, and a caller
+    // that appended one would only be matching against a path it did not mean.
+    let path = target
+        .split_once('?')
+        .map_or(target.clone(), |(path, _)| path.to_owned());
     let mut headers = HashMap::new();
     loop {
         let mut line = String::new();
@@ -144,7 +144,6 @@ pub fn read_request(stream: TcpStream) -> Result<Request, ReadError> {
     Ok(Request {
         method,
         path,
-        query,
         headers,
         body,
     })
@@ -184,12 +183,13 @@ mod tests {
         result
     }
 
+    /// A query string is dropped rather than matched against: no route this
+    /// serves reads one.
     #[test]
-    fn a_request_splits_its_path_from_its_query() {
+    fn a_request_drops_its_query_from_the_path() {
         let request = parse(b"GET /v1/health?x=1 HTTP/1.1\r\nHost: a\r\n\r\n").unwrap();
         assert_eq!(request.method, "GET");
         assert_eq!(request.path, "/v1/health");
-        assert_eq!(request.query, "x=1");
         assert!(request.body.is_empty());
     }
 
