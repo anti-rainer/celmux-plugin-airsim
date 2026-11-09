@@ -6,10 +6,24 @@
   "settings": [
     {
       "key": "port",
-      "label": "AirSIM 对接端口",
+      "label": "设置接口端口",
       "kind": "number",
-      "default": "7593",
-      "hint": "插件对外服务的端口（仅 HTTP），插件的设置页面和 AirSIM 的配对接口都走它。公网访问请自行在 nginx / Cloudflare Tunnel 中反代到这个端口。"
+      "default": "43769",
+      "hint": "Celmux 插件中心访问本插件设置页与配置接口所用的端口（仅 HTTP）。由 Celmux 内部经 relay 访问，一般无需改动。"
+    },
+    {
+      "key": "control_port",
+      "label": "控制端口（全局）",
+      "kind": "number",
+      "default": "8642",
+      "hint": "所有线路共用的 AirSIM 控制接口端口：请求带哪条线路的配对密钥，就归哪条线路。"
+    },
+    {
+      "key": "pcm_port",
+      "label": "PCM 端口（全局）",
+      "kind": "number",
+      "default": "8643",
+      "hint": "所有线路共用的音频端口，握手签名决定归属哪条线路。"
     },
     {
       "key": "advertise",

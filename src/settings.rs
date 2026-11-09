@@ -36,8 +36,9 @@ struct AssignedLine {
     line_id: String,
     #[serde(default)]
     name: String,
-    control_port: u16,
-    pcm_port: u16,
+    // Ports in a stored assignment are ignored: they are one installation-wide
+    // pair now, not a per-line choice. Reading them would let an old saved value
+    // silently override what the ports page shows.
 }
 
 /// Read the assignment from Celmux's plugin configuration.
@@ -69,8 +70,6 @@ fn parse_assignment(raw: &str) -> Result<Vec<AgentConfig>, String> {
         .map(|line| AgentConfig {
             line_id: line.line_id.trim().to_owned(),
             name: line.name.trim().to_owned(),
-            control_port: line.control_port,
-            pcm_port: line.pcm_port,
         })
         .collect())
 }
@@ -83,13 +82,14 @@ pub fn handle(
         std::sync::Mutex<std::collections::BTreeMap<String, crate::discovery::Advertisement>>,
     >,
     host: &str,
+    ports: &crate::control::Ports,
     request: Request,
 ) -> Response {
     match (request.method.as_str(), request.path.as_str()) {
-        ("GET", "/api/status") => status(fleet, host),
+        ("GET", "/api/status") => status(fleet, client, host, ports),
         ("POST", "/api/pair") => open_pairing(fleet, advertisements, &request),
         ("POST", "/api/unpair") => unpair(fleet, &request),
-        ("GET", "/api/lines") => lines(fleet, client),
+        ("GET", "/api/lines") => lines(fleet, client, ports),
         ("GET", "/api/logs") => logs(&request),
         ("GET", "/api/config") => config_read(client),
         ("GET", "/api/info") => info_page(),
@@ -98,17 +98,25 @@ pub fn handle(
 }
 
 /// What the page shows: every agent, whether it is paired, and where it listens.
-fn status(fleet: &Arc<Fleet>, host: &str) -> Response {
+fn status(
+    fleet: &Arc<Fleet>,
+    client: &Arc<Client>,
+    host: &str,
+    ports: &crate::control::Ports,
+) -> Response {
     let agents: Vec<Value> = fleet
         .list()
         .into_iter()
         .map(|agent| {
             json!({
                 "agent_id": agent.id(),
-                "name": agent.name(),
+                // The line as it is now, not the name stored at exposure time.
+                "name": crate::control::line_display_name(client, &agent),
                 "line_id": agent.config.line_id,
-                "control_port": agent.config.control_port,
-                "pcm_port": agent.config.pcm_port,
+                // Every line answers on the same pair; repeating the numbers
+                // per line would suggest they can differ.
+                "control_port": ports.control,
+                "pcm_port": ports.pcm,
                 "paired": agent.paired(),
                 "pairing_open": agent.with_pairing(|_| ()).is_some(),
             })
@@ -117,7 +125,7 @@ fn status(fleet: &Arc<Fleet>, host: &str) -> Response {
     Response::ok(json!({
         "ok": true,
         "host": host,
-        "plugin_port": config::DEFAULT_PORT,
+        "plugin_port": crate::config::DEFAULT_PORT,
         "agents": agents,
     }))
 }
@@ -218,7 +226,7 @@ fn unpair(fleet: &Arc<Fleet>, request: &Request) -> Response {
 /// to expose needs to know which module carries it and whether its voice route
 /// is actually up. Celmux keeps those two facts in two routes, so they are
 /// joined here rather than by the page.
-fn lines(fleet: &Arc<Fleet>, client: &Arc<Client>) -> Response {
+fn lines(fleet: &Arc<Fleet>, client: &Arc<Client>, ports: &crate::control::Ports) -> Response {
     let lines = match client.lines() {
         Ok(lines) => lines,
         Err(error) => {
@@ -243,9 +251,11 @@ fn lines(fleet: &Arc<Fleet>, client: &Arc<Client>) -> Response {
                 .map(|agent| {
                     json!({
                         "agent_id": agent.id(),
-                        "name": agent.name(),
-                        "control_port": agent.config.control_port,
-                        "pcm_port": agent.config.pcm_port,
+                        // This row already carries the line's own parts, so the
+                        // name is built from them rather than fetched again.
+                        "name": line.card_name(),
+                        "control_port": ports.control,
+                        "pcm_port": ports.pcm,
                         "paired": agent.paired(),
                     })
                 });
@@ -381,7 +391,7 @@ mod tests {
         assert_eq!(agents[0].line_id, "dji1");
         assert_eq!(agents[0].name, "");
         assert_eq!(agents[1].name, "Globe");
-        assert_eq!(agents[1].control_port, 8652);
+        assert_eq!(agents[1].line_id, "读卡器1#8904");
     }
 
     /// A row with no line names no agent, so it must not create a ghost.

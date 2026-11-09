@@ -92,10 +92,19 @@
   </section>
 
   <section class="panel" id="panel-lines">
-    <p class="hint">
-      点开一条线路，就能把它接入 AirSIM：每条线路一个 Agent，手机上有几条线路由此决定。
-      接入后 Celmux 会重启插件，让新的分配生效。
-    </p>
+    <!-- The ports belong to the installation, not to a line: every line shares
+         them, and the line is identified by which secret signed the request.
+         One row, because it is two numbers and a button. -->
+    <div class="card" style="margin-bottom:14px">
+      <div class="row" style="align-items:center">
+        <label style="margin:0">控制端口</label>
+        <input type="number" id="port-control" placeholder="8642" style="width:100px">
+        <label style="margin:0">PCM 端口</label>
+        <input type="number" id="port-pcm" placeholder="8643" style="width:100px">
+        <button id="save-ports" class="primary">保存</button>
+        <span class="hint" id="ports-note" style="margin:0"></span>
+      </div>
+    </div>
     <div id="lines-list"></div>
     <p class="hint" id="save-note" style="margin-top:12px"></p>
   </section>
@@ -183,6 +192,11 @@ function accessLabel(line) {
 }
 
 function accessTagClass(line) {
+  // N-standby VoWiFi is a working path even though Celmux reports the module's
+  // own voice route as unavailable: under N-standby the voice route belongs to
+  // the Profile, not to the module. Painting it red said "this line is broken"
+  // about the lines that work.
+  if (line.n_standby && line.n_standby_active) return 'tag ok';
   if (line.voice_route === 'unavailable') return 'tag err';
   if (!line.online) return 'tag warn';
   return 'tag ok';
@@ -247,20 +261,20 @@ function renderLines() {
                       : el('span', { className: 'tag warn' }, ['AirSIM 未配对']))
       : el('span', { className: 'tag' }, ['未接入 AirSIM']);
 
+    // Three lines: what the line is, how it is doing, and its label. The
+    // details are one tap away in the expansion, because the list is read at a
+    // glance to pick a line to expose, not to audit it.
     const card = el('div', { className: 'line-card' });
     card.append(
       el('div', { className: 'line-head' }, [
         el('span', { className: 'line-name' }, [lineLabel(line)]),
+      ]),
+      el('div', { className: 'line-head', style: 'margin-top:6px' }, [
         el('span', { className: accessTagClass(line) }, [accessLabel(line)]),
         statusTag,
       ]),
-      el('div', { className: 'kv' }, [
-        el('div', {}, [el('span', {}, ['所在模组 ']), line.device_name || line.device_id]),
-        el('div', {}, [el('span', {}, ['运营商 ']), line.operator_name || '—']),
-        el('div', {}, [el('span', {}, ['手机号 ']), line.local_phone || '—']),
-        el('div', {}, [el('span', {}, ['注册 ']), line.registration || '—']),
-        el('div', {}, [el('span', {}, ['ICCID ']), line.iccid || '—']),
-        el('div', {}, [el('span', {}, ['信号 ']), line.signal_dbm == null ? '—' : `${line.signal_dbm} dBm`]),
+      el('div', { className: 'mono', style: 'color:var(--muted);margin-top:6px;font-size:12px' }, [
+        line.line_id,
       ])
     );
     card.onclick = () => {
@@ -276,33 +290,11 @@ function renderLineDetail(line) {
   const detail = el('div', { className: 'detail' });
   if (line.agent) {
     const agent = line.agent;
+    // The ports are shared by every line and are edited once at the top of this
+    // page, so repeating them per card would only suggest each line has its own.
     detail.append(
-      el('h3', {}, ['这个 Agent']),
-      el('div', { className: 'mono hint' }, [
-        `id ${agent.agent_id} · 控制端口 ${agent.control_port} · PCM 端口 ${agent.pcm_port}`,
-      ])
+      el('div', { className: 'mono hint' }, [`Agent ${agent.agent_id}`])
     );
-    // Ports are edited here rather than on a separate page: they belong to this
-    // agent, and an operator changing one wants to see which line it serves.
-    const assignment = state.assignment.find((entry) => entry.line_id === line.line_id);
-    if (assignment) {
-      const control = el('input', { type: 'number', value: assignment.control_port, style: 'width:110px' });
-      control.onclick = (event) => event.stopPropagation();
-      control.onchange = () => {
-        assignment.control_port = Number(control.value) || 0;
-        void saveAssignment();
-      };
-      const pcm = el('input', { type: 'number', value: assignment.pcm_port, style: 'width:110px' });
-      pcm.onclick = (event) => event.stopPropagation();
-      pcm.onchange = () => {
-        assignment.pcm_port = Number(pcm.value) || 0;
-        void saveAssignment();
-      };
-      detail.append(el('div', { className: 'row', style: 'margin-top:10px' }, [
-        el('div', { style: 'width:130px' }, [el('label', {}, ['控制端口']), control]),
-        el('div', { style: 'width:130px' }, [el('label', {}, ['PCM 端口']), pcm]),
-      ]));
-    }
 
     const row = el('div', { className: 'row', style: 'margin-top:10px' });
     const pair = el('button', { className: 'primary' }, ['开始配对']);
@@ -393,16 +385,68 @@ async function unpairAgent(agentId) {
 }
 
 /** Persist the assignment and apply it. */
+// The one pair of ports every line listens on, taken from the plugin's own
+// config: they are not a per-line setting, so they are not stored per line.
+function sharedPorts() {
+  const config = state.config || {};
+  return {
+    control: Number(config.control_port) || 8642,
+    pcm: Number(config.pcm_port) || 8643,
+  };
+}
+
+// Save the installation-wide port pair. Written to the plugin config, not to a
+// line, because changing it changes every line at once.
+async function savePorts() {
+  const note = document.getElementById('ports-note');
+  const control = Number(document.getElementById('port-control').value) || 0;
+  const pcm = Number(document.getElementById('port-pcm').value) || 0;
+  if (!control || !pcm) {
+    note.className = 'hint err';
+    note.textContent = '端口不能为空';
+    return;
+  }
+  if (control === pcm) {
+    note.className = 'hint err';
+    note.textContent = '控制端口与 PCM 端口不能相同';
+    return;
+  }
+  note.className = 'hint';
+  note.textContent = '保存中…';
+  try {
+    await pluginFetch('/api/config', {
+      method: 'POST',
+      body: JSON.stringify({
+        values: { control_port: String(control), pcm_port: String(pcm) },
+      }),
+    });
+    state.config = { ...(state.config || {}), control_port: String(control), pcm_port: String(pcm) };
+    note.textContent = `已保存：控制端口 ${control}、PCM 端口 ${pcm}（所有线路共用，重启插件后生效）`;
+  } catch (error) {
+    note.className = 'hint err';
+    note.textContent = `保存失败：${error.message || error}`;
+  }
+}
+
+function fillPortInputs() {
+  const ports = sharedPorts();
+  const control = document.getElementById('port-control');
+  const pcm = document.getElementById('port-pcm');
+  if (control) control.value = ports.control;
+  if (pcm) pcm.value = ports.pcm;
+}
+
 async function saveAssignment() {
   const note = document.getElementById('save-note');
   if (note) { note.className = 'hint'; note.textContent = '保存中…'; }
   try {
-    const seen = new Set();
     for (const row of state.assignment) {
       if (!row.line_id) throw new Error('有线路未选择');
-      if (row.control_port === row.pcm_port) throw new Error(`${row.line_id} 的控制端口与 PCM 端口相同`);
-      if (seen.has(row.control_port)) throw new Error(`控制端口 ${row.control_port} 重复`);
-      seen.add(row.control_port);
+    }
+    // Every line shares the same two ports, so equal ports are the one thing
+    // that cannot work: they are checked once, not once per line.
+    if (sharedPorts().control === sharedPorts().pcm) {
+      throw new Error('控制端口与 PCM 端口不能相同');
     }
     // Through the relay, so this page needs nothing but the token it was
     // opened with: Celmux owns the config, and the relay applies it as the
@@ -479,15 +523,23 @@ async function refresh() {
 async function loadConfig() {
   try {
     const data = await pluginFetch('/api/config');
-    const raw = (data.config || {}).agents || '';
+    state.config = data.config || {};
+    const raw = state.config.agents || '';
     state.assignment = raw.trim() ? JSON.parse(raw) : [];
-  } catch { state.assignment = []; }
+  } catch {
+    state.config = {};
+    state.assignment = [];
+  }
 }
 
 document.getElementById('refresh-logs').onclick = loadLogs;
+document.getElementById('save-ports').onclick = () => void savePorts();
 
 (async function init() {
   await loadConfig();
+  // Before the first refresh: the inputs show the ports in effect, and the
+  // cards below no longer carry them.
+  fillPortInputs();
   await refresh();
 })();
 </script>

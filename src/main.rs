@@ -124,33 +124,40 @@ fn main() {
         Arc::clone(&fleet),
         Arc::clone(&client),
         &host,
-        config.advertise,
+        &config,
     );
 
-    // The settings listener is what the operator reaches: it serves this
-    // plugin's own page and the pairing endpoints. A busy port is fatal because
-    // without it nothing can be configured or paired.
+    // The settings listener is what Celmux's plugin centre relays to: it serves
+    // this plugin's own page and its configuration API. A separate port from the
+    // phone's control port, because the page is reached through Celmux with a
+    // page token, while the phone signs its requests - two different callers,
+    // two different credentials, and one of them should never be reachable from
+    // the same address the phone uses.
     let listener = match std::net::TcpListener::bind(("0.0.0.0", config.port)) {
         Ok(listener) => listener,
         Err(error) => {
             crate::log_warn!(
-                "celmux-plugin-airsim: 无法监听插件端口 {}: {error}",
+                "celmux-plugin-airsim: 无法监听设置接口端口 {}: {error}",
                 config.port
             );
             std::process::exit(4);
         }
     };
     crate::log_info!(
-        "celmux-plugin-airsim: 对接接口 http://{host}:{}",
+        "celmux-plugin-airsim: 设置接口 http://{host}:{}",
         config.port
     );
     let advertisements = Arc::new(std::sync::Mutex::new(advertisements));
+    let settings_ports = crate::control::Ports {
+        control: config.control_port,
+        pcm: config.pcm_port,
+    };
     let handler = {
         let fleet = Arc::clone(&fleet);
         let client = Arc::clone(&client);
         let host = host.clone();
         Arc::new(move |request: http::Request| {
-            settings::handle(&fleet, &client, &advertisements, &host, request)
+            settings::handle(&fleet, &client, &advertisements, &host, &settings_ports, request)
         }) as Arc<dyn Fn(http::Request) -> http::Response + Send + Sync>
     };
     http::serve(listener, handler);
@@ -164,80 +171,94 @@ fn start_agents(
     fleet: Arc<Fleet>,
     client: Arc<celmux::Client>,
     host: &str,
-    advertise: bool,
+    config: &crate::config::Config,
 ) -> BTreeMap<String, discovery::Advertisement> {
     let mut advertisements = BTreeMap::new();
-    for agent in fleet.list() {
-        let id = agent.id();
-        let control_port = agent.config.control_port;
-        let pcm_port = agent.config.pcm_port;
-
-        // The control listener starts whether or not the agent has paired:
-        // pairing happens over HTTP by port, so the phone has to reach it
-        // *before* there is a secret. Which routes it will answer is decided
-        // per request, from whether a secret exists at that moment.
+    let agents = fleet.list();
+    // The ports come up even with no lines configured: pairing is what creates a
+    // line, and it happens over the control port. Returning early here meant a
+    // freshly cleared installation had no port to pair against.
+    // One control port and one PCM port for every line.
+    //
+    // The ports are shared because every request already carries the identity
+    // that tells the lines apart: it is signed with one line's secret, and
+    // verifying against each known secret names the line. Giving each line its
+    // own port would spend a port per line, put a listener per line in every
+    // firewall rule, and make the phone's saved endpoints change whenever a
+    // line was added - for information the signature already provides.
+    let ports = crate::control::Ports {
+        control: config.control_port,
+        pcm: config.pcm_port,
+    };
+    let advertise = config.advertise;
+    for agent in &agents {
         if !agent.paired() {
-            crate::log_info!(
-                "celmux-plugin-airsim: agent {id} 尚未配对（控制端口 {control_port}）"
-            );
+            crate::log_info!("celmux-plugin-airsim: agent {} 尚未配对", agent.id());
         }
-        start_control_listener(Arc::clone(&agent), Arc::clone(&client), host);
-        start_pcm_listener(Arc::clone(&agent), Arc::clone(&client), pcm_port);
-        advertise_agent(&agent, host, advertise, &mut advertisements);
+    }
+    // The control listener starts whether or not any line has paired: pairing
+    // happens over HTTP, so the phone has to reach it *before* there is a
+    // secret. Which routes it answers is decided per request, from whether a
+    // secret exists at that moment.
+    start_shared_control_listener(Arc::clone(&fleet), Arc::clone(&client), host, ports);
+    start_shared_pcm_listener(Arc::clone(&fleet), Arc::clone(&client), ports.pcm);
+    // Each line follows Celmux's event stream. Without this the phone's long
+    // poll only ever answers on its timeout, so an incoming call or a received
+    // message looks like it never arrived until something else asks.
+    for agent in &agents {
+        let control = crate::control::Control {
+            client: Arc::clone(&client),
+            agent: Arc::clone(agent),
+            revision: agent.revision(),
+            ports,
+        };
+        Arc::new(control).follow_celmux();
+    }
+    for agent in &agents {
+        advertise_agent(agent, &client, host, advertise, ports, &mut advertisements);
     }
     advertisements
 }
 
-fn start_control_listener(agent: Arc<Agent>, client: Arc<celmux::Client>, host: &str) {
-    let port = agent.config.control_port;
+/// The fleet as the listeners see it: a request is routed to the line whose
+/// secret signed it.
+fn start_shared_control_listener(
+    fleet: Arc<Fleet>,
+    client: Arc<celmux::Client>,
+    host: &str,
+    ports: crate::control::Ports,
+) {
+    let port = ports.control;
     let listener = match std::net::TcpListener::bind(("0.0.0.0", port)) {
         Ok(listener) => listener,
         Err(error) => {
-            crate::log_warn!(
-                "celmux-plugin-airsim: agent {} 无法监听 {port}: {error}",
-                agent.id()
-            );
+            crate::log_error!("celmux-plugin-airsim: 无法监听控制端口 {port}: {error}");
             return;
         }
     };
-    let control = Arc::new(control::Control {
-        client,
-        agent: Arc::clone(&agent),
-        revision: Arc::new(revision::Revision::default()),
-    });
-    // Celmux pushes calls and messages; this is the thread that hears it.
-    Arc::clone(&control).follow_celmux();
-    crate::log_info!(
-        "celmux-plugin-airsim: agent {} 控制接口 http://{host}:{port}",
-        agent.id()
-    );
+    crate::log_info!("celmux-plugin-airsim: 控制接口 http://{host}:{port}（全部线路共用）");
     let handler = {
-        let control = Arc::clone(&control);
-        Arc::new(move |request: http::Request| control.handle(request))
-            as Arc<dyn Fn(http::Request) -> http::Response + Send + Sync>
+        let fleet = Arc::clone(&fleet);
+        let client = Arc::clone(&client);
+        Arc::new(move |request: http::Request| {
+            control::handle_shared(&fleet, &client, &ports, request)
+        }) as Arc<dyn Fn(http::Request) -> http::Response + Send + Sync>
     };
     std::thread::spawn(move || http::serve(listener, handler));
 }
 
-fn start_pcm_listener(agent: Arc<Agent>, client: Arc<celmux::Client>, pcm_port: u16) {
+fn start_shared_pcm_listener(fleet: Arc<Fleet>, client: Arc<celmux::Client>, pcm_port: u16) {
     let listener = match std::net::TcpListener::bind(("0.0.0.0", pcm_port)) {
         Ok(listener) => listener,
         Err(error) => {
-            // The control API is still useful without audio - the phone can
-            // list devices and place calls - so a busy PCM port is reported
-            // rather than fatal.
             crate::log_warn!(
-                "celmux-plugin-airsim: agent {} 无法监听 PCM {pcm_port}: {error}（通话将没有声音）",
-                agent.id()
+                "celmux-plugin-airsim: 无法监听 PCM {pcm_port}: {error}（通话将没有声音）"
             );
             return;
         }
     };
-    crate::log_info!(
-        "celmux-plugin-airsim: agent {} PCM 网关 tcp://0.0.0.0:{pcm_port}",
-        agent.id()
-    );
-    std::thread::spawn(move || pcm::serve(listener, client, agent));
+    crate::log_info!("celmux-plugin-airsim: PCM 网关 tcp://0.0.0.0:{pcm_port}（全部线路共用）");
+    std::thread::spawn(move || pcm::serve_shared(listener, client, fleet));
 }
 
 /// Advertise one agent and keep the handle.
@@ -247,19 +268,23 @@ fn start_pcm_listener(agent: Arc<Agent>, client: Arc<celmux::Client>, pcm_port: 
 /// call that created it.
 fn advertise_agent(
     agent: &Arc<Agent>,
+    client: &Arc<celmux::Client>,
     host: &str,
     advertise: bool,
+    ports: crate::control::Ports,
     advertisements: &mut BTreeMap<String, discovery::Advertisement>,
 ) {
     if !advertise {
         return;
     }
     match discovery::Advertisement::register(
-        &agent.name(),
+        // The TXT `device_name` the phone shows, so it is the line as it is
+        // now rather than the name stored when the line was exposed.
+        &crate::control::line_display_name(client, agent),
         &agent.id(),
         host,
-        agent.config.control_port,
-        agent.config.pcm_port,
+        ports.control,
+        ports.pcm,
     ) {
         Ok(advertisement) => {
             crate::log_info!(

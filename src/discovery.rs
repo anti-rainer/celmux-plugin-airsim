@@ -42,10 +42,22 @@ impl Advertisement {
         let instance = format!("{agent_id}.{SERVICE_TYPE}");
         let control = control_port.to_string();
         let pcm = pcm_port.to_string();
+        // The same TXT record the reference agent publishes. Every field is read
+        // by the app: `v` gates acceptance outright, and `agent_id` is the
+        // credential slot the app looks the pairing secret up by - without it the
+        // app falls back to `vowlan-<host>-<port>`, finds no secret under that
+        // name, and reports the gateway unreachable although pairing succeeded.
         let properties = [
+            ("v", "1"),
+            ("agent_id", agent_id),
+            ("agent_kind", "standalone"),
+            ("device_name", display_name),
+            ("manufacturer", "Celmux"),
+            ("model", "Celmux VoWiFi Gateway"),
             ("host", host),
             ("control_port", control.as_str()),
             ("pcm_port", pcm.as_str()),
+            ("caps", "control,pcm"),
         ];
         let service = ServiceInfo::new(
             SERVICE_TYPE,

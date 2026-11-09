@@ -22,10 +22,10 @@ use crate::http::{Request, Response};
 use crate::pairing::{self, Claim};
 
 /// Handle a pairing request. `None` means the path is not a pairing route.
-pub fn handle(agent: &Arc<Agent>, request: &Request) -> Option<Response> {
+pub fn handle(agent: &Arc<Agent>, ports: &crate::control::Ports, request: &Request) -> Option<Response> {
     match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/pair/v1/info") => Some(info(agent)),
-        ("POST", "/pair/v1/claim") => Some(claim(agent, request)),
+        ("POST", "/pair/v1/claim") => Some(claim(agent, ports, request)),
         _ => None,
     }
 }
@@ -70,7 +70,7 @@ fn info(agent: &Arc<Agent>) -> Response {
 }
 
 /// Exchange a sealed registration for a route proof.
-fn claim(agent: &Arc<Agent>, request: &Request) -> Response {
+fn claim(agent: &Arc<Agent>, ports: &crate::control::Ports, request: &Request) -> Response {
     let payload: Value = match serde_json::from_slice(&request.body) {
         Ok(value) => value,
         Err(error) => {
@@ -195,8 +195,19 @@ fn claim(agent: &Arc<Agent>, request: &Request) -> Response {
         session_id,
         client_key_text,
         &agent.id(),
-        agent.config.control_port,
-        agent.config.pcm_port,
+        ports.control,
+        ports.pcm,
+    );
+    // A fingerprint, never the key: enough to tell "the phone signs with the key
+    // it was given" from "the phone signs with something else", which is the
+    // difference between a key-transport bug and a key-lookup bug.
+    crate::log_info!(
+        "celmux-plugin-airsim: agent {} 密钥指纹 {}",
+        agent.id(),
+        crate::config::base64_url_encode(&{
+            use sha2::Digest as _;
+            sha2::Sha256::digest(&secret)[..8].to_vec()
+        })
     );
     crate::log_info!(
         "celmux-plugin-airsim: agent {} 配对成功 device={}",
@@ -210,8 +221,8 @@ fn claim(agent: &Arc<Agent>, request: &Request) -> Response {
     Response::ok(json!({
         "configured": true,
         "agent_id": agent.id(),
-        "control_port": agent.config.control_port,
-        "pcm_port": agent.config.pcm_port,
+        "control_port": ports.control,
+        "pcm_port": ports.pcm,
         "route_proof": proof,
         "device_id_hint": short_hint(&registration.device_id),
     }))
@@ -235,6 +246,11 @@ fn short_hint(device_id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    const TEST_PORTS: crate::control::Ports = crate::control::Ports {
+        control: 8642,
+        pcm: 8643,
+    };
+
     use super::*;
     use crate::agents::AgentConfig;
 
@@ -243,8 +259,6 @@ mod tests {
             AgentConfig {
                 line_id: "dji1".to_owned(),
                 name: String::new(),
-                control_port: 8642,
-                pcm_port: 8643,
             },
             None,
         ))
@@ -264,7 +278,7 @@ mod tests {
     /// so instead of handing out a key nobody can use.
     #[test]
     fn info_without_a_window_reports_nothing_to_pair_with() {
-        let response = handle(&agent(), &request("GET", "/pair/v1/info", "")).unwrap();
+        let response = handle(&agent(), &TEST_PORTS, &request("GET", "/pair/v1/info", "")).unwrap();
         assert_eq!(response.status, 404);
     }
 
@@ -276,7 +290,7 @@ mod tests {
         agent
             .open_pairing(std::time::Duration::from_secs(300), "s1".to_owned())
             .unwrap();
-        let response = handle(&agent, &request("GET", "/pair/v1/info", "")).unwrap();
+        let response = handle(&agent, &TEST_PORTS, &request("GET", "/pair/v1/info", "")).unwrap();
         assert_eq!(response.status, 200);
         let body: Value = serde_json::from_slice(&response.body).unwrap();
         assert_eq!(body["product"], "airsim-pair");
@@ -299,14 +313,14 @@ mod tests {
             crate::config::base64_url_encode(&[1_u8; 32]),
             crate::config::base64_url_encode(&[2_u8; 40])
         );
-        let response = handle(&agent(), &request("POST", "/pair/v1/claim", &body)).unwrap();
+        let response = handle(&agent(), &TEST_PORTS, &request("POST", "/pair/v1/claim", &body)).unwrap();
         assert_eq!(response.status, 404);
     }
 
     /// A malformed claim is a bad request, not a crash.
     #[test]
     fn a_malformed_claim_is_rejected() {
-        let response = handle(&agent(), &request("POST", "/pair/v1/claim", "{}")).unwrap();
+        let response = handle(&agent(), &TEST_PORTS, &request("POST", "/pair/v1/claim", "{}")).unwrap();
         assert_eq!(response.status, 400);
     }
 
@@ -323,7 +337,7 @@ mod tests {
             crate::config::base64_url_encode(&[1_u8; 32]),
             crate::config::base64_url_encode(&[2_u8; 40])
         );
-        let response = handle(&agent, &request("POST", "/pair/v1/claim", &body)).unwrap();
+        let response = handle(&agent, &TEST_PORTS, &request("POST", "/pair/v1/claim", &body)).unwrap();
         assert_eq!(response.status, 403);
         assert!(!agent.paired());
     }
@@ -341,13 +355,13 @@ mod tests {
             crate::config::base64_url_encode(&[1_u8; 32]),
             crate::config::base64_url_encode(&[2_u8; 40])
         );
-        let response = handle(&agent, &request("POST", "/pair/v1/claim", &body)).unwrap();
+        let response = handle(&agent, &TEST_PORTS, &request("POST", "/pair/v1/claim", &body)).unwrap();
         assert_eq!(response.status, 403);
     }
 
     #[test]
     fn a_non_pairing_path_is_left_to_the_caller() {
-        assert!(handle(&agent(), &request("GET", "/v1/health", "")).is_none());
+        assert!(handle(&agent(), &TEST_PORTS, &request("GET", "/v1/health", "")).is_none());
     }
 
     /// The hint is only the tail of a device id, which is all the phone shows.

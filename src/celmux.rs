@@ -46,6 +46,50 @@ pub struct Line {
     pub n_standby: bool,
 }
 
+impl Line {
+    /// Whether this line can carry a call or a message at all.
+    ///
+    /// A module in N-standby still reports its own bare line alongside the
+    /// Profile lines, but that bare line has no card of its own to use: the
+    /// cards belong to the Profiles. Offering it would put an entry in the
+    /// phone's list that can never place a call.
+    /// A bare module line is the fallback Celmux reports for the module itself,
+    /// as opposed to a line backed by one Profile card.
+    pub fn is_bare(&self) -> bool {
+        self.profile_name.is_empty() && !self.line_id.contains('#')
+    }
+
+    /// Whether this line can carry a call or a message right now.
+    ///
+    /// Two things disqualify a line and they are independent. A bare line on a
+    /// module that also reports Profiles cannot select a card. And any line
+    /// whose voice route Celmux reports as unavailable has nothing to dial
+    /// through - that is what the module in N-standby shows for its own bare
+    /// line, because the voice route belongs to the Profiles.
+    pub fn usable(&self) -> bool {
+        self.voice_route != "unavailable"
+    }
+
+    /// What the phone shows for this line: device, operator and number.
+    ///
+    /// One shape for every line, whether or not the module is in N-standby:
+    /// the phone lists these side by side, and two naming schemes would look
+    /// like two different kinds of thing. An absent part is left out rather than
+    /// shown as an empty separator.
+    pub fn card_name(&self) -> String {
+        let operator = if self.operator_name.is_empty() {
+            self.profile_name.as_str()
+        } else {
+            self.operator_name.as_str()
+        };
+        [self.device_name.as_str(), operator, self.local_phone.as_str()]
+            .into_iter()
+            .filter(|part| !part.trim().is_empty())
+            .collect::<Vec<&str>>()
+            .join(" · ")
+    }
+}
+
 /// One module as Celmux reports it, reduced to what a line card shows.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Device {
@@ -317,10 +361,20 @@ impl Client {
         self.request("GET", "/events/once", None)
     }
 
-    /// Recent messages as Celmux reports them, newest first.
-    pub fn messages(&self) -> Result<Value, Error> {
-        self.request("GET", "/sms", None)
+    /// Recent messages for one line, newest first.
+    ///
+    /// Celmux holds every line's messages; this asks for its own. The phone is
+    /// that line's phone, so a conversation it cannot answer from here is not
+    /// its business - and handing it another line's messages would attribute
+    /// that number to this device.
+    pub fn messages(&self, line_id: &str) -> Result<Value, Error> {
+        // The line is named the way Celmux names lines everywhere: `module` for
+        // a device's own line, `module#iccid` for one Profile on it. Celmux
+        // resolves the card from that label itself, so nothing is guessed here.
+        let encoded = percent_encode(line_id);
+        self.request("GET", &format!("/sms?line={encoded}"), None)
     }
+
 
     /// Send one message on one line.
     pub fn send_sms(&self, line_id: &str, to: &str, text: &str) -> Result<Value, Error> {
@@ -515,6 +569,24 @@ fn read_chunk(
     let mut crlf = String::new();
     let _ = reader.read_line(&mut crlf);
     Ok(true)
+}
+
+/// Percent-encode a value for a query string.
+///
+/// A line label can carry `#` (a Profile line is `module#iccid`), and an
+/// unencoded `#` would truncate the query at the fragment, silently asking
+/// Celmux for the module's line instead of the Profile's.
+fn percent_encode(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(char::from(*byte));
+            }
+            other => encoded.push_str(&format!("%{other:02X}")),
+        }
+    }
+    encoded
 }
 
 fn read_http(stream: &mut dyn std::io::Read) -> Result<(u16, Vec<u8>), Error> {

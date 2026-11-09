@@ -24,6 +24,16 @@ pub struct Control {
     /// What a long poll compares against: bumped whenever anything the phone
     /// cares about changes.
     pub revision: Arc<crate::revision::Revision>,
+    /// The ports every line shares. Reported in health so the phone knows where
+    /// to open audio, and the same two numbers for every line.
+    pub ports: Ports,
+}
+
+/// The installation-wide pair of ports the phone talks to.
+#[derive(Clone, Copy, Debug)]
+pub struct Ports {
+    pub control: u16,
+    pub pcm: u16,
 }
 
 /// One device as the phone understands it: a thing with a name that can place
@@ -39,25 +49,76 @@ struct DeviceView {
 }
 
 fn devices(lines: Vec<Line>) -> Vec<DeviceView> {
+    // A module that reports Profile lines also reports a bare line of its own,
+    // left over from before the Profiles existed. It cannot select a card, so it
+    // stays out of the phone's list; a module with no Profiles keeps its bare
+    // line, because that is its only one.
+    let modules_with_profiles: std::collections::BTreeSet<String> = lines
+        .iter()
+        .filter(|line| !line.is_bare())
+        .map(|line| line.device_id.clone())
+        .collect();
     lines
         .into_iter()
+        .filter(|line| {
+            let keep = line.usable();
+            if !keep {
+                // Only a dropped line is worth a line of log: it explains a
+                // number the operator expected to see and did not.
+                crate::log_info!(
+                    "celmux-plugin-airsim: 线路 {} 语音路由不可用（{}），不暴露给手机",
+                    line.line_id,
+                    line.voice_route
+                );
+            }
+            keep
+        })
+        .filter(|line| !(line.is_bare() && modules_with_profiles.contains(&line.device_id)))
         .map(|line| {
             let id = line.line_id.clone();
-            let name = if line.n_standby {
-                // A Profile line is distinguished by its subscription, not by
-                // the device it shares with its siblings.
-                let operator = if line.operator_name.is_empty() {
-                    line.profile_name.clone()
-                } else {
-                    line.operator_name.clone()
-                };
-                format!("{} · {}", line.device_name, operator)
-            } else {
-                line.device_name.clone()
-            };
+            let name = line.card_name();
             DeviceView { id, name, line }
         })
         .collect()
+}
+
+/// The name this agent's line should be shown under.
+///
+/// Computed from the line as Celmux reports it now, not from the name stored
+/// when the operator exposed the line: a line's card, operator and number all
+/// change while the exposure stays, and a stale snapshot would keep showing the
+/// old ones. Falls back to the stored name when Celmux cannot be reached, so a
+/// network blip does not rename the device to nothing.
+pub fn line_display_name(client: &Client, agent: &crate::agents::Agent) -> String {
+client
+    .lines()
+    .ok()
+    .and_then(|lines| {
+        lines
+            .into_iter()
+            .find(|line| line.line_id == agent.config.line_id)
+    })
+    .map(|line| line.card_name())
+    .filter(|name| !name.trim().is_empty())
+    .unwrap_or_else(|| agent.name())
+}
+
+/// The call id Celmux assigned, as text.
+///
+/// Celmux nests the call row under `call.call`; the id is a number there and the
+/// client wants it as an opaque string.
+fn call_id_text(value: &Value) -> Option<String> {
+    let id = value
+        .get("call")
+        .and_then(|call| call.get("call"))
+        .and_then(|call| call.get("id"))
+        .or_else(|| value.get("call").and_then(|call| call.get("id")))
+        .or_else(|| value.get("id"))?;
+    match id {
+        Value::Number(number) => Some(number.to_string()),
+        Value::String(text) => Some(text.clone()),
+        _ => None,
+    }
 }
 
 /// One numeric query parameter, or `None`.
@@ -108,50 +169,124 @@ fn active_call(value: &Value) -> Option<Value> {
     ))
 }
 
-impl Control {
-    /// Route one request. `Ok` carries the response; `Err` is a request that
-    /// failed authentication, which is always a 401 with no detail beyond that.
-    pub fn handle(self: &Arc<Self>, request: Request) -> Response {
-        // An unsigned liveness probe: the phone and any operator tooling use it
-        // to tell "port closed" from "auth wrong", and it says nothing.
-        if request.path == "/healthz" {
-            return Response::ok(json!({"ok": true}));
+/// Route one request on the shared control port.
+///
+/// Every line listens on this one port, and the request itself names its line:
+/// it is signed with that line's secret, so verifying against each known secret
+/// identifies the line. That is how the reference agent works too - it scans its
+/// paired records and takes the one whose secret verifies. Without a line there
+/// is nothing to answer, so an unverifiable request is a 401 and an unpaired
+/// installation answers only the pairing exchange.
+pub fn handle_shared(
+    fleet: &Arc<crate::agents::Fleet>,
+    client: &Arc<Client>,
+    ports: &Ports,
+    request: Request,
+) -> Response {
+    // An unsigned liveness probe says nothing and needs no line.
+    if request.path == "/healthz" {
+        return Response::ok(json!({"ok": true}));
+    }
+    // Every request on this port is logged with the headers that decide
+    // authorship. When a phone reports the gateway unreachable, this is the only
+    // way to tell "the request never arrived" from "it arrived and was
+    // refused" - and if it was refused, which line it should have matched.
+    crate::log_info!(
+        "celmux-plugin-airsim: 收到 {} {} 时间戳={:?} nonce={:?} 签名={}",
+        request.method,
+        request.path,
+        request.headers.get(crate::auth::HEADER_TIMESTAMP),
+        request.headers.get(crate::auth::HEADER_NONCE),
+        request
+            .headers
+            .get(crate::auth::HEADER_SIGNATURE)
+            .map(|value| value.chars().take(8).collect::<String>())
+            .unwrap_or_default()
+    );
+    let now = std::time::SystemTime::now();
+    let target = if request.query.is_empty() {
+        request.path.clone()
+    } else {
+        format!("{}?{}", request.path, request.query)
+    };
+    for agent in fleet.list() {
+        let Some(verifier) = agent.verifier() else {
+            continue;
+        };
+        if verifier
+            .verify(
+                &request.method,
+                &target,
+                &request.body,
+                &request.headers,
+                now,
+            )
+            .is_ok()
+        {
+            // The revision is the line's, not a fresh one: the phone's long
+            // poll compares against it, and the thread following Celmux bumps
+            // it. A revision created per request would never change, so every
+            // poll would wait out its full timeout and a call would look like
+            // it never arrived.
+            let control = Control {
+                client: Arc::clone(client),
+                revision: agent.revision(),
+                agent,
+                ports: *ports,
+            };
+            return control.handle_verified(request);
         }
-        // Before this agent has paired there is no secret, so nothing can be
-        // verified and the only thing worth answering is the pairing exchange.
-        // Read through the agent rather than a field set at startup: pairing
-        // happens while this listener is already running, and a verifier fixed
-        // at startup would keep the agent refusing the secret pairing just gave
-        // it.
-        let Some(verifier) = self.agent.verifier() else {
-            if let Some(response) = crate::pair_endpoint::handle(&self.agent, &request) {
-                return response;
+    }
+    // No line's secret verified it. Say why per line, because "签名不匹配" alone
+    // cannot distinguish a stale secret on the phone from a clock skew from a
+    // path mismatch - and each of those has a different fix.
+    for agent in fleet.list() {
+        match agent.verifier() {
+            Some(verifier) => {
+                if let Err(error) = verifier.verify(
+                    &request.method,
+                    &target,
+                    &request.body,
+                    &request.headers,
+                    now,
+                ) {
+                    crate::log_warn!(
+                        "celmux-plugin-airsim: {} 校验失败: {error:?}",
+                        agent.id()
+                    );
+                }
             }
-            return Response::error(
-                503,
-                "Service Unavailable",
-                "not_paired",
-                "该 agent 尚未配对，请先在 Celmux 插件设置中开始配对",
-            );
-        };
-        let now = std::time::SystemTime::now();
-        // The canonical string uses the request target as sent, query string
-        // included: the app signs `api/events?after=…&timeout_ms=…` whole, so
-        // verifying against the path alone rejects every parameterised request.
-        let target = if request.query.is_empty() {
-            request.path.clone()
-        } else {
-            format!("{}?{}", request.path, request.query)
-        };
-        if let Err(error) = verifier.verify(
-            &request.method,
-            &target,
-            &request.body,
-            &request.headers,
-            now,
-        ) {
-            return Response::error(401, "Unauthorized", "unauthorized", &error.to_string());
+            None => crate::log_warn!("celmux-plugin-airsim: {} 没有配对密钥", agent.id()),
         }
+    }
+    // Before any line has paired, the only thing worth answering is the pairing
+    // exchange itself, which is what a phone that is about to pair asks for.
+    for agent in fleet.list() {
+        if agent.paired() {
+            continue;
+        }
+        if let Some(response) = crate::pair_endpoint::handle(&agent, ports, &request) {
+            return response;
+        }
+    }
+    if fleet.list().iter().all(|agent| !agent.paired()) {
+        return Response::error(
+            503,
+            "Service Unavailable",
+            "not_paired",
+            "尚未配对，请先在 Celmux 插件设置中开始配对",
+        );
+    }
+    Response::error(401, "Unauthorized", "unauthorized", "签名不匹配")
+}
+
+impl Control {
+    /// Route one request that has already been attributed to this line.
+    ///
+    /// Authentication happens in [`handle_shared`], which has to look at every
+    /// line's secret to know which line the request belongs to. Repeating it
+    /// here would verify the same signature twice for no information.
+    pub fn handle_verified(&self, request: Request) -> Response {
         match (request.method.as_str(), request.path.as_str()) {
             // iOS uses two names for the same probe. `/v1/health` is the
             // VoWLAN gateway's own identity answer; `/api/health` is the
@@ -163,7 +298,11 @@ impl Control {
             // string for the status screen. Answering both with one payload
             // makes one of the two fail to decode.
             ("GET", "/v1/health") => self.health(&request),
-            ("GET", "/api/health") => self.agent_health(),
+            // The app polls this one, and it decodes the same fields as /v1:
+            // `identity_proof` in particular, without which it refuses the
+            // gateway outright. Two health routes with different bodies is how
+            // the app came to report 「VoWLAN 鉴权失败」 while curl saw 200.
+            ("GET", "/api/health") => self.health(&request),
             ("GET", "/v1/devices/status") => self.device_status(),
             ("GET", "/api/status") => self.device_status(),
             ("GET", "/api/calls/status") => self.call_status(),
@@ -172,6 +311,22 @@ impl Control {
             ("GET", "/api/sim/identity") => self.sim_identity(),
             ("GET", "/api/sms") => self.messages(),
             ("GET", "/api/sms/status") => self.sms_status(),
+            // Routes the app calls that carry no Celmux-side meaning yet. Each
+            // one answers in the shape the app decodes rather than 404: a 404 is
+            // read as "this gateway is not an agent", and the app then stops
+            // probing an otherwise healthy line.
+            ("GET", "/api/push/status") => self.push_status(),
+            ("POST", "/api/push/register") => self.push_register(&request),
+            ("POST", "/api/push/mode") => Response::ok(self.push_status_body()),
+            ("GET", "/api/local-mode") => Response::ok(json!({"local_mode": true})),
+            ("POST", "/api/local-mode") => Response::ok(json!({"local_mode": true})),
+            ("GET", "/api/android/status") => self.device_status(),
+            ("GET", "/api/calls/early-media") => {
+                Response::error(404, "Not Found", "not_found", "早期媒体未启用")
+            }
+            ("POST", "/api/calls/audio/host/warmup") => Response::ok(json!({"ok": true})),
+            ("POST", "/api/calls/audio/host/register") => Response::ok(json!({"ok": true})),
+            ("POST", "/api/calls/resolve") => self.device_status(),
             ("POST", "/api/sms/send") => self.send_sms(&request),
             ("POST", "/api/sms/ack") => Response::ok(json!({"ok": true, "acked": 0})),
             // The app records hangs up and history locally first, then tells the
@@ -220,11 +375,13 @@ impl Control {
         Response::ok(json!({
             "ok": true,
             "transport": "vowlan",
-            "version": 1,
+            // A String on the client: an integer here fails decoding and the
+            // app's status screen goes blank.
+            "version": "0.2.0",
             "agent_id": agent_id,
             "identity_proof": proof,
             "agent_kind": "standalone",
-            "device_name": self.agent.name(),
+            "device_name": self.line_name(),
             "manufacturer": "Celmux",
             "model": "Celmux VoWiFi Gateway",
             // The subscriber this agent's line answers on. The phone shows it
@@ -233,8 +390,8 @@ impl Control {
             // all even though pairing succeeded.
             "phone_number": self.line_phone(),
             "canonical_call_ids": true,
-            "control_port": self.agent.config.control_port,
-            "pcm_port": self.agent.config.pcm_port,
+            "control_port": self.ports.control,
+            "pcm_port": self.ports.pcm,
         }))
     }
 
@@ -251,41 +408,6 @@ impl Control {
             })
             .map(|line| line.local_phone)
             .unwrap_or_default()
-    }
-
-    /// `GET /api/health` — the agent's own health, which is a different model
-    /// from the VoWLAN identity answer above.
-    fn agent_health(&self) -> Response {
-        let (state, registration) = self.cellular_state();
-        Response::ok(super::control_api::agent_health(
-            env!("CARGO_PKG_VERSION"),
-            &state,
-            &registration,
-        ))
-    }
-
-    /// The module's registration state, as far as Celmux will say.
-    ///
-    /// Absence is reported as empty strings rather than guesses: the app shows
-    /// these two verbatim, and inventing "registered" would tell the operator a
-    /// line can call when it cannot.
-    fn cellular_state(&self) -> (String, String) {
-        let Ok(devices) = self.client.devices() else {
-            return (String::new(), String::new());
-        };
-        let Some(device) = devices
-            .iter()
-            .find(|device| device.id == self.agent.config.line_id || device.id == self.agent.config.line_id.split('#').next().unwrap_or(""))
-        else {
-            return (String::new(), String::new());
-        };
-        let state = if device.running { "registered" } else { "unregistered" };
-        let registration = if device.vowifi_n_standby_active || device.running {
-            "home"
-        } else {
-            ""
-        };
-        (state.to_owned(), registration.to_owned())
     }
 
     /// `GET /v1/devices/status` — what the phone lists.
@@ -411,7 +533,7 @@ impl Control {
 
     fn sms_count(&self) -> usize {
         self.client
-            .messages()
+            .messages(&self.agent.config.line_id)
             .ok()
             .and_then(|value| {
                 value
@@ -446,10 +568,15 @@ impl Control {
     /// other party. Sending its rows through unchanged would show every message
     /// as incoming from the phone's own number.
     fn messages(&self) -> Response {
-        match self.client.messages() {
+        match self.client.messages(&self.agent.config.line_id) {
             Ok(value) => {
                 let messages = super::control_api::sms_messages(&value);
-                Response::ok(json!({"ok": true, "messages": messages}))
+                // A bare array, because the app decodes `[SMSMessage]` from this
+                // route. The Android agent it was written against answers that
+                // way; wrapping it in an object makes the decode fail and the
+                // list silently keep whatever it had before - a refresh button
+                // that appears to do nothing.
+                Response::ok(Value::Array(messages))
             }
             Err(error) => Response::error(
                 502,
@@ -458,6 +585,46 @@ impl Control {
                 &error.to_string(),
             ),
         }
+    }
+
+    /// What this agent's line is called right now.
+    fn line_name(&self) -> String {
+        line_display_name(&self.client, &self.agent)
+    }
+
+    /// The push status document.
+    ///
+    /// The app reads this to decide whether a cloud path is configured, and it
+    /// is where `local_mode` comes from. This gateway is local-only, so the
+    /// honest answer is "configured, cloud off": reporting a cloud path it does
+    /// not have would send the app down a relay that never answers.
+    fn push_status(&self) -> Response {
+        Response::ok(self.push_status_body())
+    }
+
+    fn push_status_body(&self) -> serde_json::Value {
+        json!({
+            "local_mode": true,
+            "cloud_enabled": false,
+            "configured": true,
+            "call_push_ready": false,
+            "message_push_ready": false,
+            "last_error": "",
+            "wan_interface": "celmux",
+        })
+    }
+
+    /// `POST /api/push/register`
+    ///
+    /// The app registers its APNs tokens here when a cloud path is in use. This
+    /// gateway has none, so nothing is stored and the reply says so instead of
+    /// pretending the registration took.
+    fn push_register(&self, _request: &Request) -> Response {
+        Response::ok(json!({
+            "registered": false,
+            "local_mode": true,
+            "reason": "celmux 直连网关不使用云端推送",
+        }))
     }
 
     /// `GET /api/sms/status`
@@ -499,12 +666,31 @@ impl Control {
             .to_owned();
         match self.client.dial(&line_id, &number) {
             Ok(value) => {
-                // A dial that the app is not told about is a call it cannot show
-                // until its next poll, so the poll is released now.
+                // The app does not treat a 200 as "the call started". It decodes
+                // a receipt binding this request to one call, and without the
+                // fields below it concludes the peer is unsupported and never
+                // asks for audio at all - which is exactly what "stuck
+                // establishing the voice link" looks like from the phone.
                 self.revision.bump();
+                let android_id = call_id_text(&value).unwrap_or_default();
+                // The nonce of this very request is what the receipt is signed
+                // over, so the proof cannot be replayed onto another dial.
+                let nonce = request
+                    .headers
+                    .get(crate::auth::HEADER_NONCE)
+                    .cloned()
+                    .unwrap_or_default();
+                let backend_id = format!("celmux:{line_id}");
+                let operation_proof = self.agent.proof(&format!(
+                    "AIRSIM-DIAL1\n{nonce}\n{operation_id}\n{android_id}\n{backend_id}"
+                ));
                 Response::ok(json!({
                     "ok": true,
+                    "version": 1,
                     "operation_id": operation_id,
+                    "android_id": android_id,
+                    "backend_id": backend_id,
+                    "operation_proof": operation_proof,
                     "line_id": line_id,
                     "number": number,
                     "call": value,
@@ -533,7 +719,7 @@ impl Control {
             "route_ready": true,
             "route_session_ready": true,
             "route_running": true,
-            "pcm_port": self.agent.config.pcm_port,
+            "pcm_port": self.ports.pcm,
             "diagnostic_log": "音频由 PCM 网关承载",
             "log_tail": [],
         }))
@@ -689,8 +875,6 @@ mod tests {
             crate::agents::AgentConfig {
                 line_id: "读卡器1".to_owned(),
                 name: "读卡器1".to_owned(),
-                control_port: 18642,
-                pcm_port: 18643,
             },
             // A fixed secret: the test signs with the same bytes the verifier
             // holds, so it exercises the real authentication path.
@@ -739,6 +923,11 @@ mod tests {
         signed_request_with(method, path, &[7_u8; 32])
     }
 
+    const TEST_PORTS: crate::control::Ports = crate::control::Ports {
+        control: 18642,
+        pcm: 18643,
+    };
+
     fn control() -> Arc<Control> {
         Arc::new(Control {
             // A port nothing listens on: routes that reach Celmux fail closed,
@@ -750,6 +939,7 @@ mod tests {
             )),
             agent: test_agent(),
             revision: Arc::new(crate::revision::Revision::default()),
+            ports: TEST_PORTS,
         })
     }
 
@@ -758,7 +948,7 @@ mod tests {
     /// exactly the bug this test exists for.
     #[test]
     fn the_health_route_answers_the_field_the_client_decodes() {
-        let response = control().handle(signed_request("GET", "/v1/health"));
+        let response = control().handle_verified(signed_request("GET", "/v1/health"));
         assert_eq!(response.status, 200);
         let body: Value = serde_json::from_slice(&response.body).unwrap();
         assert!(body.get("identity_proof").is_some(), "body: {body}");
@@ -768,21 +958,31 @@ mod tests {
         assert!(body.get("device_name").is_some());
     }
 
-    /// `AgentHealth.version` is a String on the client; an integer there fails
-    /// decoding and the status screen goes blank.
+    /// Both health routes answer the same document.
+    ///
+    /// The app polls `/api/health`; `/v1/health` is the older sibling. When the
+    /// two differed, the app decoded `identity_proof` from a body that did not
+    /// carry it and reported 「VoWLAN 鉴权失败」 while curl saw a healthy 200.
+    /// `version` is a String on the client, so an integer there blanks the
+    /// status screen.
     #[test]
-    fn the_agent_health_route_reports_a_string_version() {
-        let response = control().handle(signed_request("GET", "/api/health"));
-        assert_eq!(response.status, 200);
-        let body: Value = serde_json::from_slice(&response.body).unwrap();
-        assert!(body["version"].is_string(), "body: {body}");
-        assert_eq!(body["ok"], true);
+    fn both_health_routes_answer_the_same_document() {
+        for path in ["/api/health", "/v1/health"] {
+            let response = control().handle_verified(signed_request("GET", path));
+            assert_eq!(response.status, 200, "{path}");
+            let body: Value = serde_json::from_slice(&response.body).unwrap();
+            assert!(body["version"].is_string(), "{path}: {body}");
+            assert_eq!(body["ok"], true, "{path}");
+            assert!(body.get("identity_proof").is_some(), "{path}: {body}");
+            assert!(body.get("agent_id").is_some(), "{path}: {body}");
+            assert!(body.get("phone_number").is_some(), "{path}: {body}");
+        }
     }
 
     /// The app long-polls this and reads the call status nested inside it.
     #[test]
     fn the_event_route_nests_the_call_status() {
-        let response = control().handle(signed_request("GET", "/api/events"));
+        let response = control().handle_verified(signed_request("GET", "/api/events"));
         assert_eq!(response.status, 200);
         let body: Value = serde_json::from_slice(&response.body).unwrap();
         assert!(body["call"].is_object(), "body: {body}");
@@ -820,7 +1020,7 @@ mod tests {
         headers.insert("x-airsim-vowlan-timestamp".to_owned(), timestamp.to_string());
         headers.insert("x-airsim-vowlan-nonce".to_owned(), "nonce-q".to_owned());
         headers.insert("x-airsim-vowlan-signature".to_owned(), signature);
-        let response = control().handle(Request {
+        let response = control().handle_verified(Request {
             method: "GET".to_owned(),
             path: path.to_owned(),
             query: query.to_owned(),
@@ -828,6 +1028,21 @@ mod tests {
             body: Vec::new(),
         });
         assert_eq!(response.status, 200, "a signed long poll must verify");
+    }
+
+    /// The app decodes `[SMSMessage]` from `/api/sms`. Answering an object makes
+    /// the decode fail, and the app keeps the list it already has - a refresh
+    /// that appears to do nothing rather than an error anyone can see.
+    #[test]
+    fn the_sms_route_answers_a_bare_array() {
+        let response = control().handle_verified(signed_request("GET", "/api/sms"));
+        // The client is unreachable in this test, so the shape is what can be
+        // asserted: never an object with a `messages` key.
+        let body = String::from_utf8_lossy(&response.body);
+        assert!(
+            !body.contains("\"messages\""),
+            "must not wrap the list: {body}"
+        );
     }
 
     /// Every route the phone calls must exist, even when it fails closed: a 404
@@ -849,7 +1064,7 @@ mod tests {
             "/api/feedback",
             "/api/debug",
         ] {
-            let response = control.handle(signed_request("GET", path));
+            let response = control.handle_verified(signed_request("GET", path));
             assert_ne!(response.status, 404, "{path} is missing");
         }
     }
@@ -857,29 +1072,64 @@ mod tests {
     /// A wrong secret is a refusal, not an answer.
     #[test]
     fn a_request_signed_with_the_wrong_secret_is_refused() {
-        let response = control().handle(signed_request_with("GET", "/v1/health", &[9_u8; 32]));
-        assert_eq!(response.status, 401);
+        // Through the shared port, because that is where the signature decides
+        // which line - and whether any line - the request belongs to.
+        // A fleet in a scratch directory: reconcile creates the agents, and the
+        // secret is handed to each the way pairing would.
+        let root = std::env::temp_dir().join("celmux-plugin-shared-route-test");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::create_dir_all(&root);
+        let fleet = Arc::new(crate::agents::Fleet::new(&root));
+        fleet
+            .reconcile(vec![crate::agents::AgentConfig {
+                line_id: "读卡器1".to_owned(),
+                name: "读卡器1".to_owned(),
+            }])
+            .unwrap();
+        for agent in fleet.list() {
+            agent.set_secret(vec![7_u8; 32]);
+        }
+        let client = Arc::new(Client::new(
+            "http://127.0.0.1:1".to_owned(),
+            "unused".to_owned(),
+            "airsim".to_owned(),
+        ));
+        let wrong = self::handle_shared(
+            &fleet,
+            &client,
+            &TEST_PORTS,
+            signed_request_with("GET", "/v1/health", &[9_u8; 32]),
+        );
+        assert_eq!(wrong.status, 401, "签错密钥必须被拒绝");
+        let right = self::handle_shared(
+            &fleet,
+            &client,
+            &TEST_PORTS,
+            signed_request_with("GET", "/v1/health", &[7_u8; 32]),
+        );
+        assert_eq!(right.status, 200, "签对密钥应被接受");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A device's own line keeps the device name, because that is what the
-    /// operator calls it.
+    /// Every line is named the same way: device, operator, number. The phone
+    /// lists them side by side, and a module with an extra naming scheme would
+    /// read as a different kind of thing.
     #[test]
-    fn a_device_line_is_named_after_its_device() {
+    fn a_line_is_named_by_device_operator_and_number() {
         let views = devices(vec![line("d1", "读卡器1", "Globe", "", false)]);
-        assert_eq!(views[0].name, "读卡器1");
+        assert_eq!(views[0].name, "读卡器1 · Globe · +100");
         assert_eq!(views[0].id, "d1");
     }
 
-    /// Under N-standby several lines share one device, so the device name alone
-    /// would give the phone two indistinguishable entries.
+    /// Under N-standby several lines share one device, so the number is what
+    /// keeps the entries apart.
     #[test]
-    fn n_standby_lines_are_distinguished_by_their_subscription() {
+    fn n_standby_lines_are_distinguished_by_their_number() {
         let views = devices(vec![
             line("d1#890", "dji1", "Globe", "Globe", true),
             line("d1#891", "dji1", "Smart", "Smart", true),
         ]);
-        assert_eq!(views[0].name, "dji1 · Globe");
-        assert_eq!(views[1].name, "dji1 · Smart");
+        assert_eq!(views[0].name, "dji1 · Globe · +100");
         assert_ne!(views[0].name, views[1].name);
     }
 
@@ -888,6 +1138,66 @@ mod tests {
     #[test]
     fn a_profile_line_falls_back_to_its_profile_name() {
         let views = devices(vec![line("d1#890", "dji1", "", "旅行卡", true)]);
-        assert_eq!(views[0].name, "dji1 · 旅行卡");
+        assert_eq!(views[0].name, "dji1 · 旅行卡 · +100");
+    }
+
+    /// A module that reports Profiles also reports a bare line of its own, left
+    /// over from before the Profiles existed. It cannot select a card, so it
+    /// must not reach the phone - while a module with no Profiles keeps its
+    /// bare line, because that is its only one.
+    #[test]
+    fn a_bare_line_is_dropped_only_when_its_module_has_profiles() {
+        let views = devices(vec![
+            line("读卡器2", "读卡器2", "", "", false),
+            line("读卡器2#890", "读卡器2", "Vodafone", "Vodafone UK", true),
+            line("读卡器1", "读卡器1", "Globe", "", false),
+        ]);
+        let ids: Vec<&str> = views.iter().map(|view| view.id.as_str()).collect();
+        assert_eq!(ids, vec!["读卡器2#890", "读卡器1"], "裸线路只在该模组有 Profile 时丢弃");
+    }
+    /// The app's `AgentPushStatus` has four required fields. A 404 here is read
+    /// as "not an agent" and the app stops probing a healthy line, so this route
+    /// has to answer - with the local truth, which is that there is no cloud
+    /// path to register against.
+    #[test]
+    fn the_push_status_route_answers_the_shape_the_app_decodes() {
+        let response = control().handle_verified(signed_request("GET", "/api/push/status"));
+        assert_eq!(response.status, 200);
+        let body: Value = serde_json::from_slice(&response.body).unwrap();
+        for key in [
+            "local_mode",
+            "cloud_enabled",
+            "configured",
+            "call_push_ready",
+            "message_push_ready",
+        ] {
+            assert!(body.get(key).is_some(), "缺少 {key}: {body}");
+        }
+        assert_eq!(body["local_mode"], true);
+        assert_eq!(body["cloud_enabled"], false);
+        assert_eq!(body["configured"], true);
+    }
+
+    /// Every route the app is allowed to call must answer rather than 404.
+    #[test]
+    fn every_route_the_app_calls_is_answered() {
+        let control = control();
+        for path in [
+            "/v1/health",
+            "/api/health",
+            "/api/status",
+            "/api/debug",
+            "/api/push/status",
+            "/api/calls/status",
+            "/api/calls/events",
+            "/api/sms",
+            "/api/sms/status",
+            "/api/feedback",
+            "/api/calls/audio/host/config",
+            "/api/local-mode",
+        ] {
+            let response = control.handle_verified(signed_request("GET", path));
+            assert_ne!(response.status, 404, "{path} 返回 404");
+        }
     }
 }

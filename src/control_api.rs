@@ -57,21 +57,6 @@ pub fn call_status(active: Option<Value>, history: Vec<Value>) -> Value {
     })
 }
 
-/// `AgentHealth` for the `/api/health` route.
-///
-/// `ok` and `version` are required by the client; the rest are diagnostics it
-/// shows when present. `version` is a string here even though it is an integer
-/// on the VoWLAN route, because that is what this model declares.
-pub fn agent_health(version: &str, cellular_state: &str, registration: &str) -> Value {
-    json!({
-        "ok": true,
-        "version": version,
-        "control_plane": "celmux",
-        "cellular_state": cellular_state,
-        "cellular_registration": registration,
-    })
-}
-
 /// `SIMStatus`-shaped answer for `api/sim/identity`.
 ///
 /// The client decodes `phone_number` as a required string, so an unknown number
@@ -261,16 +246,6 @@ mod tests {
         assert!(status.get("event_driven").is_none());
         assert!(status.get("revision").is_none());
         assert_eq!(status["poll_interval_s"], 2);
-    }
-
-    /// `version` is a string on this model and an integer on the VoWLAN one;
-    /// sending the wrong type fails decoding.
-    #[test]
-    fn agent_health_reports_a_string_version() {
-        let health = agent_health("0.2.0", "registered", "home");
-        assert_eq!(health["version"], "0.2.0");
-        assert_eq!(health["ok"], true);
-        assert_eq!(health["control_plane"], "celmux");
     }
 
     /// A slot with no number must send an empty string: the client treats the

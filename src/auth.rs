@@ -40,6 +40,7 @@ pub const HEADER_SIGNATURE: &str = "x-airsim-vowlan-signature";
 pub const HEADER_TIMESTAMP: &str = "x-airsim-vowlan-timestamp";
 pub const HEADER_NONCE: &str = "x-airsim-vowlan-nonce";
 
+#[derive(Debug)]
 pub enum AuthError {
     MissingHeader(&'static str),
     BadTimestamp,
@@ -106,6 +107,17 @@ impl Verifier {
         let expected = sign(&self.key, canonical.as_bytes());
         let supplied =
             crate::config::base64_url_decode(signature).ok_or(AuthError::SignatureMismatch)?;
+        // The canonical string and both MACs, so a mismatch can be read instead
+        // of guessed at. The secret itself is never printed: knowing it is
+        // enough to sign as this line.
+        if expected.ct_eq(&supplied).unwrap_u8() != 1 {
+            crate::log_warn!(
+                "celmux-plugin-airsim: 签名不符 canonical={:?} 期望={} 收到={}",
+                canonical,
+                crate::config::base64_url_encode(&expected),
+                crate::config::base64_url_encode(&supplied)
+            );
+        }
         // Constant time: a length leak here would let an attacker learn the MAC
         // one byte at a time.
         if expected.ct_eq(&supplied).unwrap_u8() != 1 {
@@ -139,6 +151,15 @@ impl Verifier {
         let message = format!("AIRSIM-HEALTH1\n{nonce}\n{agent_id}");
         crate::config::base64_url_encode(&sign(&self.key, message.as_bytes()))
     }
+
+    /// Sign one canonical message with this agent's secret.
+    ///
+    /// Every proof the client checks is an HMAC over a string it builds itself -
+    /// the health proof, the dial receipt - so the signing is one operation and
+    /// only the message differs.
+    pub fn proof(&self, message: &str) -> String {
+        crate::config::base64_url_encode(&sign(&self.key, message.as_bytes()))
+    }
 }
 
 fn header<'a>(
@@ -162,6 +183,33 @@ pub fn canonical(method: &str, path: &str, body: &[u8], timestamp: i64, nonce: &
         timestamp,
         nonce
     )
+}
+
+/// Check one signature against a secret, for a caller that has the pieces
+/// separately rather than in headers.
+///
+/// The PCM handshake arrives as a line of text rather than as headers, so it
+/// cannot go through [`Verifier::verify`]; the MAC and the comparison are the
+/// same ones, which is what keeps one definition of a valid signature.
+pub fn signature_matches(
+    secret: &[u8],
+    method: &str,
+    path: &str,
+    body: &[u8],
+    timestamp: &str,
+    nonce: &str,
+    signature: &str,
+) -> bool {
+    let Ok(timestamp) = timestamp.parse::<i64>() else {
+        return false;
+    };
+    let canonical = canonical(method, path, body, timestamp, nonce);
+    let expected = sign(secret, canonical.as_bytes());
+    // Constant time, like the header path: a length leak here would let an
+    // attacker learn the MAC one byte at a time.
+    crate::config::base64_url_decode(signature)
+        .map(|supplied| expected.ct_eq(&supplied).unwrap_u8() == 1)
+        .unwrap_or(false)
 }
 
 fn sign(key: &[u8], message: &[u8]) -> Vec<u8> {

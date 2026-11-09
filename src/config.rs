@@ -16,15 +16,22 @@ use std::collections::BTreeMap;
 /// this process makes carries it.
 pub const PLUGIN_ID: &str = "airsim";
 
-/// The port this plugin listens on by default: its AirSIM-facing API.
+/// The port Celmux's plugin centre relays to: this plugin's own settings page
+/// and its configuration API.
 ///
-/// This is the port the settings page reaches and the port an operator forwards
-/// if the phone is not on the LAN. Deliberately its own port rather than
-/// anything Celmux already uses: a plugin that borrowed Celmux's listener would
-/// have to be routed by SNI or path inside Celmux's TLS terminator, and Celmux
-/// would grow a plugin router for something an operator can point nginx at in
-/// one line.
-pub const DEFAULT_PORT: u16 = 7593;
+/// Separate from the phone's control port on purpose. The two callers
+/// authenticate differently - the page with a token Celmux minted for the
+/// operator who opened it, the phone by signing each request - and keeping them
+/// on separate listeners means neither credential is ever accepted where the
+/// other is expected.
+pub const DEFAULT_PORT: u16 = 43769;
+
+/// The port every line's control API answers on. Shared by all lines: the
+/// request says which line it belongs to by the secret that signed it.
+pub const DEFAULT_CONTROL_PORT: u16 = 8642;
+
+/// The PCM port, shared by all lines for the same reason.
+pub const DEFAULT_PCM_PORT: u16 = 8643;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -35,6 +42,13 @@ pub struct Config {
     /// The AirSIM-facing port: the API the settings page drives, and the
     /// pairing endpoints.
     pub port: u16,
+    /// The port every line's control API answers on. One port, not one per
+    /// line: a request names its line by the secret that signed it, so a port
+    /// per line would spend a port and a firewall rule on information the
+    /// signature already carries.
+    pub control_port: u16,
+    /// The PCM port, shared by every line for the same reason.
+    pub pcm_port: u16,
     /// Whether to advertise agents on Bonjour.
     pub advertise: bool,
 }
@@ -91,10 +105,37 @@ impl Config {
                 .map_err(|_| ConfigError::Invalid(format!("port 不是有效端口号: {value}")))?,
             _ => DEFAULT_PORT,
         };
+        let control_port = read("control_port")
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                value.parse().map_err(|_| {
+                    ConfigError::Invalid(format!("control_port 不是有效端口号: {value}"))
+                })
+            })
+            .transpose()?
+            .unwrap_or(DEFAULT_CONTROL_PORT);
+        let pcm_port = read("pcm_port")
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                value.parse().map_err(|_| {
+                    ConfigError::Invalid(format!("pcm_port 不是有效端口号: {value}"))
+                })
+            })
+            .transpose()?
+            .unwrap_or(DEFAULT_PCM_PORT);
+        if control_port == pcm_port {
+            return Err(ConfigError::Invalid(
+                "control_port 与 pcm_port 不能相同".to_owned(),
+            ));
+        }
         Ok(Self {
             celmux_url: values["celmux_url"].trim().trim_end_matches('/').to_owned(),
             celmux_token: values["celmux_token"].trim().to_owned(),
             port,
+            control_port,
+            pcm_port,
             advertise: read("advertise")
                 .map(|value| value.trim() != "false" && value.trim() != "0")
                 .unwrap_or(true),
@@ -216,6 +257,6 @@ mod tests {
     /// nginx at, so it is pinned rather than left to drift.
     #[test]
     fn the_default_port_is_the_documented_one() {
-        assert_eq!(DEFAULT_PORT, 7593);
+        assert_eq!(DEFAULT_PORT, 43769);
     }
 }

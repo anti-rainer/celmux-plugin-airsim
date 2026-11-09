@@ -27,10 +27,10 @@ pub struct AgentConfig {
     pub line_id: String,
     /// What the phone lists. Falls back to the line label.
     pub name: String,
-    /// Control port for this agent.
-    pub control_port: u16,
-    /// PCM port for this agent.
-    pub pcm_port: u16,
+    // No ports here. Every line shares one control port and one PCM port
+    // because the request already names its line; giving a line its own ports
+    // would spend a port and a firewall rule per line for information the
+    // signature carries.
 }
 
 impl AgentConfig {
@@ -45,13 +45,17 @@ impl AgentConfig {
     /// readable part is kept when it survives, and a digest of the whole label
     /// is appended whenever the readable part could be ambiguous.
     pub fn agent_id(&self) -> String {
-        let label = if self.name.is_empty() {
-            &self.line_id
-        } else {
-            &self.name
-        };
-        let readable = sanitize(label);
-        if readable == "line" || !is_distinctive(&readable, label) {
+        // Derived from the line label alone, never from the display name.
+        //
+        // The phone stores one secret per agent id, and the id it looks the
+        // secret up by comes from this same string. A display name is what the
+        // operator sees and is free to change - "读卡器1" became
+        // "读卡器1·联通·138…" - so deriving the id from it would rename the
+        // agent on every rename, and the phone would look up a secret that no
+        // longer has a matching id: a pairing that succeeded would fail its
+        // health check with 「VoWLAN 鉴权失败」.
+        let readable = sanitize(&self.line_id);
+        if readable == "line" || !is_distinctive(&readable, &self.line_id) {
             // Nothing usable survived, or what survived is a fragment: name the
             // agent by a digest instead of by a fragment that collides.
             format!("celmux-{}", short_digest(&self.line_id))
@@ -72,6 +76,9 @@ impl AgentConfig {
 /// A running agent: its configuration, its signing secret, and the pairing
 /// window currently open for it.
 pub struct Agent {
+    /// Bumped when anything this line cares about changes: the phone's long
+    /// poll compares against it, and the thread following Celmux bumps it.
+    revision: Arc<crate::revision::Revision>,
     pub config: AgentConfig,
     /// The secret every request from this agent's phone is signed with.
     ///
@@ -94,6 +101,7 @@ pub struct Agent {
 impl Agent {
     pub fn new(config: AgentConfig, secret: Option<Vec<u8>>) -> Self {
         Self {
+            revision: Arc::new(crate::revision::Revision::default()),
             config,
             secret: Mutex::new(secret),
             store: None,
@@ -102,10 +110,25 @@ impl Agent {
         }
     }
 
+    /// This line's revision, shared with every request handler for it.
+    pub fn revision(&self) -> Arc<crate::revision::Revision> {
+        Arc::clone(&self.revision)
+    }
+
     /// The same agent, but remembering its secret under `root`.
     pub fn with_store(mut self, root: &std::path::Path) -> Self {
         self.store = Some(crate::secrets::Store::new(root));
         self
+    }
+
+    /// Sign one canonical message with this agent's secret.
+    ///
+    /// Empty when the agent has not paired, which makes a proof check fail
+    /// rather than pass with nothing behind it.
+    pub fn proof(&self, message: &str) -> String {
+        self.verifier()
+            .map(|verifier| verifier.proof(message))
+            .unwrap_or_default()
     }
 
     /// Forget the persisted secret, so the next restart does not read it back.
@@ -353,12 +376,10 @@ fn sanitize(line_id: &str) -> String {
 mod tests {
     use super::*;
 
-    fn config(line: &str, control: u16) -> AgentConfig {
+    fn config(line: &str, _control: u16) -> AgentConfig {
         AgentConfig {
             line_id: line.to_owned(),
             name: String::new(),
-            control_port: control,
-            pcm_port: control + 1,
         }
     }
 
@@ -443,7 +464,9 @@ mod tests {
         let again = fleet.list().into_iter().next().unwrap();
         assert_eq!(again.secret(), Some(vec![7; 32]));
         // The new ports are adopted, the secret is not lost.
-        assert_eq!(again.config.control_port, 8652);
+        // The line identity survives a reconcile; the ports are no longer part
+        // of a line's configuration, so there is nothing to assert about them.
+        assert_eq!(again.config.line_id, "dji1");
     }
 
     /// The whole reason secrets are written to disk: a new process - which is
