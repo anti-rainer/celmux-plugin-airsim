@@ -15,6 +15,7 @@ mod config;
 mod control;
 mod discovery;
 mod http;
+mod pcm;
 
 use std::sync::Arc;
 
@@ -96,6 +97,26 @@ fn main() {
         None
     };
 
+    let client = Arc::new(client_for_pcm(&config));
+    match std::net::TcpListener::bind(("0.0.0.0", config.pcm_port)) {
+        Ok(listener) => {
+            eprintln!(
+                "celmux-plugin-airsim: PCM 网关 tcp://0.0.0.0:{}",
+                config.pcm_port
+            );
+            std::thread::spawn(move || pcm::serve(listener, client));
+        }
+        Err(error) => {
+            // The control API is still useful without audio - the phone can
+            // list devices and place calls - so a busy PCM port is reported
+            // rather than fatal.
+            eprintln!(
+                "celmux-plugin-airsim: 无法监听 PCM 端口 {}: {error}（通话将没有声音）",
+                config.pcm_port
+            );
+        }
+    }
+
     eprintln!(
         "celmux-plugin-airsim: 控制接口 http://{}:{}",
         control.host, config.control_port
@@ -106,6 +127,19 @@ fn main() {
             as Arc<dyn Fn(http::Request) -> http::Response + Send + Sync>
     };
     http::serve(listener, handler);
+}
+
+/// A second client handle for the PCM gateway.
+///
+/// The control side keeps its own; both are stateless wrappers over the same
+/// token, so sharing one would only mean sharing a lock the gateway does not
+/// need while it blocks on a socket.
+fn client_for_pcm(config: &Config) -> celmux::Client {
+    celmux::Client::new(
+        config.celmux_url.clone(),
+        config.celmux_token.clone(),
+        config::PLUGIN_ID.to_owned(),
+    )
 }
 
 /// The address a phone on the same network can reach.

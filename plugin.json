@@ -46,6 +46,7 @@
     "calls_read",
     "calls_control",
     "media_audio",
+    "auto_answer",
     "sms_read",
     "sms_send"
   ]

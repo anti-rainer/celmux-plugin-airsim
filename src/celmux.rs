@@ -154,6 +154,73 @@ impl Client {
     pub fn calls(&self) -> Result<Value, Error> {
         self.request("GET", "/calls", None)
     }
+
+    /// Pull the carrier's next block: signed 16-bit LE mono, base64 encoded.
+    ///
+    /// An empty `samples` is not an error - the carrier produces audio on its
+    /// own clock, so "nothing yet" is the normal answer for a poll that comes
+    /// between two blocks.
+    pub fn pull_audio(&self, call_id: u64) -> Result<Option<Vec<u8>>, Error> {
+        let value = self.request("GET", &format!("/audio?call_id={call_id}"), None)?;
+        let encoded = value.get("samples").and_then(Value::as_str).unwrap_or("");
+        if encoded.is_empty() {
+            return Ok(None);
+        }
+        crate::config::base64_url_decode(encoded)
+            .map(Some)
+            .ok_or_else(|| Error::Decode("音频帧不是有效的 base64".to_owned()))
+    }
+
+    /// Send captured audio to the caller. Celmux resamples to the carrier's own
+    /// clock, so 8 kHz mono is accepted for every carrier codec.
+    pub fn push_audio(&self, call_id: u64, samples: &[u8]) -> Result<(), Error> {
+        self.request(
+            "POST",
+            &format!("/audio?call_id={call_id}"),
+            Some(serde_json::json!({
+                "samples": crate::config::base64_url_encode(samples),
+                "sample_rate": crate::pcm::SAMPLE_RATE,
+            })),
+        )
+        .map(|_| ())
+    }
+
+    /// The call the bridge is currently carrying, if any.
+    ///
+    /// The PCM gateway is opened by the phone separately from the control
+    /// request that answered a call, so it has to learn which call it belongs
+    /// to. Calling the call list is enough: a plugin carries one call at a time
+    /// and the active one is the only call in a talking state.
+    pub fn active_call_id(&self) -> Option<u64> {
+        let value = self.calls().ok()?;
+        value
+            .get("calls")
+            .and_then(Value::as_array)?
+            .iter()
+            .find_map(|call| {
+                let state = call.get("state").and_then(Value::as_str)?;
+                if !matches!(state, "active" | "connected" | "talking") {
+                    return None;
+                }
+                call.get("call_id").and_then(Value::as_u64).or_else(|| {
+                    call.get("call_id")
+                        .and_then(Value::as_str)
+                        .and_then(|text| text.parse().ok())
+                })
+            })
+    }
+
+    /// Whether `call_id` is still the active call.
+    ///
+    /// Passing `None` asks "is there any active call", which is what the gateway
+    /// needs before it knows its own id.
+    pub fn call_still_active(&self, call_id: Option<u64>) -> bool {
+        match (self.active_call_id(), call_id) {
+            (Some(active), Some(expected)) => active == expected,
+            (Some(_), None) => true,
+            (None, _) => false,
+        }
+    }
 }
 
 #[derive(Debug)]
