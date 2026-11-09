@@ -257,8 +257,7 @@ mod tests {
     fn agent() -> Arc<Agent> {
         Arc::new(Agent::new(
             AgentConfig {
-                line_id: "dji1".to_owned(),
-                name: String::new(),
+                lines: vec!["dji1".to_owned()],
             },
             None,
         ))

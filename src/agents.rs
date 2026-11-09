@@ -1,36 +1,34 @@
 // Copyright (c) 2026 anti-rainer
 // SPDX-License-Identifier: MIT
 
-//! One agent per line.
+//! One agent, carrying every exposed line as a SIM slot.
 //!
-//! AirSIM's model is one card per agent: `api/sim/identity` answers with a
-//! single phone number and there is no list of cards anywhere in the client, so
-//! an agent that carried several lines would have exactly one of them reachable
-//! and no way to say which. Celmux, meanwhile, has lines - a device's own line,
-//! and one per N-standby Profile.
+//! This is the shape the client already has: an agent reports `sim_slots`, the
+//! phone shows a selector, and a call or a message names the slot it wants in
+//! `sim_account`. That is how the reference agent exposes two SIMs from one
+//! device - one pair of ports, one pairing, one credential, several cards.
 //!
-//! So a line maps to an agent. Each agent gets its own id, its own ports, its
-//! own pairing window and its own secret, and the phone lists them as separate
-//! devices that pair independently. That is the only mapping the client's model
-//! can express, and it means the operator picks which lines are reachable by
-//! choosing which agents exist.
+//! So the plugin is one device, not one device per line. A line maps to a slot,
+//! and the operator picks which lines are reachable by choosing which slots
+//! exist. The earlier one-agent-per-line arrangement made the phone pair once per
+//! card to reach the same installation, which is not what the client is for.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use crate::pairing::Session;
 
-/// What the operator assigned to one line.
+/// What the operator exposed: the lines this installation offers, in order.
+///
+/// There is one agent, so this is the whole configuration. Each line becomes a
+/// SIM slot the phone can choose between.
 #[derive(Clone, Debug)]
 pub struct AgentConfig {
-    /// The line this agent carries, as a Celmux line label.
-    pub line_id: String,
-    /// What the phone lists. Falls back to the line label.
-    pub name: String,
-    // No ports here. Every line shares one control port and one PCM port
-    // because the request already names its line; giving a line its own ports
-    // would spend a port and a firewall rule per line for information the
-    // signature carries.
+    /// The lines this agent carries, as Celmux line labels, in display order.
+    pub lines: Vec<String>,
+    // No ports here. One control port and one PCM port serve the installation;
+    // the request names its line by the slot it asks for, so a port per line
+    // would spend a port and a firewall rule on information the payload carries.
 }
 
 impl AgentConfig {
@@ -45,31 +43,19 @@ impl AgentConfig {
     /// readable part is kept when it survives, and a digest of the whole label
     /// is appended whenever the readable part could be ambiguous.
     pub fn agent_id(&self) -> String {
-        // Derived from the line label alone, never from the display name.
+        // A constant, because this is one installation and one credential.
         //
-        // The phone stores one secret per agent id, and the id it looks the
-        // secret up by comes from this same string. A display name is what the
-        // operator sees and is free to change - "读卡器1" became
-        // "读卡器1·联通·138…" - so deriving the id from it would rename the
-        // agent on every rename, and the phone would look up a secret that no
-        // longer has a matching id: a pairing that succeeded would fail its
-        // health check with 「VoWLAN 鉴权失败」.
-        let readable = sanitize(&self.line_id);
-        if readable == "line" || !is_distinctive(&readable, &self.line_id) {
-            // Nothing usable survived, or what survived is a fragment: name the
-            // agent by a digest instead of by a fragment that collides.
-            format!("celmux-{}", short_digest(&self.line_id))
-        } else {
-            format!("celmux-{readable}")
-        }
+        // It must never derive from the exposed lines: the phone stores one
+        // secret per id and looks it up by this same string, so adding or
+        // removing a line would rename the device and the phone would look up a
+        // secret that no longer has a matching id - a pairing that succeeded
+        // failing its health check with 「VoWLAN 鉴权失败」.
+        "celmux".to_owned()
     }
 
-    fn display_name(&self) -> &str {
-        if self.name.is_empty() {
-            &self.line_id
-        } else {
-            &self.name
-        }
+    /// The first exposed line, for a caller that has no slot to name.
+    pub fn primary_line(&self) -> &str {
+        self.lines.first().map(String::as_str).unwrap_or_default()
     }
 }
 
@@ -160,8 +146,26 @@ impl Agent {
         self.config.agent_id()
     }
 
+    /// What the phone lists this device as.
+    ///
+    /// The installation, not a card: the phone shows one entry per agent and
+    /// picks cards inside it, so naming the device after its first line would
+    /// rename it whenever the exposed set changed.
     pub fn name(&self) -> String {
-        self.config.display_name().to_owned()
+        "Celmux".to_owned()
+    }
+
+    /// The line currently on a call, with that call's id.
+    ///
+    /// A slot is chosen per call, so a PCM socket follows the call in progress
+    /// rather than a fixed line. Returning both together keeps them from being
+    /// paired up wrongly when two slots are busy.
+    pub fn active_call(&self, client: &crate::celmux::Client) -> Option<(String, u64)> {
+        self.config.lines.iter().find_map(|line_id| {
+            client
+                .active_call_id(line_id)
+                .map(|call_id| (line_id.clone(), call_id))
+        })
     }
 
     /// The secret this agent's phone signs with, if it has paired.
@@ -244,11 +248,11 @@ impl Agent {
     }
 }
 
-/// Every configured agent, keyed by line label.
+/// The installation's single agent.
 ///
-/// Shared behind an `Arc` because the control listener, the PCM listener and the
-/// settings page all reach it, and a pairing that starts in one must be visible
-/// to the others immediately.
+/// Named `Fleet` because every caller reaches it that way, but there is exactly
+/// one: the client pairs with a device and chooses among its slots, so a second
+/// agent would be a second device at the same address.
 pub struct Fleet {
     agents: Mutex<BTreeMap<String, Arc<Agent>>>,
     /// The plugin's own directory, where pairing secrets are kept.
@@ -285,20 +289,20 @@ impl Fleet {
             .agents
             .lock()
             .map_err(|_| "agent 表不可用".to_owned())?;
-        // Secrets live on disk as well as in memory, so an agent rebuilt for a
-        // renamed port - or one rebuilt after a restart - is still the agent the
-        // phone paired with.
+        // Secrets live on disk as well as in memory, so an agent rebuilt after a
+        // config save - or after a restart - is still the agent the phone paired
+        // with.
         let stored = crate::secrets::Store::new(&self.root).load();
         let mut next: BTreeMap<String, Arc<Agent>> = BTreeMap::new();
         for config in configs {
             let agent = Agent::new(config, None).with_store(&self.root);
             let in_memory = agents
-                .get(&agent.config.line_id)
+                .get(&agent.id())
                 .and_then(|existing| existing.secret());
             if let Some(secret) = in_memory.or_else(|| stored.get(&agent.id()).cloned()) {
                 agent.set_secret(secret);
             }
-            next.insert(agent.config.line_id.clone(), Arc::new(agent));
+            next.insert(agent.id(), Arc::new(agent));
         }
         *agents = next;
         Ok(())
@@ -321,56 +325,8 @@ impl Fleet {
     }
 }
 
-/// Whether the sanitised form still identifies the label it came from.
-///
-/// A label whose non-ASCII characters all vanished keeps only the digits and
-/// ASCII that happened to sit beside them, so `读卡器1` and `读卡器2` become `1`
-/// and `2` and `读卡器10` and `打印机10` would both become `10`. Treating a form
-/// that carries less than half the label's bytes as a fragment keeps the
-/// readable case readable and the ambiguous case unambiguous.
-fn is_distinctive(sanitised: &str, label: &str) -> bool {
-    let kept = sanitised
-        .chars()
-        .filter(|character| *character != '-')
-        .count();
-    let total = label.chars().count();
-    total > 0 && kept * 2 >= total
-}
 
-/// A stable digest of a label, short enough to sit in an id.
-fn short_digest(label: &str) -> String {
-    use sha2::{Digest, Sha256};
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let digest: [u8; 32] = Sha256::digest(label.as_bytes()).into();
-    let mut encoded = String::with_capacity(16);
-    for byte in &digest[..8] {
-        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
-        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    encoded
-}
 
-/// Turn a line label into something usable as an id and a Bonjour name.
-///
-/// A line label is `device` or `device#iccid`, and can carry a device name with
-/// spaces or Chinese in it. The id has to survive being a Keychain account key
-/// on the phone, so only what is unambiguous is kept.
-fn sanitize(line_id: &str) -> String {
-    let mut output = String::with_capacity(line_id.len());
-    for character in line_id.chars() {
-        if character.is_ascii_alphanumeric() {
-            output.push(character.to_ascii_lowercase());
-        } else if !output.ends_with('-') {
-            output.push('-');
-        }
-    }
-    let trimmed = output.trim_matches('-').to_owned();
-    if trimmed.is_empty() {
-        "line".to_owned()
-    } else {
-        trimmed
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -378,62 +334,27 @@ mod tests {
 
     fn config(line: &str, _control: u16) -> AgentConfig {
         AgentConfig {
-            line_id: line.to_owned(),
-            name: String::new(),
+            lines: vec![line.to_owned()],
         }
     }
 
-    /// A line label can carry a device name with spaces or Chinese; the agent id
-    /// has to survive being a Keychain key on the phone.
+    /// The id is the installation's, not a line's.
+    ///
+    /// The phone stores one secret per id and looks it up by this same string,
+    /// so an id derived from the exposed lines would rename the device whenever
+    /// the operator added or removed one - and the phone would then look up a
+    /// secret that no longer has a matching id.
     #[test]
-    fn an_agent_id_survives_a_line_label_with_separators() {
-        let id = config("读卡器1#89049032000000000001", 8642).agent_id();
-        assert!(id.starts_with("celmux-"));
-        assert!(
-            id.chars()
-                .all(|character| character.is_ascii_alphanumeric() || character == '-')
-        );
-        assert!(!id.ends_with('-'));
-    }
-
-    /// Two different lines must never collapse to the same id, or the phone
-    /// would store one credential for both.
-    #[test]
-    fn distinct_lines_keep_distinct_ids() {
-        let dji1 = config("dji1", 8642).agent_id();
-        let dji2 = config("dji2", 8644).agent_id();
-        assert_ne!(dji1, dji2);
-        assert_eq!(dji1, "celmux-dji1");
-    }
-
-    /// The real labels on this installation are Chinese, and stripping the
-    /// non-ASCII characters leaves only a digit - which two devices would
-    /// share. A label whose readable part is a fragment has to be named by a
-    /// digest instead.
-    #[test]
-    fn chinese_labels_do_not_collapse_to_a_shared_digit() {
-        let first = config("读卡器1", 8642).agent_id();
-        let second = config("读卡器2", 8644).agent_id();
-        let tenth = config("打印机10", 8646).agent_id();
-        assert_ne!(first, second);
-        assert_ne!(first, tenth);
-        assert_ne!(second, tenth);
-        assert_ne!(first, "celmux-1");
-        // Still an id the phone's Keychain can key on.
-        for id in [&first, &second, &tenth] {
-            assert!(
-                id.chars()
-                    .all(|character| character.is_ascii_alphanumeric() || character == '-'),
-                "{id} must be ascii"
-            );
+    fn the_agent_id_does_not_change_when_the_lines_do() {
+        let one = config("读卡器1", 8642).agent_id();
+        let two = AgentConfig {
+            lines: vec!["读卡器1".to_owned(), "dji1".to_owned()],
         }
-    }
-
-    /// A label that is mostly ASCII keeps its readable form.
-    #[test]
-    fn a_readable_label_keeps_its_readable_id() {
-        assert_eq!(config("dji1", 8642).agent_id(), "celmux-dji1");
-        assert_eq!(config("simreader2", 8642).agent_id(), "celmux-simreader2");
+        .agent_id();
+        let none = AgentConfig { lines: Vec::new() }.agent_id();
+        assert_eq!(one, two);
+        assert_eq!(one, none);
+        assert_eq!(one, "celmux");
     }
 
     /// The same label always yields the same id, or a restart would orphan the
@@ -445,11 +366,13 @@ mod tests {
         assert_eq!(first, second);
     }
 
+    /// A line label with nothing usable in it is still a line: it becomes a
+    /// slot, and the id does not depend on it.
     #[test]
-    fn a_label_with_nothing_usable_still_yields_an_id() {
-        let id = config("###", 8642).agent_id();
-        assert!(id.starts_with("celmux-"));
-        assert!(id.len() > "celmux-".len());
+    fn a_label_with_nothing_usable_still_exposes_a_slot() {
+        let config = config("###", 8642);
+        assert_eq!(config.agent_id(), "celmux");
+        assert_eq!(config.lines, vec!["###".to_owned()]);
     }
 
     /// AirSIM keeps one secret per agent id, so a line that keeps its
@@ -466,7 +389,7 @@ mod tests {
         // The new ports are adopted, the secret is not lost.
         // The line identity survives a reconcile; the ports are no longer part
         // of a line's configuration, so there is nothing to assert about them.
-        assert_eq!(again.config.line_id, "dji1");
+        assert_eq!(again.config.lines, vec!["dji1".to_owned()]);
     }
 
     /// The whole reason secrets are written to disk: a new process - which is
@@ -493,22 +416,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Adding a line must not disturb the ones already paired.
+    /// Adding a slot must not disturb the pairing: the device is the same
+    /// device, and only what it carries changed.
     #[test]
-    fn adding_a_line_leaves_the_others_paired() {
+    fn adding_a_slot_leaves_the_pairing_intact() {
         let fleet = Fleet::default();
         fleet.reconcile(vec![config("dji1", 8642)]).unwrap();
         fleet.list()[0].set_secret(vec![1; 32]);
         fleet
-            .reconcile(vec![config("dji1", 8642), config("dji2", 8644)])
+            .reconcile(vec![AgentConfig {
+                lines: vec!["dji1".to_owned(), "dji2".to_owned()],
+            }])
             .unwrap();
         let agents = fleet.list();
-        assert_eq!(agents.len(), 2);
-        let first = agents
-            .iter()
-            .find(|agent| agent.config.line_id == "dji1")
-            .unwrap();
-        assert_eq!(first.secret(), Some(vec![1; 32]));
+        assert_eq!(agents.len(), 1, "仍是一个 agent");
+        assert_eq!(agents[0].config.lines.len(), 2, "两个槽位");
+        assert_eq!(agents[0].secret(), Some(vec![1; 32]), "密钥不受影响");
     }
 
     /// Removing a line drops its agent and therefore its secret: the line is no
@@ -526,13 +449,13 @@ mod tests {
         assert!(fleet.by_id("celmux-dji1").is_none());
     }
 
-    /// The phone addresses an agent by its id, which is what it stores a
-    /// credential under.
+    /// The phone addresses the installation by its id, which is what it stores
+    /// a credential under.
     #[test]
-    fn an_agent_is_reachable_by_its_id() {
+    fn the_installation_is_reachable_by_its_id() {
         let fleet = Fleet::default();
         fleet.reconcile(vec![config("dji1", 8642)]).unwrap();
-        assert!(fleet.by_id("celmux-dji1").is_some());
+        assert!(fleet.by_id("celmux").is_some());
         assert!(fleet.by_id("celmux-nothing").is_none());
     }
 

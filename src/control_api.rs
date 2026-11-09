@@ -28,7 +28,13 @@ use crate::celmux::Line;
 /// `id`, `index`, `direction`, `state`, `started_at` are non-optional there, so
 /// every field is always present: a record missing one makes the whole array
 /// fail to decode and the app shows nothing rather than most of it.
-pub fn call_record(number: &str, state: &str, direction: &str, started_at: &str) -> Value {
+pub fn call_record(
+    number: &str,
+    state: &str,
+    direction: &str,
+    started_at: &str,
+    line: &str,
+) -> Value {
     json!({
         "id": format!("celmux-call-{started_at}"),
         "index": 0,
@@ -38,6 +44,10 @@ pub fn call_record(number: &str, state: &str, direction: &str, started_at: &str)
         "started_at": started_at,
         "updated_at": started_at,
         "missed": false,
+        // Which exposed line is ringing. The phone holds one active call and
+        // reads this to name the card, so a call arriving on the second line is
+        // not shown as one on the first.
+        "line_id": line,
     })
 }
 
@@ -93,16 +103,13 @@ pub fn sim_slot(line: &Line) -> Value {
     })
 }
 
-/// What a person reads in a slot picker: the operator if there is one, else the
-/// profile, else the module.
+/// What a person reads in a slot picker.
+///
+/// The same string the line is named by everywhere else - device, operator,
+/// number - because the picker and the line list describe the same thing and two
+/// names for one line is what makes an operator pick the wrong card.
 fn slot_label(line: &Line) -> String {
-    if !line.operator_name.is_empty() {
-        return line.operator_name.clone();
-    }
-    if !line.profile_name.is_empty() {
-        return line.profile_name.clone();
-    }
-    line.device_name.clone()
+    line.card_name()
 }
 
 /// `AgentEventStatus` for `api/events`.
@@ -198,11 +205,20 @@ pub fn sms_message(row: &Value) -> Option<Value> {
 
 /// The `messages` array of a `GET /api/sms` answer.
 pub fn sms_messages(value: &Value) -> Vec<Value> {
+    // Celmux answers this route with a bare array. The wrapped forms are kept
+    // because that is what this function was written against and an older
+    // installation may still send one - but reading only those made every list
+    // empty, which reads on the phone as a refresh that does nothing.
     let rows = value
-        .get("messages")
-        .or_else(|| value.get("items"))
-        .and_then(Value::as_array)
+        .as_array()
         .cloned()
+        .or_else(|| {
+            value
+                .get("messages")
+                .or_else(|| value.get("items"))
+                .and_then(Value::as_array)
+                .cloned()
+        })
         .unwrap_or_default();
     rows.iter().filter_map(sms_message).collect()
 }
@@ -229,7 +245,13 @@ mod tests {
     /// makes the whole history unreadable rather than one entry.
     #[test]
     fn a_call_record_carries_every_required_field() {
-        let record = call_record("+1234", "active", "outgoing", "2026-01-01T00:00:00Z");
+        let record = call_record(
+            "+1234",
+            "active",
+            "outgoing",
+            "2026-01-01T00:00:00Z",
+            "读卡器2#89441000400501246765",
+        );
         for key in ["id", "index", "direction", "state", "started_at", "updated_at"] {
             assert!(!record[key].is_null(), "{key} must be present");
         }
@@ -251,13 +273,15 @@ mod tests {
     /// A slot with no number must send an empty string: the client treats the
     /// number as optional but the label as required.
     #[test]
-    fn a_slot_labels_itself_by_operator_then_profile_then_device() {
+    fn a_slot_is_labelled_the_same_way_the_line_is_named() {
+        // Device, operator, number - the same string the line carries
+        // everywhere else, so the picker and the line list agree.
         let with_operator = sim_slot(&line("l1", "读卡器1", "Globe", ""));
-        assert_eq!(with_operator["label"], "Globe");
+        assert_eq!(with_operator["label"], "读卡器1 · Globe");
         assert_eq!(with_operator["id"], "l1");
 
         let profile_only = sim_slot(&line("l2", "读卡器2", "", "旅行卡"));
-        assert_eq!(profile_only["label"], "旅行卡");
+        assert_eq!(profile_only["label"], "读卡器2 · 旅行卡");
 
         let bare = sim_slot(&line("l3", "dji1", "", ""));
         assert_eq!(bare["label"], "dji1");
@@ -348,5 +372,24 @@ mod tests {
         assert_eq!(status["sms_pending"], 3);
         assert_eq!(status["call"]["polling"], true);
         assert_eq!(status["sim_revision"], 7);
+    }
+    /// Celmux answers the plugin's SMS route with a bare array. Reading only the
+    /// wrapped forms made the list empty, which on the phone is indistinguishable
+    /// from a refresh that does nothing.
+    #[test]
+    fn a_bare_array_of_messages_is_read() {
+        let row = json!([{
+            "id": 1,
+            "content": "你好",
+            "peer": "+100",
+            "sender": "+100",
+            "recipient": "+200",
+            "local_phone": "+200",
+            "timestamp": "2026-11-09T16:00:00Z",
+        }]);
+        let messages = sms_messages(&row);
+        assert_eq!(messages.len(), 1, "裸数组应被读取");
+        let wrapped = json!({"messages": row.as_array().unwrap().clone()});
+        assert_eq!(sms_messages(&wrapped).len(), 1, "包装形式仍应可读");
     }
 }

@@ -111,18 +111,27 @@ fn handshake_line(fleet: &Fleet, hello: &str) -> Option<Arc<Agent>> {
 /// phone on the same port names a different line, and therefore a different
 /// call - which is why the port can be shared at all.
 fn bridge(stream: TcpStream, client: Arc<Client>, agent: Arc<Agent>) -> std::io::Result<()> {
-    let line = agent.config.line_id.clone();
-    let call_id = client.active_call_id(&line);
+    // Audio is per call, not per device: two slots can be on two calls at once,
+    // so this socket follows whichever exposed line is on a call, and gives up
+    // when none is. The handshake identified the device; the call identifies the
+    // card.
+    let Some((line, call_id)) = agent.active_call(&client) else {
+        crate::log_warn!(
+            "celmux-plugin-airsim: agent {} 没有进行中的通话，PCM 连接结束",
+            agent.id()
+        );
+        return Ok(());
+    };
 
     let read_half = stream.try_clone()?;
     let reader = {
         let client = Arc::clone(&client);
         let line_id = line.clone();
-        std::thread::spawn(move || read_loop(read_half, client, call_id, line_id))
+        std::thread::spawn(move || read_loop(read_half, client, Some(call_id), line_id))
     };
     let writer = {
         let client = Arc::clone(&client);
-        std::thread::spawn(move || write_loop(stream, client, call_id, line))
+        std::thread::spawn(move || write_loop(stream, client, Some(call_id), line))
     };
     // Either direction ending means the call is over for this client.
     let _ = reader.join();
@@ -224,8 +233,7 @@ mod handshake_tests {
     fn agent(secret: Option<Vec<u8>>) -> Arc<Agent> {
         Arc::new(Agent::new(
             AgentConfig {
-                line_id: "读卡器1".to_owned(),
-                name: "读卡器1".to_owned(),
+                lines: vec!["读卡器1".to_owned()],
             },
             secret,
         ))

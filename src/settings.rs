@@ -34,8 +34,10 @@ const ASSIGNMENT_KEY: &str = "agents";
 struct AssignedLine {
     /// The Celmux line label.
     line_id: String,
-    #[serde(default)]
-    name: String,
+    /// Kept so a stored assignment written by an older page still parses; the
+    /// slot is named from the line itself, so this is not read.
+    #[serde(default, rename = "name")]
+    _name: String,
     // Ports in a stored assignment are ignored: they are one installation-wide
     // pair now, not a per-line choice. Reading them would let an old saved value
     // silently override what the ports page shows.
@@ -64,14 +66,17 @@ fn parse_assignment(raw: &str) -> Result<Vec<AgentConfig>, String> {
     }
     let lines: Vec<AssignedLine> =
         serde_json::from_str(trimmed).map_err(|error| format!("线路分配不是有效 JSON: {error}"))?;
-    Ok(lines
+    // One agent carrying every assigned line. The stored form stays a list
+    // because the operator's order is what the phone shows.
+    let lines: Vec<String> = lines
         .into_iter()
-        .filter(|line| !line.line_id.trim().is_empty())
-        .map(|line| AgentConfig {
-            line_id: line.line_id.trim().to_owned(),
-            name: line.name.trim().to_owned(),
-        })
-        .collect())
+        .map(|line| line.line_id.trim().to_owned())
+        .filter(|line_id| !line_id.is_empty())
+        .collect();
+    if lines.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(vec![AgentConfig { lines }])
 }
 
 /// Route one request on the settings listener.
@@ -86,7 +91,7 @@ pub fn handle(
     request: Request,
 ) -> Response {
     match (request.method.as_str(), request.path.as_str()) {
-        ("GET", "/api/status") => status(fleet, client, host, ports),
+        ("GET", "/api/status") => status(fleet, host, ports),
         ("POST", "/api/pair") => open_pairing(fleet, advertisements, &request),
         ("POST", "/api/unpair") => unpair(fleet, &request),
         ("GET", "/api/lines") => lines(fleet, client, ports),
@@ -98,12 +103,7 @@ pub fn handle(
 }
 
 /// What the page shows: every agent, whether it is paired, and where it listens.
-fn status(
-    fleet: &Arc<Fleet>,
-    client: &Arc<Client>,
-    host: &str,
-    ports: &crate::control::Ports,
-) -> Response {
+fn status(fleet: &Arc<Fleet>, host: &str, ports: &crate::control::Ports) -> Response {
     let agents: Vec<Value> = fleet
         .list()
         .into_iter()
@@ -111,8 +111,8 @@ fn status(
             json!({
                 "agent_id": agent.id(),
                 // The line as it is now, not the name stored at exposure time.
-                "name": crate::control::line_display_name(client, &agent),
-                "line_id": agent.config.line_id,
+                "name": crate::control::line_display_name(&agent),
+                "lines": agent.config.lines,
                 // Every line answers on the same pair; repeating the numbers
                 // per line would suggest they can differ.
                 "control_port": ports.control,
@@ -244,10 +244,11 @@ fn lines(fleet: &Arc<Fleet>, client: &Arc<Client>, ports: &crate::control::Ports
         .map(|line| {
             let device = line.device_id.as_str();
             let module = by_id.get(device);
-            // Which agent carries this line, if the operator exposed it.
+            // Whether the operator exposed this line. There is one agent, so
+            // the question is membership rather than which agent.
             let agent = agents
                 .iter()
-                .find(|agent| agent.config.line_id == line.line_id)
+                .find(|agent| agent.config.lines.contains(&line.line_id))
                 .map(|agent| {
                     json!({
                         "agent_id": agent.id(),
@@ -379,19 +380,17 @@ mod tests {
     }
 
     /// The assignment is one JSON field in Celmux's config, so it has to parse
-    /// from the exact text a page would save.
+    /// from the exact text a page would save. Every assigned line becomes a slot
+    /// on the one agent, in the order the operator put them.
     #[test]
-    fn an_assignment_parses_into_agents() {
+    fn an_assignment_parses_into_one_agent_with_a_slot_per_line() {
         let agents = parse_assignment(
             r#"[{"line_id":"dji1","control_port":8642,"pcm_port":8643},
                 {"line_id":"读卡器1#8904","name":"Globe","control_port":8652,"pcm_port":8653}]"#,
         )
         .unwrap();
-        assert_eq!(agents.len(), 2);
-        assert_eq!(agents[0].line_id, "dji1");
-        assert_eq!(agents[0].name, "");
-        assert_eq!(agents[1].name, "Globe");
-        assert_eq!(agents[1].line_id, "读卡器1#8904");
+        assert_eq!(agents.len(), 1, "只有一个 agent");
+        assert_eq!(agents[0].lines, vec!["dji1".to_owned(), "读卡器1#8904".to_owned()]);
     }
 
     /// A row with no line names no agent, so it must not create a ghost.
@@ -403,7 +402,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(agents.len(), 1);
-        assert_eq!(agents[0].line_id, "dji1");
+        assert_eq!(agents[0].lines, vec!["dji1".to_owned()], "空行不产生槽位");
     }
 
     #[test]

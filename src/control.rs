@@ -89,18 +89,11 @@ fn devices(lines: Vec<Line>) -> Vec<DeviceView> {
 /// change while the exposure stays, and a stale snapshot would keep showing the
 /// old ones. Falls back to the stored name when Celmux cannot be reached, so a
 /// network blip does not rename the device to nothing.
-pub fn line_display_name(client: &Client, agent: &crate::agents::Agent) -> String {
-client
-    .lines()
-    .ok()
-    .and_then(|lines| {
-        lines
-            .into_iter()
-            .find(|line| line.line_id == agent.config.line_id)
-    })
-    .map(|line| line.card_name())
-    .filter(|name| !name.trim().is_empty())
-    .unwrap_or_else(|| agent.name())
+pub fn line_display_name(agent: &crate::agents::Agent) -> String {
+    // One device carrying several cards is named by the device, not by one of
+    // its cards: the phone shows one entry per agent, and naming it after a slot
+    // would rename the device whenever the first slot changed.
+    agent.name()
 }
 
 /// The call id Celmux assigned, as text.
@@ -164,8 +157,20 @@ fn active_call(value: &Value) -> Option<Value> {
         .or_else(|| row.get("created_at"))
         .and_then(Value::as_str)
         .unwrap_or("1970-01-01T00:00:00Z");
+    // Which exposed line this call is on. The phone shows one active call at a
+    // time and uses this to say which card is ringing - without it, a call on
+    // the second card looks like a call on the first.
+    let line = row
+        .get("line_id")
+        .or_else(|| row.get("device_id"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
     Some(super::control_api::call_record(
-        number, state, direction, started_at,
+        number,
+        state,
+        direction,
+        started_at,
+        line,
     ))
 }
 
@@ -398,19 +403,25 @@ impl Control {
     /// The number this agent's line answers on, empty when Celmux has not
     /// learned it yet.
     fn line_phone(&self) -> String {
+        // The first exposed line's number, for the routes that predate
+        // `sim_slots` and expect a single number.
         self.client
             .lines()
             .ok()
             .and_then(|lines| {
                 lines
                     .into_iter()
-                    .find(|line| line.line_id == self.agent.config.line_id)
+                    .find(|line| Some(&line.line_id) == self.agent.config.lines.first())
             })
             .map(|line| line.local_phone)
             .unwrap_or_default()
     }
 
-    /// `GET /v1/devices/status` — what the phone lists.
+    /// `GET /v1/devices/status` and `api/status` — what the phone lists.
+    ///
+    /// One device entry per exposed line, which is how the phone models several
+    /// cards behind one gateway: it shows them as a list and names the one it
+    /// wants in `sim_account` when it dials or sends.
     fn device_status(&self) -> Response {
         let lines = match self.client.lines() {
             Ok(lines) => lines,
@@ -423,12 +434,13 @@ impl Control {
                 );
             }
         };
-        // Only this agent's line: AirSIM's model is one card per agent, and a
-        // second entry would be a device the phone could dial but whose
-        // identity it could never ask about.
+        // Every exposed line, in the order the operator put them: the phone
+        // lists these as the cards it can call from.
         let devices: Vec<Value> = devices(lines)
             .into_iter()
-            .filter(|device| device.line.line_id == self.agent.config.line_id)
+            .filter(|device| {
+                self.agent.config.lines.contains(&device.line.line_id)
+            })
             .map(|device| {
                 json!({
                     "id": device.id,
@@ -532,21 +544,44 @@ impl Control {
     }
 
     fn sms_count(&self) -> usize {
-        self.client
-            .messages(&self.agent.config.line_id)
-            .ok()
-            .and_then(|value| {
+        self.all_messages().len()
+    }
+
+    /// Every exposed line's messages, as the app's model.
+    ///
+    /// The app keeps one history for the device and tells the cards apart by
+    /// each message's `sim_slot`, so the union is what it expects - not the
+    /// messages of whichever line happens to be first.
+    fn all_messages(&self) -> Vec<Value> {
+        let mut messages: Vec<Value> = self
+            .agent
+            .config
+            .lines
+            .iter()
+            .filter_map(|line_id| self.client.messages(line_id).ok())
+            .flat_map(|value| super::control_api::sms_messages(&value))
+            .collect();
+        // Newest first, which is the order the phone renders and the order
+        // Celmux uses. Sorting here rather than per line keeps two cards'
+        // messages interleaved by time instead of grouped by card.
+        messages.sort_by(|left, right| {
+            let key = |value: &Value| {
                 value
-                    .get("messages")
-                    .or_else(|| value.get("items"))
-                    .and_then(serde_json::Value::as_array)
-                    .map(Vec::len)
-            })
-            .unwrap_or(0)
+                    .get("timestamp")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned()
+            };
+            key(right).cmp(&key(left))
+        });
+        messages
     }
 
     /// `GET /api/sim/identity`
     fn sim_identity(&self) -> Response {
+        // The default slot's number. The app reads this before it has a slot
+        // list and falls back to `sim_slots` for the rest, so answering with the
+        // first exposed line is the useful answer rather than none.
         let number = self
             .client
             .lines()
@@ -554,7 +589,7 @@ impl Control {
             .and_then(|lines| {
                 lines
                     .into_iter()
-                    .find(|line| line.line_id == self.agent.config.line_id)
+                    .find(|line| Some(&line.line_id) == self.agent.config.lines.first())
             })
             .map(|line| line.local_phone)
             .unwrap_or_default();
@@ -568,15 +603,13 @@ impl Control {
     /// other party. Sending its rows through unchanged would show every message
     /// as incoming from the phone's own number.
     fn messages(&self) -> Response {
-        match self.client.messages(&self.agent.config.line_id) {
-            Ok(value) => {
-                let messages = super::control_api::sms_messages(&value);
+        match self.client.lines() {
+            Ok(_) => {
                 // A bare array, because the app decodes `[SMSMessage]` from this
-                // route. The Android agent it was written against answers that
-                // way; wrapping it in an object makes the decode fail and the
+                // route. Wrapping it in an object makes the decode fail and the
                 // list silently keep whatever it had before - a refresh button
                 // that appears to do nothing.
-                Response::ok(Value::Array(messages))
+                Response::ok(Value::Array(self.all_messages()))
             }
             Err(error) => Response::error(
                 502,
@@ -589,7 +622,7 @@ impl Control {
 
     /// What this agent's line is called right now.
     fn line_name(&self) -> String {
-        line_display_name(&self.client, &self.agent)
+        line_display_name(&self.agent)
     }
 
     /// The push status document.
@@ -653,12 +686,24 @@ impl Control {
         if number.is_empty() {
             return Response::error(400, "Bad Request", "bad_request", "缺少被叫号码");
         }
+        // The slot the phone chose. Falling back to the first exposed line keeps
+        // a client that predates the slot list working, and a slot that is not
+        // exposed is refused below rather than silently dialling from another
+        // card - dialling from the wrong number is worse than not dialling.
         let line_id = payload
             .get("sim_account")
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty())
-            .unwrap_or(&self.agent.config.line_id)
-            .to_owned();
+            .map(str::to_owned)
+            .unwrap_or_else(|| self.agent.config.primary_line().to_owned());
+        if !self.agent.config.lines.contains(&line_id) {
+            return Response::error(
+                409,
+                "Conflict",
+                "unknown_slot",
+                "该线路未暴露给 AirSIM",
+            );
+        }
         let operation_id = payload
             .get("operation_id")
             .and_then(Value::as_str)
@@ -748,11 +793,16 @@ impl Control {
         let line_id = {
             let requested = field(&["sim_account", "line_id"]);
             if requested.is_empty() {
-                self.agent.config.line_id.clone()
+                self.agent.config.primary_line().to_owned()
             } else {
                 requested
             }
         };
+        // Sending from a card the operator did not expose would put the message
+        // on a number the phone never offered.
+        if !self.agent.config.lines.contains(&line_id) {
+            return Response::error(409, "Conflict", "unknown_slot", "该线路未暴露给 AirSIM");
+        }
         if to.is_empty() || text.is_empty() {
             return Response::error(
                 400,
@@ -873,8 +923,7 @@ mod tests {
     fn test_agent() -> Arc<Agent> {
         Arc::new(Agent::new(
             crate::agents::AgentConfig {
-                line_id: "读卡器1".to_owned(),
-                name: "读卡器1".to_owned(),
+                lines: vec!["读卡器1".to_owned()],
             },
             // A fixed secret: the test signs with the same bytes the verifier
             // holds, so it exercises the real authentication path.
@@ -1082,8 +1131,7 @@ mod tests {
         let fleet = Arc::new(crate::agents::Fleet::new(&root));
         fleet
             .reconcile(vec![crate::agents::AgentConfig {
-                line_id: "读卡器1".to_owned(),
-                name: "读卡器1".to_owned(),
+                lines: vec!["读卡器1".to_owned()],
             }])
             .unwrap();
         for agent in fleet.list() {

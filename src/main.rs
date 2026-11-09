@@ -215,7 +215,7 @@ fn start_agents(
         Arc::new(control).follow_celmux();
     }
     for agent in &agents {
-        advertise_agent(agent, &client, host, advertise, ports, &mut advertisements);
+        advertise_agent(agent, host, advertise, ports, &mut advertisements);
     }
     advertisements
 }
@@ -268,7 +268,6 @@ fn start_shared_pcm_listener(fleet: Arc<Fleet>, client: Arc<celmux::Client>, pcm
 /// call that created it.
 fn advertise_agent(
     agent: &Arc<Agent>,
-    client: &Arc<celmux::Client>,
     host: &str,
     advertise: bool,
     ports: crate::control::Ports,
@@ -280,7 +279,7 @@ fn advertise_agent(
     match discovery::Advertisement::register(
         // The TXT `device_name` the phone shows, so it is the line as it is
         // now rather than the name stored when the line was exposed.
-        &crate::control::line_display_name(client, agent),
+        &crate::control::line_display_name(agent),
         &agent.id(),
         host,
         ports.control,
