@@ -1,0 +1,52 @@
+{
+  "id": "airsim",
+  "name": "AirSIM 桥接",
+  "version": "0.1.0",
+  "description": "让 AirSIM iOS 客户端拨打本机的 VoWiFi/VoLTE 线路",
+  "settings": [
+    {
+      "key": "pairing_secret",
+      "label": "配对密钥",
+      "kind": "secret",
+      "default": "",
+      "hint": "32 字节 base64url。填进 AirSIM 客户端的配对页，手机用它给每个请求签名。"
+    },
+    {
+      "key": "agent_id",
+      "label": "设备名称",
+      "kind": "string",
+      "default": "celmux",
+      "hint": "手机设备列表里显示的名字。留空则用 celmux。"
+    },
+    {
+      "key": "control_port",
+      "label": "控制端口",
+      "kind": "number",
+      "default": "8642",
+      "hint": "AirSIM 客户端控制接口监听的端口。"
+    },
+    {
+      "key": "pcm_port",
+      "label": "PCM 端口",
+      "kind": "number",
+      "default": "8643",
+      "hint": "通话音频使用的端口。"
+    },
+    {
+      "key": "advertise",
+      "label": "Bonjour 广播",
+      "kind": "boolean",
+      "default": "true",
+      "hint": "关闭后需要在手机里手动填写地址。"
+    }
+  ],
+  "permissions": [
+    "lines_read",
+    "devices_read",
+    "calls_read",
+    "calls_control",
+    "media_audio",
+    "sms_read",
+    "sms_send"
+  ]
+}
