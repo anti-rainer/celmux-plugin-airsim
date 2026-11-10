@@ -860,8 +860,17 @@ impl Control {
             Some(context) => context,
             // The cloud path is off. The direct path's long poll still reports
             // the call, so there is nothing to fail here.
-            None => return,
+            None => {
+                crate::log_info!(
+                    "celmux-plugin-airsim: 来电 call_id={call_id} 无云端通道（直连模式），跳过推送"
+                );
+                return;
+            }
         };
+        crate::log_info!(
+            "celmux-plugin-airsim: 来电 call_id={call_id} state={state} 走云端推送，relay={}",
+            context.agent.target().base()
+        );
 
         // The identity of this call, decided under the lock: a repeat of the same
         // state is dropped, a retry keeps the UUID and advances the generation.
