@@ -249,6 +249,22 @@
            "someone is looking at my screen" switch, not a setting. -->
       <button id="privacy-toggle" class="eye" type="button"></button>
     </div>
+    <div class="card" style="margin-bottom:12px">
+      <div class="section-head">
+        <div class="section-title">暴露范围</div>
+      </div>
+      <label style="display:flex;align-items:flex-start;gap:8px;cursor:pointer">
+        <input type="checkbox" id="expose-all-toggle" />
+        <span>
+          <span>动态暴露所有线路</span>
+          <span class="hint" style="display:block;margin-top:2px">
+            打开后实时跟随 Celmux：随后插入的读卡器、N 待切换出的 Profile 都会自动出现，
+            不需要回到这里重新分配。
+          </span>
+        </span>
+      </label>
+      <p class="hint" id="expose-note" style="margin-top:8px"></p>
+    </div>
     <div id="lines-list"></div>
     <p class="hint" id="save-note" style="margin-top:12px"></p>
   </section>
@@ -1205,11 +1221,59 @@ document.getElementById('relay-enabled').onchange = () => {
 document.getElementById('pair-start').onclick = () => void startPairing();
 document.getElementById('pair-forget').onclick = () => void forgetPairing();
 
+// Whether the gateway follows Celmux's line list instead of the stored one.
+//
+// One switch for the whole installation, so it is saved on its own and not per
+// line: the per-line assignments below stay as they were, and turning this back
+// off returns to exactly those.
+function fillExposeAll() {
+  const toggle = document.getElementById('expose-all-toggle');
+  const note = document.getElementById('expose-note');
+  if (!toggle) return;
+  const raw = String((state.config || {}).expose_all_lines || '').trim().toLowerCase();
+  toggle.checked = raw === 'true' || raw === '1';
+  if (note) {
+    note.textContent = toggle.checked
+      ? '已打开：线路列表实时跟随 Celmux，上方的手动分配暂不生效。'
+      : '';
+  }
+}
+
+async function saveExposeAll() {
+  const toggle = document.getElementById('expose-all-toggle');
+  const note = document.getElementById('expose-note');
+  if (!toggle) return;
+  const value = toggle.checked ? 'true' : 'false';
+  if (note) { note.className = 'hint'; note.textContent = '保存中…'; }
+  try {
+    await pluginFetch('/api/config', {
+      method: 'POST',
+      body: JSON.stringify({ values: { expose_all_lines: value } }),
+    });
+    state.config = { ...(state.config || {}), expose_all_lines: value };
+    if (note) {
+      note.className = 'hint';
+      note.textContent = toggle.checked
+        ? '已打开（重启插件后生效）。'
+        : '已关闭，回到手动分配的线路（重启插件后生效）。';
+    }
+    await refresh();
+  } catch (error) {
+    if (note) { note.className = 'hint err'; note.textContent = `保存失败：${error.message || error}`; }
+  }
+}
+
+(function bindExposeAll() {
+  const toggle = document.getElementById('expose-all-toggle');
+  if (toggle) toggle.addEventListener('change', saveExposeAll);
+})();
+
 (async function init() {
   await loadConfig();
   // Before the first refresh: the inputs show the ports in effect, and the
   // cards below no longer carry them.
   fillPortInputs();
+  fillExposeAll();
   await refresh();
 })();
 </script>

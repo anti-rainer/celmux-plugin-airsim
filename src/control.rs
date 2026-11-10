@@ -59,7 +59,12 @@ pub fn uuid_v5_like(seed: &str) -> String {
     bytes.copy_from_slice(&digest[..16]);
     bytes[6] = (bytes[6] & 0x0f) | 0x50;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    let hex = |slice: &[u8]| slice.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+    let hex = |slice: &[u8]| {
+        slice
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
     format!(
         "{}-{}-{}-{}-{}",
         hex(&bytes[0..4]),
@@ -199,7 +204,11 @@ fn call_id_text(value: &Value) -> Option<String> {
 fn query_number(query: &str, key: &str) -> Option<u64> {
     query.split('&').find_map(|pair| {
         let (name, value) = pair.split_once('=')?;
-        if name == key { value.parse().ok() } else { None }
+        if name == key {
+            value.parse().ok()
+        } else {
+            None
+        }
     })
 }
 
@@ -422,10 +431,7 @@ pub fn handle_shared(
                     &request.headers,
                     now,
                 ) {
-                    crate::log_warn!(
-                        "celmux-plugin-airsim: {} 校验失败: {error:?}",
-                        agent.id()
-                    );
+                    crate::log_warn!("celmux-plugin-airsim: {} 校验失败: {error:?}", agent.id());
                 }
             }
             None => crate::log_warn!("celmux-plugin-airsim: {} 没有配对密钥", agent.id()),
@@ -480,6 +486,7 @@ impl Control {
             ("GET", "/api/calls/status") => self.call_status_now(),
             ("GET", "/api/calls/events") => self.call_status(&request),
             ("GET", "/api/calls/operation") => self.dial_operation(&request),
+            ("POST", "/api/calls/auto-answer") => self.set_line_auto_answer(&request),
             ("GET", "/api/events") => self.events(&request),
             ("GET", "/api/sim/identity") => self.sim_identity(),
             ("GET", "/api/sms") => self.messages(),
@@ -585,7 +592,7 @@ impl Control {
             .map(|lines| {
                 lines
                     .iter()
-                    .filter(|line| self.agent.config.lines.contains(&line.line_id))
+                    .filter(|line| self.agent.exposes(&line.line_id))
                     .map(super::control_api::sim_slot)
                     .collect()
             })
@@ -603,7 +610,7 @@ impl Control {
             .and_then(|lines| {
                 lines
                     .into_iter()
-                    .find(|line| Some(&line.line_id) == self.agent.config.lines.first())
+                    .find(|line| Some(&line.line_id) == self.agent.lines().first())
             })
             .map(|line| line.local_phone)
             .unwrap_or_default()
@@ -630,9 +637,7 @@ impl Control {
         // lists these as the cards it can call from.
         let devices: Vec<Value> = devices(lines)
             .into_iter()
-            .filter(|device| {
-                self.agent.config.lines.contains(&device.line.line_id)
-            })
+            .filter(|device| self.agent.exposes(&device.line.line_id))
             .map(|device| {
                 json!({
                     "id": device.id,
@@ -695,6 +700,58 @@ impl Control {
         response
     }
 
+    /// `POST /api/calls/auto-answer` — let this gateway present a line's calls.
+    ///
+    /// `enabled: true` means "Celmux may answer by itself"; the phone asks for the
+    /// opposite when it wants to ring for a call. Sent to Celmux as a runtime
+    /// suppression, so the operator's own switch on that line is never written -
+    /// a plugin that changed it would leave the line altered after the plugin was
+    /// removed, and the two settings would fight on every call.
+    fn set_line_auto_answer(&self, request: &Request) -> Response {
+        let payload: Value = match serde_json::from_slice(&request.body) {
+            Ok(payload) => payload,
+            Err(error) => {
+                return Response::error(400, "Bad Request", "bad_json", &error.to_string());
+            }
+        };
+        let line_id = payload
+            .get("line_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        // Default to the agent's first line: the app's own settings screen acts on
+        // one card at a time and may omit it.
+        let line_id = if line_id.is_empty() {
+            self.agent.lines().first().cloned().unwrap_or_default()
+        } else {
+            line_id
+        };
+        if line_id.is_empty() {
+            return Response::error(400, "Bad Request", "no_line", "没有可操作的线路");
+        }
+        if !self.agent.exposes(&line_id) {
+            return Response::error(403, "Forbidden", "line_not_exposed", "该线路未暴露给本网关");
+        }
+        let enabled = payload
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        match self.client.set_auto_answer(&line_id, enabled) {
+            Ok(answer) => Response::ok(json!({
+                "ok": true,
+                "line_id": line_id,
+                // What the phone asked for, and what the line itself is set to.
+                // The two differ whenever the phone has taken the calls over, and
+                // a client that shows only one of them misreports the other.
+                "auto_answer": enabled,
+                "configured": answer.get("configured").cloned().unwrap_or(Value::Null),
+            })),
+            Err(error) => {
+                Response::error(502, "Bad Gateway", "celmux_unavailable", &error.to_string())
+            }
+        }
+    }
+
     /// The current call state, answered at once.
     fn call_status_now(&self) -> Response {
         let active = match self.client.calls() {
@@ -708,7 +765,11 @@ impl Control {
                 );
             }
         };
-        Response::ok(super::control_api::call_status(active, Vec::new(), self.revision.now()))
+        Response::ok(super::control_api::call_status(
+            active,
+            Vec::new(),
+            self.revision.now(),
+        ))
     }
 
     /// Hold Celmux's event stream open and wake the phone's poll when it fires.
@@ -831,7 +892,10 @@ impl Control {
     /// over for one call. Only `incoming` + `ringing` is a push, and the call id is
     /// remembered so a repeat is dropped.
     fn push_ringing_call(&self, payload: &Value) {
-        let direction = payload.get("direction").and_then(Value::as_str).unwrap_or("");
+        let direction = payload
+            .get("direction")
+            .and_then(Value::as_str)
+            .unwrap_or("");
         let state = payload.get("state").and_then(Value::as_str).unwrap_or("");
         // Celmux reports a call's SIP phase; the AirSIM relay only accepts
         // `incoming` or `waiting`. `ringing` and `early` are the same moment from
@@ -922,6 +986,29 @@ impl Control {
             media_url: String::new(),
         };
 
+        // Take the line over before announcing the call. Celmux answers an
+        // auto-answer line by itself, and it does so from the same event this
+        // handler is reading - so a call on such a line is answered before the
+        // phone could ever ring for it. Suppressing first is what makes the two
+        // settings coexist: the line keeps its own switch, and this gateway is the
+        // one presenting the call. Repeated pushes are cheap: Celmux reports
+        // whether the set changed.
+        let handover_line = payload
+            .get("line_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        if !handover_line.is_empty() && self.agent.exposes(&handover_line) {
+            match self.client.set_auto_answer(&handover_line, false) {
+                Ok(_) => {}
+                // Not fatal to the ring: a line whose switch was already off needs
+                // nothing, and saying so every call would bury the real failures.
+                Err(error) => crate::log_warn!(
+                    "celmux-plugin-airsim: 接管线路 {handover_line} 自动接听失败: {error}"
+                ),
+            }
+        }
+
         // Off this thread: the event stream must keep reading, and a round-trip
         // to a relay is tens of milliseconds.
         let push = Arc::clone(&self.call_push);
@@ -936,7 +1023,6 @@ impl Control {
             }
         });
     }
-
 
     /// Tell the phone a message arrived.
     ///
@@ -971,13 +1057,7 @@ impl Control {
         }
         // The line the message arrived on: Celmux names it, and a message belongs
         // to one line.
-        let line = self
-            .agent
-            .config
-            .lines
-            .first()
-            .cloned()
-            .unwrap_or_default();
+        let line = self.agent.config.lines.first().cloned().unwrap_or_default();
         std::thread::spawn(move || {
             let Ok(value) = context.client.messages(&line) else {
                 return;
@@ -1030,7 +1110,11 @@ impl Control {
                 // number, and `sender` is what the phone puts on the notification.
                 sender: {
                     let sender = text("sender");
-                    if sender.is_empty() { text("peer") } else { sender }
+                    if sender.is_empty() {
+                        text("peer")
+                    } else {
+                        sender
+                    }
                 },
                 content: text("content"),
                 code: String::new(),
@@ -1071,7 +1155,11 @@ impl Control {
             .map(|millis| std::time::Duration::from_millis(millis.min(30_000)))
             .unwrap_or(std::time::Duration::from_secs(15));
         let revision = self.revision.wait_past(after, timeout);
-        let active = self.client.calls().ok().and_then(|value| active_call(&value));
+        let active = self
+            .client
+            .calls()
+            .ok()
+            .and_then(|value| active_call(&value));
         // Only the lines the operator exposed. Offering the others would put
         // cards in the picker that every send and dial then refuses - a choice
         // that cannot be used is worse than one that is not offered.
@@ -1079,10 +1167,7 @@ impl Control {
         let messages = self.sms_pending();
         let status = super::control_api::call_status(active, Vec::new(), revision);
         Response::ok(super::control_api::agent_event_status(
-            revision,
-            status,
-            messages,
-            slots,
+            revision, status, messages, slots,
         ))
     }
 
@@ -1197,7 +1282,7 @@ impl Control {
             .and_then(|lines| {
                 lines
                     .into_iter()
-                    .find(|line| Some(&line.line_id) == self.agent.config.lines.first())
+                    .find(|line| Some(&line.line_id) == self.agent.lines().first())
             })
             .map(|line| line.local_phone)
             .unwrap_or_default();
@@ -1219,12 +1304,9 @@ impl Control {
                 // that appears to do nothing.
                 Response::ok(Value::Array(self.all_messages()))
             }
-            Err(error) => Response::error(
-                502,
-                "Bad Gateway",
-                "celmux_unavailable",
-                &error.to_string(),
-            ),
+            Err(error) => {
+                Response::error(502, "Bad Gateway", "celmux_unavailable", &error.to_string())
+            }
         }
     }
 
@@ -1308,18 +1390,13 @@ impl Control {
             // percent-encoded; both name the same line.
             .map(|value| value.replace("%23", "#"))
             .unwrap_or_else(|| self.agent.config.primary_line().to_owned());
-        if !self.agent.config.lines.contains(&line_id) {
+        if !self.agent.exposes(&line_id) {
             crate::log_warn!(
                 "celmux-plugin-airsim: 拨号被拒 sim_account={:?} 已暴露={:?}",
                 line_id,
                 self.agent.config.lines
             );
-            return Response::error(
-                409,
-                "Conflict",
-                "unknown_slot",
-                "该线路未暴露给 AirSIM",
-            );
+            return Response::error(409, "Conflict", "unknown_slot", "该线路未暴露给 AirSIM");
         }
         let operation_id = payload
             .get("operation_id")
@@ -1358,12 +1435,9 @@ impl Control {
                     "call": value,
                 }))
             }
-            Err(error) => Response::error(
-                502,
-                "Bad Gateway",
-                "celmux_unavailable",
-                &error.to_string(),
-            ),
+            Err(error) => {
+                Response::error(502, "Bad Gateway", "celmux_unavailable", &error.to_string())
+            }
         }
     }
 
@@ -1423,7 +1497,7 @@ impl Control {
         // on a number the phone never offered. The received value is logged
         // because the phone sends a slot id, and a mismatch there is otherwise
         // indistinguishable from a bug in this check.
-        if !self.agent.config.lines.contains(&line_id) {
+        if !self.agent.exposes(&line_id) {
             crate::log_warn!(
                 "celmux-plugin-airsim: 发短信被拒 sim_account={:?} 已暴露={:?}",
                 line_id,
@@ -1432,12 +1506,7 @@ impl Control {
             return Response::error(409, "Conflict", "unknown_slot", "该线路未暴露给 AirSIM");
         }
         if to.is_empty() || text.is_empty() {
-            return Response::error(
-                400,
-                "Bad Request",
-                "bad_request",
-                "缺少收件人或内容",
-            );
+            return Response::error(400, "Bad Request", "bad_request", "缺少收件人或内容");
         }
         match self.client.send_sms(&line_id, &to, &text) {
             Ok(_) => {
@@ -1447,12 +1516,9 @@ impl Control {
                 self.revision.bump();
                 Response::ok(json!({"sent": true, "segments": 1}))
             }
-            Err(error) => Response::error(
-                502,
-                "Bad Gateway",
-                "celmux_unavailable",
-                &error.to_string(),
-            ),
+            Err(error) => {
+                Response::error(502, "Bad Gateway", "celmux_unavailable", &error.to_string())
+            }
         }
     }
 
@@ -1518,10 +1584,18 @@ impl Control {
         // The active call is the only place a dialled operation can be seen from
         // here: Celmux reports calls, not operations, so a call that is up and
         // on this line is the evidence the dial went through.
-        let active = self.client.calls().ok().and_then(|value| active_call(&value));
+        let active = self
+            .client
+            .calls()
+            .ok()
+            .and_then(|value| active_call(&value));
         let (status, android_id, backend_id, call_state, ended_at) = match active {
             Some(call) => {
-                let id = call.get("id").and_then(Value::as_str).unwrap_or("").to_owned();
+                let id = call
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
                 let state = call
                     .get("state")
                     .and_then(Value::as_str)
@@ -1592,19 +1666,19 @@ impl Control {
         let call_id: String = if call_id.is_empty() {
             // Fall back to whatever is on a call. Acting on the wrong call is
             // impossible here: there is at most one.
-            match self.client.calls().ok().and_then(|value| active_call(&value)) {
+            match self
+                .client
+                .calls()
+                .ok()
+                .and_then(|value| active_call(&value))
+            {
                 Some(active) => active
                     .get("android_id")
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_owned(),
                 None => {
-                    return Response::error(
-                        409,
-                        "Conflict",
-                        "no_active_call",
-                        "当前没有通话",
-                    );
+                    return Response::error(409, "Conflict", "no_active_call", "当前没有通话");
                 }
             }
         } else {
@@ -1615,9 +1689,7 @@ impl Control {
                 .calls()
                 .ok()
                 .and_then(|value| active_call(&value))
-                .filter(|active| {
-                    active.get("id").and_then(Value::as_str) == Some(call_id.as_str())
-                })
+                .filter(|active| active.get("id").and_then(Value::as_str) == Some(call_id.as_str()))
                 .and_then(|active| {
                     active
                         .get("android_id")
@@ -1639,9 +1711,12 @@ impl Control {
                 // asked for, and it happens whenever the carrier or Celmux ends
                 // the call first. Reporting a failure there makes the phone keep
                 // the call on screen and retry.
-                if action == "hangup" && self.client.calls().map_or(true, |value| {
-                    active_call(&value).is_none()
-                }) {
+                if action == "hangup"
+                    && self
+                        .client
+                        .calls()
+                        .map_or(true, |value| active_call(&value).is_none())
+                {
                     self.revision.bump();
                     return Response::ok(json!({"ok": true, "already_ended": true}));
                 }
@@ -1728,9 +1803,9 @@ mod tests {
     fn test_agent() -> Arc<Agent> {
         Arc::new(Agent::new(
             crate::agents::AgentConfig {
-            lines: vec!["读卡器1".to_owned()],
-            ..Default::default()
-        },
+                lines: vec!["读卡器1".to_owned()],
+                ..Default::default()
+            },
             // A fixed secret: the test signs with the same bytes the verifier
             // holds, so it exercises the real authentication path.
             Some(vec![7_u8; 32]),
@@ -1762,7 +1837,10 @@ mod tests {
         let signature = crate::config::base64_url_encode(&mac.finalize().into_bytes());
         let mut headers = std::collections::HashMap::new();
         headers.insert("x-airsim-vowlan-version".to_owned(), "1".to_owned());
-        headers.insert("x-airsim-vowlan-timestamp".to_owned(), timestamp.to_string());
+        headers.insert(
+            "x-airsim-vowlan-timestamp".to_owned(),
+            timestamp.to_string(),
+        );
         headers.insert("x-airsim-vowlan-nonce".to_owned(), nonce.to_owned());
         headers.insert("x-airsim-vowlan-signature".to_owned(), signature);
         Request {
@@ -1799,9 +1877,7 @@ mod tests {
             )),
             agent: test_agent(),
             revision: Arc::new(crate::revision::Revision::default()),
-            acked_messages: Arc::new(std::sync::Mutex::new(
-                std::collections::BTreeSet::new(),
-            )),
+            acked_messages: Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new())),
             ports: TEST_PORTS,
         })
     }
@@ -1850,7 +1926,10 @@ mod tests {
         let body: Value = serde_json::from_slice(&response.body).unwrap();
         assert!(body["call"].is_object(), "body: {body}");
         assert!(body["revision"].is_number());
-        assert_eq!(body["call"]["polling"], false, "嵌套的通话状态同样是事件驱动");
+        assert_eq!(
+            body["call"]["polling"], false,
+            "嵌套的通话状态同样是事件驱动"
+        );
         assert!(body["sim_slots"].is_array());
     }
 
@@ -1880,7 +1959,10 @@ mod tests {
         let signature = crate::config::base64_url_encode(&mac.finalize().into_bytes());
         let mut headers = std::collections::HashMap::new();
         headers.insert("x-airsim-vowlan-version".to_owned(), "1".to_owned());
-        headers.insert("x-airsim-vowlan-timestamp".to_owned(), timestamp.to_string());
+        headers.insert(
+            "x-airsim-vowlan-timestamp".to_owned(),
+            timestamp.to_string(),
+        );
         headers.insert("x-airsim-vowlan-nonce".to_owned(), "nonce-q".to_owned());
         headers.insert("x-airsim-vowlan-signature".to_owned(), signature);
         let response = control().handle_verified(Request {
@@ -1945,9 +2027,9 @@ mod tests {
         let fleet = Arc::new(crate::agents::Fleet::new(&root));
         fleet
             .reconcile(vec![crate::agents::AgentConfig {
-            lines: vec!["读卡器1".to_owned()],
-            ..Default::default()
-        }])
+                lines: vec!["读卡器1".to_owned()],
+                ..Default::default()
+            }])
             .unwrap();
         for agent in fleet.list() {
             agent.set_secret(vec![7_u8; 32]);
@@ -2027,7 +2109,10 @@ mod tests {
             let state = push.lock().unwrap();
             (state.uuid.clone(), state.generation)
         };
-        assert_eq!(retry.0, first.0, "重试必须复用同一个 UUID，否则 CallKit 会当成第二通电话");
+        assert_eq!(
+            retry.0, first.0,
+            "重试必须复用同一个 UUID，否则 CallKit 会当成第二通电话"
+        );
         assert_eq!(retry.1, first.1 + 1, "重试必须递增 generation");
 
         // A different call gets a fresh identity.
@@ -2077,7 +2162,11 @@ mod tests {
             line("读卡器1", "读卡器1", "Globe", "", false),
         ]);
         let ids: Vec<&str> = views.iter().map(|view| view.id.as_str()).collect();
-        assert_eq!(ids, vec!["读卡器2#890", "读卡器1"], "裸线路只在该模组有 Profile 时丢弃");
+        assert_eq!(
+            ids,
+            vec!["读卡器2#890", "读卡器1"],
+            "裸线路只在该模组有 Profile 时丢弃"
+        );
     }
     /// The app's `AgentPushStatus` has four required fields. A 404 here is read
     /// as "not an agent" and the app stops probing a healthy line, so this route
@@ -2164,10 +2253,7 @@ mod tests {
             query: "operation_id=abc-123".to_owned(),
             headers: {
                 let mut headers = std::collections::HashMap::new();
-                headers.insert(
-                    crate::auth::HEADER_NONCE.to_owned(),
-                    "n0nce".to_owned(),
-                );
+                headers.insert(crate::auth::HEADER_NONCE.to_owned(), "n0nce".to_owned());
                 headers
             },
             body: Vec::new(),
@@ -2255,5 +2341,4 @@ mod tests {
         let active = active_call(&payload).expect("early 也应当被识别");
         assert_eq!(active["state"], "incoming");
     }
-
 }

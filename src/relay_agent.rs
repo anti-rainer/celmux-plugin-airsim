@@ -212,10 +212,7 @@ impl Agent {
         let mut body = report.clone();
         if let Some(object) = body.as_object_mut() {
             object.insert("device_id".to_owned(), json!(signed.device_id));
-            object.insert(
-                "device_secret".to_owned(),
-                json!(signed.device_secret),
-            );
+            object.insert("device_secret".to_owned(), json!(signed.device_secret));
         }
         self.post("/v1/events/heartbeat", body)
     }
@@ -260,7 +257,6 @@ impl Agent {
         let url = format!("{}{path}", self.target.base());
         crate::apns_http::post_json(&url, &body)
     }
-
 }
 
 /// One received message, as an SMS event describes it.
@@ -388,5 +384,4 @@ mod tests {
         assert!(Target::from_mode("", "https://relay.example.com", 43770).is_own());
         assert!(Target::from_mode("nonsense", "", 43770).is_own());
     }
-
 }

@@ -80,7 +80,11 @@ pub fn serve_shared(listener: TcpListener, client: Arc<Client>, fleet: Arc<Fleet
 
 /// Serve one PCM connection, attributing it to the line whose secret signed the
 /// handshake.
-fn handle_shared(mut stream: TcpStream, client: Arc<Client>, fleet: Arc<Fleet>) -> std::io::Result<()> {
+fn handle_shared(
+    mut stream: TcpStream,
+    client: Arc<Client>,
+    fleet: Arc<Fleet>,
+) -> std::io::Result<()> {
     let _ = stream.set_nodelay(true);
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
@@ -103,7 +107,9 @@ fn handle_shared(mut stream: TcpStream, client: Arc<Client>, fleet: Arc<Fleet>) 
         loop {
             match stream.read(&mut byte) {
                 Ok(0) => {
-                    crate::log_warn!("celmux-plugin-airsim: PCM 对方关闭连接，未发送握手（{peer}）");
+                    crate::log_warn!(
+                        "celmux-plugin-airsim: PCM 对方关闭连接，未发送握手（{peer}）"
+                    );
                     return Ok(());
                 }
                 Ok(_) => {
@@ -127,10 +133,7 @@ fn handle_shared(mut stream: TcpStream, client: Arc<Client>, fleet: Arc<Fleet>) 
         crate::log_warn!("celmux-plugin-airsim: PCM 握手无匹配线路，已拒绝（{peer}）");
         return Ok(());
     };
-    crate::log_info!(
-        "celmux-plugin-airsim: PCM 连接 {peer} 归属 {}",
-        agent.id()
-    );
+    crate::log_info!("celmux-plugin-airsim: PCM 连接 {peer} 归属 {}", agent.id());
     stream.write_all(SERVER_READY)?;
     stream.flush()?;
     // The handshake timeouts above exist for the handshake only. Leaving them on
@@ -209,7 +212,10 @@ fn bridge(stream: TcpStream, client: Arc<Client>, agent: Arc<Agent>) -> std::io:
 /// A dial takes a moment to become visible on Celmux's side, and the phone's
 /// audio arrives before that. Retrying is what keeps that race from costing the
 /// greeting.
-fn connect_wire(client: &Arc<Client>, agent: &Arc<Agent>) -> Result<crate::audio_wire::Wire, String> {
+fn connect_wire(
+    client: &Arc<Client>,
+    agent: &Arc<Agent>,
+) -> Result<crate::audio_wire::Wire, String> {
     let address = client.audio_wire_address()?;
     let plugin_id = client.plugin_id();
     let token = client.token();

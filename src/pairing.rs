@@ -406,9 +406,9 @@ mod tests {
 
         // A local-only pairing sends no relay credential, and an empty string is
         // not a credential: both read as absent rather than as an empty secret.
-        let local = parse_registration(br#"{"device_id":"p2","device_secret":"","vowlan_secret":"s"}"#)
-            .unwrap();
+        let local =
+            parse_registration(br#"{"device_id":"p2","device_secret":"","vowlan_secret":"s"}"#)
+                .unwrap();
         assert!(local.device_secret.is_none(), "空字符串不应被当成凭据");
     }
-
 }

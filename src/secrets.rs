@@ -112,7 +112,11 @@ impl Store {
     /// belongs to. A credential is only valid for the relay that issued it, so
     /// the third field is what stops a leftover from being presented to a new
     /// endpoint and being refused for reasons nothing on screen explains.
-    pub fn save_relay(&self, id: &str, relay: &crate::agents::RelayCredentials) -> Result<(), String> {
+    pub fn save_relay(
+        &self,
+        id: &str,
+        relay: &crate::agents::RelayCredentials,
+    ) -> Result<(), String> {
         let mut lines: Vec<String> = Vec::new();
         if let Ok(text) = std::fs::read_to_string(&self.relay_path) {
             for line in text.lines() {

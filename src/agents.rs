@@ -30,7 +30,19 @@ pub const DEFAULT_AGENT_NAME: &str = "Celmux";
 #[derive(Clone, Debug, Default)]
 pub struct AgentConfig {
     /// The lines this agent carries, as Celmux line labels, in display order.
+    ///
+    /// Ignored when `expose_all_lines` is set, which exposes whatever Celmux has
+    /// at the moment of the request.
     pub lines: Vec<String>,
+    /// Expose every line Celmux currently has, instead of the list above.
+    ///
+    /// The list is a snapshot, and Celmux is not: a reader plugged in, a Profile
+    /// switched in N-standby, or a VoWiFi tunnel coming up adds a line that no
+    /// static list could have named. With this on, a line appears as soon as
+    /// Celmux knows about it and disappears when it goes away, which is what an
+    /// installation that treats the gateway as a bridge - rather than as a curated
+    /// set of cards - wants.
+    pub expose_all_lines: bool,
     /// The display name the phone shows. Operator-editable: it is a label, and
     /// renaming it changes nothing about the pairing.
     pub name: String,
@@ -240,6 +252,20 @@ impl Agent {
         self.config.lines.clone()
     }
 
+    /// Whether Celmux's line is one this agent offers.
+    ///
+    /// One place, because the health document, the slot picker, the status list,
+    /// SMS filtering and the PCM handshake all ask the same question. When they
+    /// each carried their own `config.lines.contains(...)`, exposing every line
+    /// would have meant finding every one of them - and missing one shows up as a
+    /// line that lists but cannot be dialled.
+    pub fn exposes(&self, line_id: &str) -> bool {
+        if self.config.expose_all_lines {
+            return true;
+        }
+        self.config.lines.iter().any(|line| line == line_id)
+    }
+
     /// The secret this agent's phone signs with, if it has paired.
     pub fn secret(&self) -> Option<Vec<u8>> {
         self.secret.lock().ok().and_then(|secret| secret.clone())
@@ -257,7 +283,12 @@ impl Agent {
     /// to whichever relay it was pointed at, so this process only ever sees it in
     /// that claim. With an external relay it is the only credential the events can
     /// be signed with.
-    pub fn set_relay_credentials(&self, device_id: String, device_secret: String, relay_url: String) {
+    pub fn set_relay_credentials(
+        &self,
+        device_id: String,
+        device_secret: String,
+        relay_url: String,
+    ) {
         if let Ok(mut relay) = self.relay_credentials.lock() {
             *relay = Some(RelayCredentials {
                 device_id,
@@ -269,7 +300,10 @@ impl Agent {
 
     /// What the phone registered with a relay under, if it reported one.
     pub fn relay_credentials(&self) -> Option<RelayCredentials> {
-        self.relay_credentials.lock().ok().and_then(|relay| relay.clone())
+        self.relay_credentials
+            .lock()
+            .ok()
+            .and_then(|relay| relay.clone())
     }
 
     /// The id of the phone that paired with this gateway, if any.
@@ -429,9 +463,6 @@ impl Fleet {
     }
 }
 
-
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -439,6 +470,7 @@ mod tests {
     fn config(line: &str, _control: u16) -> AgentConfig {
         AgentConfig {
             lines: vec![line.to_owned()],
+            expose_all_lines: false,
             // The defaults, so a test that wants a named agent says so explicitly.
             name: String::new(),
             id: String::new(),
@@ -451,6 +483,7 @@ mod tests {
     fn the_identity_comes_from_configuration_not_from_the_lines() {
         let named = AgentConfig {
             lines: vec!["读卡器1".to_owned()],
+            expose_all_lines: false,
             name: "客厅网关".to_owned(),
             id: "living-room".to_owned(),
         };
@@ -469,6 +502,7 @@ mod tests {
         // cannot address.
         let blank = AgentConfig {
             lines: vec!["dji1".to_owned()],
+            expose_all_lines: false,
             name: String::new(),
             id: String::new(),
         };
@@ -564,9 +598,9 @@ mod tests {
         fleet.list()[0].set_secret(vec![1; 32]);
         fleet
             .reconcile(vec![AgentConfig {
-            lines: vec!["dji1".to_owned(), "dji2".to_owned()],
-            ..Default::default()
-        }])
+                lines: vec!["dji1".to_owned(), "dji2".to_owned()],
+                ..Default::default()
+            }])
             .unwrap();
         let agents = fleet.list();
         assert_eq!(agents.len(), 1, "仍是一个 agent");
@@ -625,5 +659,53 @@ mod tests {
         assert_eq!(second.len(), 6);
         let live_session = agent.with_pairing(|session| session.id.clone());
         assert_eq!(live_session.as_deref(), Some("s2"));
+    }
+    /// A line the operator never assigned is exposed when the switch is on.
+    ///
+    /// The list is a snapshot; Celmux is not. A reader plugged in afterwards, or
+    /// an N-standby Profile switched in, adds a line no static list could name -
+    /// and the point of the switch is that such a line appears without anyone
+    /// editing a list.
+    #[test]
+    fn exposing_all_lines_includes_one_that_was_never_assigned() {
+        let curated = AgentConfig {
+            lines: vec!["读卡器1".to_owned()],
+            expose_all_lines: false,
+            name: "C".to_owned(),
+            id: "celmux".to_owned(),
+        };
+        let agent = Agent::new(curated, None);
+        assert!(agent.exposes("读卡器1"));
+        assert!(!agent.exposes("读卡器3"), "未分配的线路默认不暴露");
+
+        let everything = AgentConfig {
+            lines: vec!["读卡器1".to_owned()],
+            expose_all_lines: true,
+            name: "C".to_owned(),
+            id: "celmux".to_owned(),
+        };
+        let agent = Agent::new(everything, None);
+        assert!(agent.exposes("读卡器1"));
+        assert!(agent.exposes("读卡器3"), "打开开关后任何线路都暴露");
+        assert!(
+            agent.exposes("dji1@89860012345678901234"),
+            "N 待 Profile 也暴露"
+        );
+    }
+
+    /// With the switch on the gateway is still a gateway when the list is empty.
+    ///
+    /// Demanding a list first would make the switch impossible to use on a fresh
+    /// installation: there is nothing to curate, and every line should appear.
+    #[test]
+    fn an_empty_list_still_yields_an_agent_when_every_line_is_exposed() {
+        let configs =
+            crate::settings::parse_assignment_for_tests("", ("C".to_owned(), String::new(), true));
+        assert_eq!(configs.len(), 1, "开关打开时没有线路也要有 agent");
+        assert!(configs[0].expose_all_lines);
+
+        let configs =
+            crate::settings::parse_assignment_for_tests("", ("C".to_owned(), String::new(), false));
+        assert!(configs.is_empty(), "开关关闭且没有线路时没有 agent");
     }
 }

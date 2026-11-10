@@ -133,7 +133,11 @@ fn main() {
     let relay_context = Arc::new(relay_endpoint::Context {
         state: Arc::new(relay::State::persistent(&root)),
         agent: Arc::new(relay_agent::Agent::new(
-            relay_agent::Target::from_mode(&config.relay_mode, &config.relay_target, config.relay_port),
+            relay_agent::Target::from_mode(
+                &config.relay_mode,
+                &config.relay_target,
+                config.relay_port,
+            ),
             relay_agent::Credentials {
                 // The phone's credentials are what a relay authenticates an event
                 // with. When this process is the relay it registered that phone
@@ -213,7 +217,11 @@ fn main() {
     let own_relay = relay_context.agent.target().is_own();
     if config.relay_enabled && own_relay {
         relay_endpoint::spawn_heartbeat(Arc::clone(&relay_context));
-        start_relay_listener(Arc::clone(&relay_context), Arc::clone(&fleet), config.relay_port);
+        start_relay_listener(
+            Arc::clone(&relay_context),
+            Arc::clone(&fleet),
+            config.relay_port,
+        );
     } else if !config.relay_enabled {
         crate::log_info!(
             "celmux-plugin-airsim: Relay 云端已关闭（relay_enabled=false），不监听 {}",
@@ -252,11 +260,7 @@ fn main() {
 /// requires `https`, and terminating TLS is the proxy's job, not this process's.
 /// Every route here authenticates with the credentials the phone registered, so an
 /// open port is not an open interface.
-fn start_relay_listener(
-    context: Arc<relay_endpoint::Context>,
-    fleet: Arc<Fleet>,
-    port: u16,
-) {
+fn start_relay_listener(context: Arc<relay_endpoint::Context>, fleet: Arc<Fleet>, port: u16) {
     let listener = match std::net::TcpListener::bind(("0.0.0.0", port)) {
         Ok(listener) => listener,
         Err(error) => {

@@ -29,6 +29,8 @@ const PAIRING_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// The key the assignment is stored under in Celmux's plugin configuration.
 const ASSIGNMENT_KEY: &str = "agents";
+/// Expose every line Celmux has, instead of the stored list.
+const EXPOSE_ALL_KEY: &str = "expose_all_lines";
 /// The display name, stored apart from the line list.
 const AGENT_NAME_KEY: &str = "agent_name";
 /// The credential id, stored apart from the line list.
@@ -67,7 +69,14 @@ pub fn load_assignment(client: &Client) -> Result<Vec<AgentConfig>, String> {
     // The identity is its own configuration, not part of the line list: the list
     // is the operator's ordering of lines, and folding a name into it would make
     // renaming the agent rewrite every row.
-    let identity = (read(AGENT_NAME_KEY), read(AGENT_ID_KEY));
+    // The switch is read from the same place the list is, because they answer the
+    // same question: which lines this gateway offers.
+    let expose_all = config
+        .and_then(|config| config.get(EXPOSE_ALL_KEY))
+        .and_then(Value::as_str)
+        .map(|value| matches!(value.trim(), "true" | "1" | "on" | "yes"))
+        .unwrap_or(false);
+    let identity = (read(AGENT_NAME_KEY), read(AGENT_ID_KEY), expose_all);
     let raw = config
         .and_then(|config| config.get(ASSIGNMENT_KEY))
         .and_then(Value::as_str)
@@ -76,9 +85,25 @@ pub fn load_assignment(client: &Client) -> Result<Vec<AgentConfig>, String> {
 }
 
 /// Parse the stored assignment, tolerating an empty value.
-fn parse_assignment(raw: &str, identity: (String, String)) -> Result<Vec<AgentConfig>, String> {
+fn parse_assignment(
+    raw: &str,
+    identity: (String, String, bool),
+) -> Result<Vec<AgentConfig>, String> {
+    let (_, _, expose_all_lines) = identity.clone();
     let trimmed = raw.trim();
     if trimmed.is_empty() {
+        // An empty list is still a gateway when every line is exposed: there is
+        // nothing to curate, and demanding a list first would make the switch
+        // impossible to use on a fresh installation.
+        if expose_all_lines {
+            let (name, id, expose_all_lines) = identity;
+            return Ok(vec![AgentConfig {
+                lines: Vec::new(),
+                expose_all_lines,
+                name,
+                id,
+            }]);
+        }
         return Ok(Vec::new());
     }
     let lines: Vec<AssignedLine> =
@@ -90,13 +115,27 @@ fn parse_assignment(raw: &str, identity: (String, String)) -> Result<Vec<AgentCo
         .map(|line| line.line_id.trim().to_owned())
         .filter(|line_id| !line_id.is_empty())
         .collect();
-    let (name, id) = identity;
-    if lines.is_empty() {
+    let (name, id, _) = identity;
+    if lines.is_empty() && !expose_all_lines {
         // No lines is no agent, but the operator may still have set a name before
         // assigning any: keeping it means the page shows what they typed.
         return Ok(Vec::new());
     }
-    Ok(vec![AgentConfig { lines, name, id }])
+    Ok(vec![AgentConfig {
+        lines,
+        expose_all_lines,
+        name,
+        id,
+    }])
+}
+
+/// Parse an assignment the way the settings page does, for tests.
+#[cfg(test)]
+pub(crate) fn parse_assignment_for_tests(
+    raw: &str,
+    identity: (String, String, bool),
+) -> Vec<AgentConfig> {
+    parse_assignment(raw, identity).unwrap_or_default()
 }
 
 /// Route one request on the settings listener.
@@ -256,7 +295,11 @@ fn memory_kb() -> u64 {
             status
                 .lines()
                 .find(|line| line.starts_with("VmRSS:"))
-                .and_then(|line| line.split_whitespace().nth(1).and_then(|value| value.parse().ok()))
+                .and_then(|line| {
+                    line.split_whitespace()
+                        .nth(1)
+                        .and_then(|value| value.parse().ok())
+                })
         })
         .unwrap_or(0)
 }
@@ -269,12 +312,14 @@ fn threads() -> u64 {
             status
                 .lines()
                 .find(|line| line.starts_with("Threads:"))
-                .and_then(|line| line.split_whitespace().nth(1).and_then(|value| value.parse().ok()))
+                .and_then(|line| {
+                    line.split_whitespace()
+                        .nth(1)
+                        .and_then(|value| value.parse().ok())
+                })
         })
         .unwrap_or(0)
 }
-
-
 
 #[derive(Deserialize)]
 struct PairRequest {
@@ -529,7 +574,11 @@ mod tests {
     #[test]
     fn an_empty_assignment_yields_no_agents() {
         assert!(parse_assignment("", Default::default()).unwrap().is_empty());
-        assert!(parse_assignment("   ", Default::default()).unwrap().is_empty());
+        assert!(
+            parse_assignment("   ", Default::default())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// The assignment is one JSON field in Celmux's config, so it has to parse
@@ -544,7 +593,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(agents.len(), 1, "只有一个 agent");
-        assert_eq!(agents[0].lines, vec!["dji1".to_owned(), "读卡器1#8904".to_owned()]);
+        assert_eq!(
+            agents[0].lines,
+            vec!["dji1".to_owned(), "读卡器1#8904".to_owned()]
+        );
     }
 
     /// A row with no line names no agent, so it must not create a ghost.
@@ -571,5 +623,55 @@ mod tests {
     #[test]
     fn the_pairing_window_is_minutes_not_hours() {
         assert_eq!(PAIRING_TTL.as_secs(), 300);
+    }
+    fn assignment(lines: &[&str]) -> String {
+        let rows: Vec<String> = lines
+            .iter()
+            .map(|line| format!("{{\"line_id\":\"{line}\"}}"))
+            .collect();
+        format!("[{}]", rows.join(","))
+    }
+
+    fn identity(expose_all: bool) -> (String, String, bool) {
+        ("Celmux".to_owned(), "celmux".to_owned(), expose_all)
+    }
+
+    /// The switch survives parsing, and the curated list survives with it.
+    ///
+    /// Both have to be readable afterwards: with the switch on the list is not
+    /// consulted, and an operator who turns the switch back off expects the lines
+    /// they assigned to still be there.
+    #[test]
+    fn the_expose_all_switch_is_parsed_alongside_the_assignment() {
+        let raw = assignment(&["读卡器1", "dji1"]);
+
+        let off = parse_assignment(&raw, identity(false)).expect("parse");
+        assert_eq!(off.len(), 1);
+        assert!(!off[0].expose_all_lines);
+        assert_eq!(off[0].lines, vec!["读卡器1".to_owned(), "dji1".to_owned()]);
+
+        let on = parse_assignment(&raw, identity(true)).expect("parse");
+        assert_eq!(on.len(), 1);
+        assert!(on[0].expose_all_lines);
+        assert_eq!(
+            on[0].lines,
+            vec!["读卡器1".to_owned(), "dji1".to_owned()],
+            "打开开关不清空手动分配的线路"
+        );
+    }
+
+    /// With no assignment at all, the switch alone still yields a gateway.
+    ///
+    /// Otherwise the switch would be unusable on a fresh installation: there is
+    /// nothing to curate yet, and every line is supposed to appear.
+    #[test]
+    fn the_switch_alone_yields_a_gateway_with_no_assignment() {
+        let on = parse_assignment("", identity(true)).expect("parse");
+        assert_eq!(on.len(), 1, "开关打开时没有线路也要有 agent");
+        assert!(on[0].expose_all_lines);
+        assert!(on[0].lines.is_empty());
+
+        let off = parse_assignment("", identity(false)).expect("parse");
+        assert!(off.is_empty(), "开关关闭且没有线路时没有 agent");
     }
 }

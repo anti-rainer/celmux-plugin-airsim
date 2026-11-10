@@ -125,19 +125,21 @@ impl Pusher {
     /// Validation happens here rather than at first push because the operator
     /// needs to know at startup: a key that cannot be parsed would otherwise only
     /// surface as a call that never rings.
-    pub fn new(
-        key_pem: &str,
-        key_id: &str,
-        team_id: &str,
-        bundle_id: &str,
-        sandbox: bool,
-    ) -> Self {
+    pub fn new(key_pem: &str, key_id: &str, team_id: &str, bundle_id: &str, sandbox: bool) -> Self {
         let (status, canonical_key) = if key_pem.trim().is_empty() {
             (Status::NoKey, String::new())
         } else if key_id.trim().is_empty() || team_id.trim().is_empty() {
             let missing = [
-                if key_id.trim().is_empty() { "Key ID" } else { "" },
-                if team_id.trim().is_empty() { "Team ID" } else { "" },
+                if key_id.trim().is_empty() {
+                    "Key ID"
+                } else {
+                    ""
+                },
+                if team_id.trim().is_empty() {
+                    "Team ID"
+                } else {
+                    ""
+                },
             ]
             .into_iter()
             .filter(|part| !part.is_empty())
@@ -189,7 +191,13 @@ impl Pusher {
     /// The payload is the whole notification: APNs adds the `aps` envelope itself
     /// for a PushKit push, so the fields here are exactly what the app reads out
     /// of `payload.dictionaryPayload`.
-    pub fn push_voip(&self, device_token: &str, payload: &Value, collapse_id: &str, expires_at: u64) -> Outcome {
+    pub fn push_voip(
+        &self,
+        device_token: &str,
+        payload: &Value,
+        collapse_id: &str,
+        expires_at: u64,
+    ) -> Outcome {
         if !self.status.ready() {
             return Outcome {
                 status: None,
@@ -430,7 +438,13 @@ mod tests {
     /// than at the first call, and both missing pieces are named.
     #[test]
     fn a_key_without_identifiers_names_what_is_missing() {
-        let pusher = Pusher::new("-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----", "", "", "com.example.app", false);
+        let pusher = Pusher::new(
+            "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----",
+            "",
+            "",
+            "com.example.app",
+            false,
+        );
         match pusher.status() {
             Status::Incomplete(what) => {
                 assert!(what.contains("Key ID"));
@@ -443,7 +457,13 @@ mod tests {
     /// Garbage in the key field is caught before a call needs it.
     #[test]
     fn an_unreadable_key_is_rejected_up_front() {
-        let pusher = Pusher::new("not a key at all!!", "KEYID12345", "TEAMID1234", "com.example.app", false);
+        let pusher = Pusher::new(
+            "not a key at all!!",
+            "KEYID12345",
+            "TEAMID1234",
+            "com.example.app",
+            false,
+        );
         assert!(matches!(pusher.status(), Status::UnreadableKey(_)));
     }
 
@@ -475,7 +495,10 @@ mod tests {
         let mut scalar = [7_u8; 32];
         scalar[0] = 1;
         let signing_key = p256::ecdsa::SigningKey::from_slice(&scalar).unwrap();
-        let pem = signing_key.to_pkcs8_pem(p256::pkcs8::LineEnding::LF).unwrap().to_string();
+        let pem = signing_key
+            .to_pkcs8_pem(p256::pkcs8::LineEnding::LF)
+            .unwrap()
+            .to_string();
         let token = sign_jwt("TEAMID1234", "KEYID56789", &pem).expect("应能签发");
 
         let parts: Vec<&str> = token.split('.').collect();

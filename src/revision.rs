@@ -130,7 +130,10 @@ mod tests {
         let revision = Revision::default();
         let stale = revision.now().saturating_sub(1000);
         let started = Instant::now();
-        assert_eq!(revision.wait_past(stale, Duration::from_secs(5)), revision.now());
+        assert_eq!(
+            revision.wait_past(stale, Duration::from_secs(5)),
+            revision.now()
+        );
         assert!(started.elapsed() < Duration::from_millis(200));
     }
 
@@ -195,5 +198,4 @@ mod tests {
             started.elapsed()
         );
     }
-
 }

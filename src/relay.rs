@@ -163,9 +163,14 @@ fn validate_registration(body: &Value) -> Result<(), String> {
     if device_secret.len() < 16 || device_secret.len() > 512 {
         return Err("device_secret 长度无效".to_owned());
     }
-    let has_token = ["voip_token", "alert_token", "watch_voip_token", "live_activity_push_to_start_token"]
-        .iter()
-        .any(|key| !text(key).is_empty());
+    let has_token = [
+        "voip_token",
+        "alert_token",
+        "watch_voip_token",
+        "live_activity_push_to_start_token",
+    ]
+    .iter()
+    .any(|key| !text(key).is_empty());
     if !has_token {
         return Err("至少需要一个 APNs token".to_owned());
     }
@@ -196,55 +201,55 @@ impl State {
         let mut preferred_id = String::new();
         let mut phone_relay: Option<crate::agents::RelayCredentials> = None;
         if let Ok(file) = std::fs::read_to_string(&path) {
-          for text in file.lines() {
-            // Four fields: id, secret, VoIP token, alert token. An older file has
-            // only the first two, so the tokens are read as optional rather than
-            // making the whole registration unreadable.
-            let line = text.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            // `^ id` names the device this gateway signs as when several have.
-            if let Some(preferred) = line.strip_prefix("^ ") {
-                preferred_id = preferred.trim().to_owned();
-                continue;
-            }
-            // `= id secret relay` is the phone's own relay credential.
-            if let Some(rest) = line.strip_prefix("= ") {
-                let mut fields = rest.splitn(3, ' ');
-                let device_id = fields.next().unwrap_or("").to_owned();
-                let device_secret = fields.next().unwrap_or("").to_owned();
-                let relay_url = fields.next().unwrap_or("").to_owned();
-                if !device_id.is_empty() && !device_secret.is_empty() {
-                    phone_relay = Some(crate::agents::RelayCredentials {
-                        device_id,
-                        device_secret,
-                        relay_url,
-                    });
+            for text in file.lines() {
+                // Four fields: id, secret, VoIP token, alert token. An older file has
+                // only the first two, so the tokens are read as optional rather than
+                // making the whole registration unreadable.
+                let line = text.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
                 }
-                continue;
+                // `^ id` names the device this gateway signs as when several have.
+                if let Some(preferred) = line.strip_prefix("^ ") {
+                    preferred_id = preferred.trim().to_owned();
+                    continue;
+                }
+                // `= id secret relay` is the phone's own relay credential.
+                if let Some(rest) = line.strip_prefix("= ") {
+                    let mut fields = rest.splitn(3, ' ');
+                    let device_id = fields.next().unwrap_or("").to_owned();
+                    let device_secret = fields.next().unwrap_or("").to_owned();
+                    let relay_url = fields.next().unwrap_or("").to_owned();
+                    if !device_id.is_empty() && !device_secret.is_empty() {
+                        phone_relay = Some(crate::agents::RelayCredentials {
+                            device_id,
+                            device_secret,
+                            relay_url,
+                        });
+                    }
+                    continue;
+                }
+                let mut fields = line.split_whitespace();
+                let id = fields.next().unwrap_or("");
+                let secret = fields.next().unwrap_or("");
+                let voip_token = fields.next().unwrap_or("");
+                let alert_token = fields.next().unwrap_or("");
+                // A trailing empty field is lost to `split_whitespace`; that is fine,
+                // an absent token and an empty one mean the same thing here.
+                if !id.is_empty() && !secret.is_empty() {
+                    inner.devices.insert(
+                        id.to_owned(),
+                        Device {
+                            device_id: id.to_owned(),
+                            device_secret: secret.to_owned(),
+                            voip_token: voip_token.to_owned(),
+                            alert_token: alert_token.to_owned(),
+                            registered_at: Some(std::time::SystemTime::now()),
+                            ..Device::default()
+                        },
+                    );
+                }
             }
-            let mut fields = line.split_whitespace();
-            let id = fields.next().unwrap_or("");
-            let secret = fields.next().unwrap_or("");
-            let voip_token = fields.next().unwrap_or("");
-            let alert_token = fields.next().unwrap_or("");
-            // A trailing empty field is lost to `split_whitespace`; that is fine,
-            // an absent token and an empty one mean the same thing here.
-            if !id.is_empty() && !secret.is_empty() {
-                inner.devices.insert(
-                    id.to_owned(),
-                    Device {
-                        device_id: id.to_owned(),
-                        device_secret: secret.to_owned(),
-                        voip_token: voip_token.to_owned(),
-                        alert_token: alert_token.to_owned(),
-                        registered_at: Some(std::time::SystemTime::now()),
-                        ..Device::default()
-                    },
-                );
-            }
-          }
         }
         Self {
             inner: Mutex::new(inner),
@@ -283,10 +288,7 @@ impl State {
             for device in inner.devices.values() {
                 lines.push(format!(
                     "{} {} {} {}",
-                    device.device_id,
-                    device.device_secret,
-                    device.voip_token,
-                    device.alert_token
+                    device.device_id, device.device_secret, device.voip_token, device.alert_token
                 ));
             }
         }
@@ -393,8 +395,7 @@ impl State {
         (device, first)
     }
 
-
-/// Remember the push tokens the phone reported.
+    /// Remember the push tokens the phone reported.
     ///
     /// Returns whether anything was stored. The tokens persist across a restart
     /// through the same one-line file as the device credential, because a phone
@@ -448,7 +449,8 @@ impl State {
     /// its own relay it can sign as that phone without being told anything. That
     /// is what makes the agent half work with no extra configuration.
     pub fn credentials(&self) -> Option<(String, String)> {
-        self.owner().map(|device| (device.device_id, device.device_secret))
+        self.owner()
+            .map(|device| (device.device_id, device.device_secret))
     }
 
     /// The device this gateway acts for.
@@ -568,7 +570,8 @@ impl State {
 
     /// Whether the agent is inside the window the phone counts as online.
     pub fn online(&self) -> bool {
-        self.silence().is_some_and(|age| age < ONLINE_WINDOW.as_secs())
+        self.silence()
+            .is_some_and(|age| age < ONLINE_WINDOW.as_secs())
     }
 
     /// Record a command the phone enqueued, returning the stored copy.
@@ -590,7 +593,9 @@ impl State {
             inner.commands.retain(|_, existing| {
                 elapsed_seconds(existing.enqueued_at) < COMMAND_RETENTION.as_secs()
             });
-            inner.commands.insert(command.command_id.clone(), command.clone());
+            inner
+                .commands
+                .insert(command.command_id.clone(), command.clone());
         }
         command
     }
@@ -859,7 +864,10 @@ mod tests {
             "alert_token": "alert-a",
         });
         let (accepted, first) = state.register(&celmux);
-        assert!(first && accepted.device_id == "celmux-phone", "第一台设备应当直接注册成功");
+        assert!(
+            first && accepted.device_id == "celmux-phone",
+            "第一台设备应当直接注册成功"
+        );
 
         // A second phone: its own id and its own credential.
         let android = serde_json::json!({
@@ -884,7 +892,11 @@ mod tests {
             .into_iter()
             .find(|device| device["device_id"] == json!("android-agent"))
             .map(|device| device["has_push"].clone());
-        assert_eq!(android_token, Some(json!(true)), "第二台设备的推送凭据应当独立保存");
+        assert_eq!(
+            android_token,
+            Some(json!(true)),
+            "第二台设备的推送凭据应当独立保存"
+        );
 
         // A known id with the wrong secret is refused: a reinstall returns with
         // the same secret, an impostor does not.
@@ -924,7 +936,10 @@ mod tests {
             "重启后仍应能推出自己那台手机"
         );
         assert!(
-            reloaded.authenticates("celmux-phone", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+            reloaded.authenticates(
+                "celmux-phone",
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            ),
             "重启后凭据仍应能通过校验"
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -964,5 +979,4 @@ mod tests {
             "注册不得改写已配对身份"
         );
     }
-
 }

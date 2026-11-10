@@ -102,11 +102,15 @@ impl Line {
         } else {
             self.operator_name.as_str()
         };
-        [self.device_name.as_str(), operator, self.local_phone.as_str()]
-            .into_iter()
-            .filter(|part| !part.trim().is_empty())
-            .collect::<Vec<&str>>()
-            .join(" · ")
+        [
+            self.device_name.as_str(),
+            operator,
+            self.local_phone.as_str(),
+        ]
+        .into_iter()
+        .filter(|part| !part.trim().is_empty())
+        .collect::<Vec<&str>>()
+        .join(" · ")
     }
 }
 
@@ -288,6 +292,20 @@ impl Client {
         self.request("GET", "/calls", None)
     }
 
+    /// Stop or restore Celmux answering a line's calls by itself.
+    ///
+    /// Not a write to the line's own auto-answer switch: this is the runtime
+    /// suppression that lets the phone be the one that presents an incoming call.
+    /// The operator's setting is left exactly as they left it, which is what makes
+    /// this safe to turn on and off from here.
+    pub fn set_auto_answer(&self, line_id: &str, enabled: bool) -> Result<Value, Error> {
+        self.request(
+            "POST",
+            "/auto-answer",
+            Some(serde_json::json!({"line_id": line_id, "enabled": enabled})),
+        )
+    }
+
     /// Subscribe to the events Celmux pushes.
     ///    /// One connection, held open, one JSON object per line. Celmux owns this
     /// direction: an incoming call or a received message happens while the phone
@@ -389,7 +407,7 @@ impl Client {
                             || reason.contains("temporarily unavailable")
                             || reason.contains("os error 11") =>
                     {
-                        continue
+                        continue;
                     }
                     Err(error) => return Err(error),
                 }
@@ -439,7 +457,6 @@ impl Client {
         let encoded = percent_encode(line_id);
         self.request("GET", &format!("/sms?line={encoded}"), None)
     }
-
 
     /// Send one message on one line.
     pub fn send_sms(&self, line_id: &str, to: &str, text: &str) -> Result<Value, Error> {
@@ -516,10 +533,7 @@ fn split_url(url: &str) -> Result<ParsedUrl, Error> {
 /// Returns `false` at the terminating zero-length chunk. The sizes are hex, and a
 /// chunk's trailing CRLF is part of the framing rather than the payload, so it is
 /// consumed here and never reaches the JSON parser.
-fn read_chunk(
-    reader: &mut impl std::io::BufRead,
-    out: &mut Vec<u8>,
-) -> Result<bool, Error> {
+fn read_chunk(reader: &mut impl std::io::BufRead, out: &mut Vec<u8>) -> Result<bool, Error> {
     let mut size_line = String::new();
     if reader
         .read_line(&mut size_line)

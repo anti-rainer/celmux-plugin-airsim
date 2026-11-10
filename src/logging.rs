@@ -173,7 +173,9 @@ fn roll(sink: &mut Sink) {
     let mut target = sink.path.with_file_name(format!("{ROLLED_PREFIX}{stamp}"));
     let mut suffix = 1;
     while target.exists() {
-        target = sink.path.with_file_name(format!("{ROLLED_PREFIX}{stamp}.{suffix}"));
+        target = sink
+            .path
+            .with_file_name(format!("{ROLLED_PREFIX}{stamp}.{suffix}"));
         suffix += 1;
         if suffix > 99 {
             break;

@@ -35,7 +35,10 @@ pub fn main(args: Vec<String>) -> i32 {
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--port" => {
-                port = iter.next().and_then(|value| value.parse().ok()).unwrap_or(port);
+                port = iter
+                    .next()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(port);
             }
             "--host" => host = iter.next().unwrap_or(host),
             "--code" => code = iter.next().unwrap_or_default(),
@@ -149,7 +152,10 @@ fn run(base: &str, code: &str) -> Result<(), String> {
     let (status, body, nonce) = signed_get(base, &vowlan_secret_bytes, "/v1/health")?;
     println!("/v1/health -> {status}");
     let health: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
-    match health.get("identity_proof").and_then(|value| value.as_str()) {
+    match health
+        .get("identity_proof")
+        .and_then(|value| value.as_str())
+    {
         // The proof must be a MAC this same key can reproduce, over the nonce of
         // this request: a proof of the wrong shape passes JSON decoding and then
         // fails the app's check, which is the failure mode this guards.
@@ -166,7 +172,12 @@ fn run(base: &str, code: &str) -> Result<(), String> {
         }
         None => failures.push("/v1/health 缺少 identity_proof".to_owned()),
     }
-    for field in ["agent_id", "agent_kind", "device_name", "canonical_call_ids"] {
+    for field in [
+        "agent_id",
+        "agent_kind",
+        "device_name",
+        "canonical_call_ids",
+    ] {
         if health.get(field).is_none() {
             failures.push(format!("/v1/health 缺少 {field}"));
         }
@@ -223,10 +234,7 @@ fn signed_get(base: &str, secret: &[u8], path: &str) -> Result<(u16, String, Str
     let mut nonce_bytes = [0_u8; 16];
     getrandom::fill(&mut nonce_bytes).map_err(|error| format!("随机数不可用: {error}"))?;
     let nonce = base64_url_encode(&nonce_bytes);
-    let canonical = format!(
-        "GET\n{path}\n{}\n{timestamp}\n{nonce}",
-        sha256_hex(b"")
-    );
+    let canonical = format!("GET\n{path}\n{}\n{timestamp}\n{nonce}", sha256_hex(b""));
     let signature = hmac_base64_url(secret, &canonical);
     let mut request = format!(
         "GET {path} HTTP/1.1\r\nHost: {base}\r\nX-AirSIM-VoWLAN-Version: 1\r\nX-AirSIM-VoWLAN-Timestamp: {timestamp}\r\nX-AirSIM-VoWLAN-Nonce: {nonce}\r\nX-AirSIM-VoWLAN-Signature: {signature}\r\nConnection: close\r\n\r\n"
@@ -241,8 +249,7 @@ fn get(url: &str) -> Result<String, String> {
         .and_then(|rest| rest.split('/').next())
         .ok_or("bad url")?;
     let path = &url[url.find(base).unwrap() + base.len()..];
-    let mut request =
-        format!("GET {path} HTTP/1.1\r\nHost: {base}\r\nConnection: close\r\n\r\n");
+    let mut request = format!("GET {path} HTTP/1.1\r\nHost: {base}\r\nConnection: close\r\n\r\n");
     exchange(base, &mut request).map(|(_, body)| body)
 }
 

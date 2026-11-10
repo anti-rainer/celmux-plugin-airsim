@@ -22,7 +22,11 @@ use crate::http::{Request, Response};
 use crate::pairing::{self, Claim};
 
 /// Handle a pairing request. `None` means the path is not a pairing route.
-pub fn handle(agent: &Arc<Agent>, ports: &crate::control::Ports, request: &Request) -> Option<Response> {
+pub fn handle(
+    agent: &Arc<Agent>,
+    ports: &crate::control::Ports,
+    request: &Request,
+) -> Option<Response> {
     match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/pair/v1/info") => Some(info(agent)),
         ("POST", "/pair/v1/claim") => Some(claim(agent, ports, request)),
@@ -204,7 +208,11 @@ fn claim(agent: &Arc<Agent>, ports: &crate::control::Ports, request: &Request) -
         agent.persist_relay_credentials();
         crate::log_info!(
             "celmux-plugin-airsim: 已保存手机的 relay 凭据 device={} relay={}",
-            if registration.device_id.is_empty() { "?" } else { &registration.device_id },
+            if registration.device_id.is_empty() {
+                "?"
+            } else {
+                &registration.device_id
+            },
             registration.relay_url.as_deref().unwrap_or("本机")
         );
     }
@@ -331,14 +339,24 @@ mod tests {
             crate::config::base64_url_encode(&[1_u8; 32]),
             crate::config::base64_url_encode(&[2_u8; 40])
         );
-        let response = handle(&agent(), &TEST_PORTS, &request("POST", "/pair/v1/claim", &body)).unwrap();
+        let response = handle(
+            &agent(),
+            &TEST_PORTS,
+            &request("POST", "/pair/v1/claim", &body),
+        )
+        .unwrap();
         assert_eq!(response.status, 404);
     }
 
     /// A malformed claim is a bad request, not a crash.
     #[test]
     fn a_malformed_claim_is_rejected() {
-        let response = handle(&agent(), &TEST_PORTS, &request("POST", "/pair/v1/claim", "{}")).unwrap();
+        let response = handle(
+            &agent(),
+            &TEST_PORTS,
+            &request("POST", "/pair/v1/claim", "{}"),
+        )
+        .unwrap();
         assert_eq!(response.status, 400);
     }
 
@@ -355,7 +373,12 @@ mod tests {
             crate::config::base64_url_encode(&[1_u8; 32]),
             crate::config::base64_url_encode(&[2_u8; 40])
         );
-        let response = handle(&agent, &TEST_PORTS, &request("POST", "/pair/v1/claim", &body)).unwrap();
+        let response = handle(
+            &agent,
+            &TEST_PORTS,
+            &request("POST", "/pair/v1/claim", &body),
+        )
+        .unwrap();
         assert_eq!(response.status, 403);
         assert!(!agent.paired());
     }
@@ -373,7 +396,12 @@ mod tests {
             crate::config::base64_url_encode(&[1_u8; 32]),
             crate::config::base64_url_encode(&[2_u8; 40])
         );
-        let response = handle(&agent, &TEST_PORTS, &request("POST", "/pair/v1/claim", &body)).unwrap();
+        let response = handle(
+            &agent,
+            &TEST_PORTS,
+            &request("POST", "/pair/v1/claim", &body),
+        )
+        .unwrap();
         assert_eq!(response.status, 403);
     }
 

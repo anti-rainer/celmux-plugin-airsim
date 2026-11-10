@@ -56,8 +56,8 @@ async fn post_async(
     body: &[u8],
 ) -> Result<Response, String> {
     let tls = Arc::new(tls_config()?);
-    let server_name = ServerName::try_from(host.to_owned())
-        .map_err(|error| format!("主机名无效: {error}"))?;
+    let server_name =
+        ServerName::try_from(host.to_owned()).map_err(|error| format!("主机名无效: {error}"))?;
     let tcp = tokio::net::TcpStream::connect((host, 443))
         .await
         .map_err(|error| format!("无法连接 {host}: {error}"))?;
@@ -99,7 +99,9 @@ async fn post_async(
     send.send_data(bytes::Bytes::copy_from_slice(body), true)
         .map_err(|error| format!("无法发送正文: {error}"))?;
 
-    let response = response.await.map_err(|error| format!("未收到响应: {error}"))?;
+    let response = response
+        .await
+        .map_err(|error| format!("未收到响应: {error}"))?;
     let status = response.status().as_u16();
     let apns_id = response
         .headers()
@@ -142,10 +144,7 @@ pub fn post_json(url: &str, body: &Value) -> Result<crate::relay_agent::Reply, S
     } else {
         serde_json::from_str(&text).unwrap_or(Value::String(text))
     };
-    Ok(crate::relay_agent::Reply {
-        status: 200,
-        body,
-    })
+    Ok(crate::relay_agent::Reply { status: 200, body })
 }
 
 /// An HTTPS POST over HTTP/1.1, for an external relay.
@@ -170,8 +169,8 @@ fn post_https_1(url: &str, payload: &[u8]) -> Result<String, String> {
         .map_err(|error| format!("无法创建运行时: {error}"))?;
     runtime.block_on(async move {
         let tls = Arc::new(tls_config()?);
-        let server_name = ServerName::try_from(host.clone())
-            .map_err(|error| format!("主机名无效: {error}"))?;
+        let server_name =
+            ServerName::try_from(host.clone()).map_err(|error| format!("主机名无效: {error}"))?;
         let tcp = tokio::net::TcpStream::connect((host.as_str(), port))
             .await
             .map_err(|error| format!("无法连接 relay: {error}"))?;

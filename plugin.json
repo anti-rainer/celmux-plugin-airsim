@@ -1,7 +1,7 @@
 {
   "id": "airsim",
   "name": "AirSIM 桥接",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "repository": "anti-rainer/celmux-plugin-airsim",
   "description": "让 AirSIM iOS 客户端拨打本机的 VoWiFi/VoLTE 线路",
   "settings": [
@@ -123,6 +123,13 @@
       "kind": "boolean",
       "default": "true",
       "hint": "关闭后需要在手机里手动填写地址。"
+    },
+    {
+      "key": "expose_all_lines",
+      "label": "动态暴露所有线路",
+      "kind": "boolean",
+      "default": "false",
+      "hint": "打开后实时暴露 Celmux 当前所有可用线路，新插入的读卡器、N 待切换出的 Profile 会自动出现；关闭则只用上方手动分配的线路。"
     },
     {
       "key": "agents",

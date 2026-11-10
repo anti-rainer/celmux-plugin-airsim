@@ -300,7 +300,14 @@ mod tests {
             "读卡器2#89441000400501246765",
             "21",
         );
-        for key in ["id", "index", "direction", "state", "started_at", "updated_at"] {
+        for key in [
+            "id",
+            "index",
+            "direction",
+            "state",
+            "started_at",
+            "updated_at",
+        ] {
             assert!(!record[key].is_null(), "{key} must be present");
         }
         assert_eq!(record["state"], "active");
@@ -420,7 +427,10 @@ mod tests {
         let status = agent_event_status(7, call_status(None, Vec::new(), 0), 3, Vec::new());
         assert_eq!(status["revision"], 7);
         assert_eq!(status["sms_pending"], 3);
-        assert_eq!(status["call"]["polling"], false, "嵌套的通话状态同样是事件驱动");
+        assert_eq!(
+            status["call"]["polling"], false,
+            "嵌套的通话状态同样是事件驱动"
+        );
         assert_eq!(status["sim_revision"], 7);
     }
     /// Celmux answers the plugin's SMS route with a bare array. Reading only the
@@ -440,7 +450,11 @@ mod tests {
         let messages = sms_messages(&row, "LoopDL");
         assert_eq!(messages.len(), 1, "裸数组应被读取");
         let wrapped = json!({"messages": row.as_array().unwrap().clone()});
-        assert_eq!(sms_messages(&wrapped, "LoopDL").len(), 1, "包装形式仍应可读");
+        assert_eq!(
+            sms_messages(&wrapped, "LoopDL").len(),
+            1,
+            "包装形式仍应可读"
+        );
     }
     /// A bubble says which card carried a message, and the number is part of
     /// that: several cards share a device, and the device alone would not tell

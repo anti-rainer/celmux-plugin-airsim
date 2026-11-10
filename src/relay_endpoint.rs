@@ -24,7 +24,7 @@ use serde_json::{Value, json};
 
 use crate::agents::Fleet;
 use crate::http::{Request, Response};
-use crate::relay::{AgentReport, State, SERVICE, VERSION};
+use crate::relay::{AgentReport, SERVICE, State, VERSION};
 
 /// What the relay needs to answer truthfully about the agent it fronts.
 pub struct Context {
@@ -73,7 +73,11 @@ impl Context {
 
 /// Answer one relay route, or `None` if this path is not one of them.
 pub fn handle(context: &Context, fleet: &Arc<Fleet>, request: &Request) -> Option<Response> {
-    let path = request.path.split('?').next().unwrap_or(request.path.as_str());
+    let path = request
+        .path
+        .split('?')
+        .next()
+        .unwrap_or(request.path.as_str());
     let path = path.trim_start_matches('/');
     let route = [
         "healthz",
@@ -93,9 +97,7 @@ pub fn handle(context: &Context, fleet: &Arc<Fleet>, request: &Request) -> Optio
     .into_iter()
     // A route ending in `/` is a prefix: the call-action paths carry the call's
     // UUID, so they cannot be enumerated as literals.
-    .find(|route| {
-        path == *route || (route.ends_with('/') && path.starts_with(route))
-    })?;
+    .find(|route| path == *route || (route.ends_with('/') && path.starts_with(route)))?;
     match (request.method.as_str(), route) {
         ("GET", "healthz") => Some(health()),
         ("POST", "v1/devices/register") => Some(register(context, request)),
@@ -170,7 +172,11 @@ fn register(context: &Context, request: &Request) -> Response {
         device.device_id,
         device.bundle_id,
         device.environment,
-        if device.voip_token.is_empty() { "无" } else { "有" },
+        if device.voip_token.is_empty() {
+            "无"
+        } else {
+            "有"
+        },
         device.relay_url,
         device.registered_at
     );
@@ -251,12 +257,7 @@ fn receive_call(context: &Context, request: &Request) -> Response {
     let token = match context.state.voip_token() {
         Some(token) if !token.is_empty() => token,
         _ => {
-            return Response::error(
-                409,
-                "Conflict",
-                "no_token",
-                "手机尚未注册推送 token",
-            );
+            return Response::error(409, "Conflict", "no_token", "手机尚未注册推送 token");
         }
     };
     let mut payload = json!({
@@ -285,12 +286,7 @@ fn receive_call(context: &Context, request: &Request) -> Response {
             call.call_id,
             outcome.describe()
         );
-        return Response::error(
-            502,
-            "Bad Gateway",
-            "push_failed",
-            &outcome.describe(),
-        );
+        return Response::error(502, "Bad Gateway", "push_failed", &outcome.describe());
     }
     Response::ok(json!({"accepted": true, "call_id": call.call_id}))
 }
@@ -343,7 +339,9 @@ fn dispatch_pulled(context: &Arc<Context>, command: &Value) {
         }
         Err(error) => {
             crate::log_warn!("celmux-plugin-airsim: 云端命令执行失败 {kind} {command_id}: {error}");
-            let _ = context.agent.complete(&command_id, false, &error.to_string());
+            let _ = context
+                .agent
+                .complete(&command_id, false, &error.to_string());
         }
     }
 }
@@ -366,13 +364,12 @@ fn signing_credentials(context: &Arc<Context>) -> Option<crate::relay_agent::Cre
             device_secret: relay.device_secret,
         });
     }
-    context
-        .state
-        .credentials()
-        .map(|(device_id, device_secret)| crate::relay_agent::Credentials {
+    context.state.credentials().map(
+        |(device_id, device_secret)| crate::relay_agent::Credentials {
             device_id,
             device_secret,
-        })
+        },
+    )
 }
 
 /// Deliver a received message to the phone, from this process's own relay.
@@ -401,7 +398,9 @@ pub fn deliver_sms_locally(context: &Arc<Context>, event: &crate::relay_agent::S
     });
     // An alert push is addressed to the bare bundle id, not `<bundle>.voip`: it is
     // an ordinary notification, and the wrong topic is answered `TopicDisallowed`.
-    let outcome = context.pusher.push_alert(&token, &payload, &event.delivery_id);
+    let outcome = context
+        .pusher
+        .push_alert(&token, &payload, &event.delivery_id);
     crate::log_info!(
         "celmux-plugin-airsim: 短信推送 delivery_id={} {}",
         event.delivery_id,
@@ -483,7 +482,7 @@ fn call_control(context: &Context, fleet: &Arc<Fleet>, path: &str, request: &Req
     let verb = match action {
         "answer" => "answer",
         // A rejected incoming call and an ended one are the same act on the line.
-        "reject" | "end" => "hangup", 
+        "reject" | "end" => "hangup",
         other => {
             return Response::error(
                 400,
@@ -560,10 +559,7 @@ fn pull_commands() -> Response {
 fn complete_command(request: &Request) -> Response {
     match body_of(request) {
         Ok(body) => {
-            let command_id = body
-                .get("command_id")
-                .and_then(Value::as_str)
-                .unwrap_or("");
+            let command_id = body.get("command_id").and_then(Value::as_str).unwrap_or("");
             Response::ok(json!({"ok": true, "command_id": command_id}))
         }
         Err(response) => response,
@@ -590,7 +586,10 @@ fn push_mode(context: &Context, request: &Request) -> Response {
         Err(response) => return response,
     };
     let enabled = body.get("enabled").and_then(Value::as_bool).unwrap_or(true);
-    crate::log_info!("celmux-plugin-airsim: Relay 云端模式 {}", if enabled { "开启" } else { "关闭" });
+    crate::log_info!(
+        "celmux-plugin-airsim: Relay 云端模式 {}",
+        if enabled { "开启" } else { "关闭" }
+    );
     if enabled {
         // A heartbeat right away, so the directory the phone is about to read
         // already has this agent online instead of waiting a full interval.
@@ -725,33 +724,35 @@ pub fn spawn_heartbeat(context: Arc<Context>) {
     // decide whether this gateway is alive.
     if !context.agent.target().is_own() {
         let polling = Arc::clone(&context);
-        std::thread::spawn(move || loop {
-            std::thread::sleep(std::time::Duration::from_secs(5));
-            if let Some(credentials) = signing_credentials(&polling) {
-                polling.agent.adopt(credentials);
-            }
-            if !polling.agent.ready() {
-                continue;
-            }
-            match polling.agent.pull() {
-                Ok(reply) if reply.accepted() => {
-                    let commands = reply
-                        .body
-                        .get("commands")
-                        .and_then(Value::as_array)
-                        .cloned()
-                        .unwrap_or_default();
-                    for command in commands {
-                        dispatch_pulled(&polling, &command);
-                    }
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                if let Some(credentials) = signing_credentials(&polling) {
+                    polling.agent.adopt(credentials);
                 }
-                Ok(reply) => crate::log_warn!(
-                    "celmux-plugin-airsim: relay 拒绝命令拉取: HTTP {}",
-                    reply.status
-                ),
-                // A relay that is temporarily unreachable is not an error worth
-                // a line every five seconds.
-                Err(_) => {}
+                if !polling.agent.ready() {
+                    continue;
+                }
+                match polling.agent.pull() {
+                    Ok(reply) if reply.accepted() => {
+                        let commands = reply
+                            .body
+                            .get("commands")
+                            .and_then(Value::as_array)
+                            .cloned()
+                            .unwrap_or_default();
+                        for command in commands {
+                            dispatch_pulled(&polling, &command);
+                        }
+                    }
+                    Ok(reply) => crate::log_warn!(
+                        "celmux-plugin-airsim: relay 拒绝命令拉取: HTTP {}",
+                        reply.status
+                    ),
+                    // A relay that is temporarily unreachable is not an error worth
+                    // a line every five seconds.
+                    Err(_) => {}
+                }
             }
         });
     }
@@ -912,12 +913,7 @@ fn enqueue(context: &Context, fleet: &Arc<Fleet>, request: &Request) -> Response
     }
     let command = context.state.enqueue(&body);
     if command.command_id.is_empty() {
-        return Response::error(
-            400,
-            "Bad Request",
-            "bad_command",
-            "command_id 不能为空",
-        );
+        return Response::error(400, "Bad Request", "bad_command", "command_id 不能为空");
     }
     let agent = report(context, fleet);
     crate::log_info!(
@@ -1037,11 +1033,8 @@ impl Dispatch {
         // it is the difference between "the phone asked the wrong device" and a
         // command silently executing here.
         if !self.target_matches() {
-            self.state.complete(
-                &self.command.command_id,
-                "failed",
-                "命令目标不是本 Agent",
-            );
+            self.state
+                .complete(&self.command.command_id, "failed", "命令目标不是本 Agent");
             return;
         }
         // The phone names the slot it wants when it has several, which is how one
@@ -1052,15 +1045,11 @@ impl Dispatch {
             self.command.sim_account.replace("%23", "#")
         };
         let outcome = match self.command.kind.as_str() {
-            "dial" => self
+            "dial" => self.client.dial(&line, &self.command.number).map(|_| ()),
+            "send_sms" => self
                 .client
-                .dial(&line, &self.command.number)
+                .send_sms(&line, &self.command.number, &self.command.message)
                 .map(|_| ()),
-            "send_sms" => self.client.send_sms(
-                &line,
-                &self.command.number,
-                &self.command.message,
-            ).map(|_| ()),
             // Call actions name the call the phone is already on, which this side
             // resolves from the live registry rather than from the command.
             action @ ("answer" | "hangup" | "reject" | "dtmf") => {
@@ -1073,18 +1062,22 @@ impl Dispatch {
                 self.client.call_action(action, &call_id).map(|_| ())
             }
             other => {
-                self.state
-                    .complete(&self.command.command_id, "failed", &format!("不支持的命令: {other}"));
+                self.state.complete(
+                    &self.command.command_id,
+                    "failed",
+                    &format!("不支持的命令: {other}"),
+                );
                 return;
             }
         };
         match outcome {
-            Ok(()) => self.state.complete(&self.command.command_id, "completed", ""),
-            Err(error) => self.state.complete(
-                &self.command.command_id,
-                "failed",
-                &error.to_string(),
-            ),
+            Ok(()) => self
+                .state
+                .complete(&self.command.command_id, "completed", ""),
+            Err(error) => {
+                self.state
+                    .complete(&self.command.command_id, "failed", &error.to_string())
+            }
         }
     }
 }
@@ -1125,13 +1118,11 @@ fn report(context: &Context, fleet: &Arc<Fleet>) -> AgentReport {
         .lines()
         .ok()
         .and_then(|lines| {
-            lines
-                .into_iter()
-                .find(|line| {
-                    agent
-                        .as_ref()
-                        .is_some_and(|a| a.config.primary_line() == line.line_id)
-                })
+            lines.into_iter().find(|line| {
+                agent
+                    .as_ref()
+                    .is_some_and(|a| a.config.primary_line() == line.line_id)
+            })
         })
         .map(|line| line.local_phone)
         .unwrap_or_default();
@@ -1188,12 +1179,17 @@ mod tests {
         fleet
             .reconcile(vec![crate::agents::AgentConfig {
                 lines: vec!["line-1".to_owned()],
+                expose_all_lines: false,
                 name: "Celmux".to_owned(),
-                id: "celmux".to_owned()
+                id: "celmux".to_owned(),
             }])
             .expect("fleet");
         for agent in fleet.list() {
-            agent.set_relay_credentials(device_id.to_owned(), "paired-secret".to_owned(), String::new());
+            agent.set_relay_credentials(
+                device_id.to_owned(),
+                "paired-secret".to_owned(),
+                String::new(),
+            );
         }
         fleet
     }
@@ -1292,8 +1288,12 @@ mod tests {
         let credentials = json!({"device_id": "d1", "device_secret": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "voip_token": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"});
 
         let before = body_of_response(
-            &handle(&context, &fleet, &request("POST", "/v1/devices/status", credentials.clone()))
-                .unwrap(),
+            &handle(
+                &context,
+                &fleet,
+                &request("POST", "/v1/devices/status", credentials.clone()),
+            )
+            .unwrap(),
         );
         assert_eq!(before["cloud_online"], json!(false));
 
@@ -1310,7 +1310,12 @@ mod tests {
         assert_eq!(beat.status, 200);
 
         let after = body_of_response(
-            &handle(&context, &fleet, &request("POST", "/v1/devices/status", credentials)).unwrap(),
+            &handle(
+                &context,
+                &fleet,
+                &request("POST", "/v1/devices/status", credentials),
+            )
+            .unwrap(),
         );
         assert_eq!(after["cloud_online"], json!(true));
         assert_eq!(after["agents"][0]["cloud_online"], json!(true));
@@ -1329,7 +1334,11 @@ mod tests {
         let context = context();
         let fleet = Arc::new(Fleet::default());
         let register = |body: serde_json::Value| {
-            handle(&context, &fleet, &request("POST", "v1/devices/register", body))
+            handle(
+                &context,
+                &fleet,
+                &request("POST", "v1/devices/register", body),
+            )
         };
 
         let accepted = register(json!({
@@ -1367,7 +1376,12 @@ mod tests {
     fn push_status_tells_the_phone_to_keep_its_pairing_local() {
         let context = context();
         let fleet = Arc::new(Fleet::default());
-        let status = handle(&context, &fleet, &request("GET", "api/push/status", json!({}))).unwrap();
+        let status = handle(
+            &context,
+            &fleet,
+            &request("GET", "api/push/status", json!({})),
+        )
+        .unwrap();
         let body = body_of_response(&status);
         assert_eq!(body["local_mode"], json!(true));
         // No ready push channel, and no relay address for the phone to call back:
@@ -1411,8 +1425,12 @@ mod tests {
         let fleet = Arc::new(Fleet::default());
         assert!(handle(&context, &fleet, &request("GET", "/api/status", json!({}))).is_none());
         // The right path with the wrong method is an error, not a fall-through.
-        let wrong = handle(&context, &fleet, &request("GET", "/v1/devices/status", json!({})))
-            .unwrap();
+        let wrong = handle(
+            &context,
+            &fleet,
+            &request("GET", "/v1/devices/status", json!({})),
+        )
+        .unwrap();
         assert_eq!(wrong.status, 405);
     }
     /// A registered stranger may not act on the lines.
@@ -1430,8 +1448,9 @@ mod tests {
         fleet
             .reconcile(vec![crate::agents::AgentConfig {
                 lines: vec!["line-1".to_owned()],
+                expose_all_lines: false,
                 name: "Celmux".to_owned(),
-                id: "celmux".to_owned()
+                id: "celmux".to_owned(),
             }])
             .expect("fleet");
         for agent in fleet.list() {
@@ -1564,5 +1583,4 @@ mod tests {
         assert!(!is_uuid("probe-2093624"), "非 UUID 必须被拒绝");
         assert!(!is_uuid("a064765cd0d94e8d96e3636ba9137f44"));
     }
-
 }

@@ -197,9 +197,9 @@ impl Config {
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty())
             .map(|value| {
-                value.parse().map_err(|_| {
-                    ConfigError::Invalid(format!("pcm_port 不是有效端口号: {value}"))
-                })
+                value
+                    .parse()
+                    .map_err(|_| ConfigError::Invalid(format!("pcm_port 不是有效端口号: {value}")))
             })
             .transpose()?
             .unwrap_or(DEFAULT_PCM_PORT);
@@ -222,10 +222,7 @@ impl Config {
             ("relay_port", relay_port),
         ];
         for (index, (name, value)) in ports.iter().enumerate() {
-            if ports[index + 1..]
-                .iter()
-                .any(|(_, other)| other == value)
-            {
+            if ports[index + 1..].iter().any(|(_, other)| other == value) {
                 return Err(ConfigError::Invalid(format!(
                     "{name} 与另一个端口重复: {value}"
                 )));
