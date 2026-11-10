@@ -170,7 +170,7 @@ fn main() {
         default_line: fleet
             .list()
             .first()
-            .map(|agent| agent.config.primary_line().to_owned())
+            .map(|agent| agent.lines().first().cloned().unwrap_or_default())
             .unwrap_or_default(),
     });
     let host = local_address().unwrap_or_else(|| "0.0.0.0".to_owned());
@@ -202,6 +202,14 @@ fn main() {
         "celmux-plugin-airsim: 设置接口 http://{host}:{}",
         config.port
     );
+    // Keep the exposed set in step with Celmux without restarting.
+    //
+    // Editing one line's assignment or flipping the expose-all switch is a change
+    // to what this gateway offers, not to the process carrying it: restarting for
+    // it drops the pairing window, every open socket and the phone's event stream.
+    // The assignment is small and reads over loopback, so re-reading it on a timer
+    // costs less than the reconnect it replaces.
+    spawn_config_refresh(Arc::clone(&fleet), Arc::clone(&client));
     let advertisements = Arc::new(std::sync::Mutex::new(advertisements));
     let settings_ports = crate::control::Ports {
         control: config.control_port,
@@ -436,6 +444,32 @@ fn advertise_agent(
 /// a phone on the LAN cannot reach it. What the phone needs is the address of
 /// the interface the LAN segment is on, so a private address on a non-tunnel
 /// interface is preferred, and the lookup is only a last resort.
+/// Re-read the assignment from Celmux on a timer and apply it in place.
+///
+/// A timer rather than a push: Celmux has no channel to tell a plugin its
+/// configuration changed, and adding one would mean a second way for the two
+/// sides to disagree. The interval is short enough that a saved change looks
+/// immediate and long enough that an idle gateway is not busy.
+fn spawn_config_refresh(fleet: Arc<crate::agents::Fleet>, client: Arc<crate::celmux::Client>) {
+    std::thread::spawn(move || {
+        const INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+        loop {
+            std::thread::sleep(INTERVAL);
+            let configs = match crate::settings::load_assignment(&client) {
+                Ok(configs) => configs,
+                // Celmux restarting is not a reason to clear what is exposed.
+                Err(_) => continue,
+            };
+            if configs.is_empty() {
+                continue;
+            }
+            if fleet.apply_configs(configs) {
+                crate::log_info!("celmux-plugin-airsim: 已应用新的线路分配，无需重启");
+            }
+        }
+    });
+}
+
 fn local_address() -> Option<String> {
     if let Some(address) = lan_address() {
         return Some(address);

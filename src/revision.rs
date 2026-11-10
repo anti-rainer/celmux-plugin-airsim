@@ -47,7 +47,13 @@ impl Revision {
     /// Record a change. Every poll waiting on the old revision wakes.
     pub fn bump(&self) {
         if let Ok(mut current) = self.current.lock() {
-            *current = now_ms();
+            // Strictly forward, never merely "now". Two changes in the same
+            // millisecond - which happens when a line list is applied row by row -
+            // would otherwise leave the revision unchanged, and a poll already
+            // waiting on that value would sit out its whole timeout before the
+            // phone learned anything.
+            let next = now_ms();
+            *current = if next > *current { next } else { *current + 1 };
         }
     }
 

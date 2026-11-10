@@ -179,7 +179,7 @@ fn status(
                 "agent_id": agent.id(),
                 // The line as it is now, not the name stored at exposure time.
                 "name": crate::control::line_display_name(&agent),
-                "lines": agent.config.lines,
+                "lines": agent.lines(),
                 // Every line answers on the same pair; repeating the numbers
                 // per line would suggest they can differ.
                 "control_port": ports.control,
@@ -220,7 +220,7 @@ fn totals(fleet: &Arc<Fleet>, client: &Arc<Client>) -> Value {
     let assigned: Vec<String> = fleet
         .list()
         .into_iter()
-        .flat_map(|agent| agent.config.lines.clone())
+        .flat_map(|agent| agent.lines())
         .collect();
     let lines: Vec<crate::celmux::Line> = client
         .lines()
@@ -442,7 +442,7 @@ fn lines(fleet: &Arc<Fleet>, client: &Arc<Client>) -> Response {
             // page rather than repeated on every card.
             let exposed = agents
                 .iter()
-                .any(|agent| agent.config.lines.contains(&line.line_id));
+                .any(|agent| agent.exposes(&line.line_id));
             json!({
                 "line_id": line.line_id,
                 "device_id": device,

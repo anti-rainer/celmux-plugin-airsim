@@ -81,11 +81,6 @@ impl AgentConfig {
             self.id.trim().to_owned()
         }
     }
-
-    /// The first exposed line, for a caller that has no slot to name.
-    pub fn primary_line(&self) -> &str {
-        self.lines.first().map(String::as_str).unwrap_or_default()
-    }
 }
 
 /// A running agent: its configuration, its signing secret, and the pairing
@@ -94,7 +89,13 @@ pub struct Agent {
     /// Bumped when anything this line cares about changes: the phone's long
     /// poll compares against it, and the thread following Celmux bumps it.
     revision: Arc<crate::revision::Revision>,
-    pub config: AgentConfig,
+    /// What the operator exposed, replaceable at runtime.
+    ///
+    /// Behind a lock rather than immutable because a settings change must take
+    /// effect without restarting the process: restarting to read one boolean
+    /// drops every open connection, the pairing handshake and the phone's event
+    /// stream - for a value that is read on the next request anyway.
+    config: std::sync::RwLock<AgentConfig>,
     /// The secret every request from this agent's phone is signed with.
     ///
     /// `None` until the phone pairs: pairing is what creates it, because the
@@ -132,7 +133,7 @@ impl Agent {
     pub fn new(config: AgentConfig, secret: Option<Vec<u8>>) -> Self {
         Self {
             revision: Arc::new(crate::revision::Revision::default()),
-            config,
+            config: std::sync::RwLock::new(config),
             secret: Mutex::new(secret),
             store: None,
             pairing: Mutex::new(None),
@@ -226,7 +227,7 @@ impl Agent {
     }
 
     pub fn id(&self) -> String {
-        self.config.agent_id()
+        self.config().agent_id()
     }
 
     /// What the phone lists this device as.
@@ -235,10 +236,11 @@ impl Agent {
     /// picks cards inside it, so naming the device after its first line would
     /// rename it whenever the exposed set changed.
     pub fn name(&self) -> String {
-        if self.config.name.trim().is_empty() {
+        let config = self.config();
+        if config.name.trim().is_empty() {
             DEFAULT_AGENT_NAME.to_owned()
         } else {
-            self.config.name.trim().to_owned()
+            config.name.trim().to_owned()
         }
     }
 
@@ -248,8 +250,42 @@ impl Agent {
     /// rather than a fixed line. Returning both together keeps them from being
     /// paired up wrongly when two slots are busy.
     /// The lines this agent exposes, in the order they were configured.
+    /// A copy of the configuration in effect right now.
+    ///
+    /// A copy, not a guard: callers hold it across work that must not keep the
+    /// write side waiting, and a settings change landing mid-request should give
+    /// that request one consistent view rather than a half-old one.
+    pub fn config(&self) -> AgentConfig {
+        self.config
+            .read()
+            .map(|config| config.clone())
+            .unwrap_or_default()
+    }
+
+    /// Replace the configuration in place.
+    ///
+    /// Returns whether anything changed, so the reload thread can say so in the
+    /// log instead of reporting a change every time it polls.
+    pub fn replace_config(&self, next: AgentConfig) -> bool {
+        let Ok(mut current) = self.config.write() else {
+            return false;
+        };
+        let same = current.lines == next.lines
+            && current.expose_all_lines == next.expose_all_lines
+            && current.name == next.name
+            && current.id == next.id;
+        if same {
+            return false;
+        }
+        *current = next;
+        // The phone's long poll waits on this: a new line must show up without
+        // waiting out its timeout.
+        self.revision.bump();
+        true
+    }
+
     pub fn lines(&self) -> Vec<String> {
-        self.config.lines.clone()
+        self.config().lines.clone()
     }
 
     /// Whether Celmux's line is one this agent offers.
@@ -260,10 +296,11 @@ impl Agent {
     /// would have meant finding every one of them - and missing one shows up as a
     /// line that lists but cannot be dialled.
     pub fn exposes(&self, line_id: &str) -> bool {
-        if self.config.expose_all_lines {
+        let config = self.config();
+        if config.expose_all_lines {
             return true;
         }
-        self.config.lines.iter().any(|line| line == line_id)
+        config.lines.iter().any(|line| line == line_id)
     }
 
     /// The secret this agent's phone signs with, if it has paired.
@@ -422,6 +459,30 @@ impl Fleet {
     /// A line that keeps its assignment keeps its agent, and therefore its
     /// secret and its pairing state: re-saving the settings page must not
     /// unpair a phone. Only lines that appear or disappear change.
+    /// Apply the current assignment without rebuilding the agents.
+    ///
+    /// `reconcile` replaces agents, which is right at startup and wrong for a
+    /// settings change: a rebuilt agent drops its pairing window, its call
+    /// suppression and the revision the phone's long poll is waiting on. This
+    /// updates what changed and leaves the rest of the running state alone.
+    ///
+    /// Returns whether anything changed.
+    pub fn apply_configs(&self, configs: Vec<AgentConfig>) -> bool {
+        let Ok(agents) = self.agents.lock() else {
+            return false;
+        };
+        let mut changed = false;
+        for config in configs {
+            let id = config.agent_id();
+            // An agent that does not exist yet is a startup-shaped change: the
+            // caller's `reconcile` builds it rather than this inventing one.
+            if let Some(agent) = agents.get(&id) {
+                changed |= agent.replace_config(config);
+            }
+        }
+        changed
+    }
+
     pub fn reconcile(&self, configs: Vec<AgentConfig>) -> Result<(), String> {
         let mut agents = self
             .agents
@@ -562,7 +623,7 @@ mod tests {
         // The new ports are adopted, the secret is not lost.
         // The line identity survives a reconcile; the ports are no longer part
         // of a line's configuration, so there is nothing to assert about them.
-        assert_eq!(again.config.lines, vec!["dji1".to_owned()]);
+        assert_eq!(again.lines(), vec!["dji1".to_owned()]);
     }
 
     /// The whole reason secrets are written to disk: a new process - which is
@@ -604,7 +665,7 @@ mod tests {
             .unwrap();
         let agents = fleet.list();
         assert_eq!(agents.len(), 1, "仍是一个 agent");
-        assert_eq!(agents[0].config.lines.len(), 2, "两个槽位");
+        assert_eq!(agents[0].lines().len(), 2, "两个槽位");
         assert_eq!(agents[0].secret(), Some(vec![1; 32]), "密钥不受影响");
     }
 
@@ -707,5 +768,47 @@ mod tests {
         let configs =
             crate::settings::parse_assignment_for_tests("", ("C".to_owned(), String::new(), false));
         assert!(configs.is_empty(), "开关关闭且没有线路时没有 agent");
+    }
+    /// A configuration change applies without rebuilding the agent.
+    ///
+    /// This is the whole point of the lock: restarting a plugin to read one
+    /// boolean drops the pairing window, every open socket and the phone's event
+    /// stream. Rebuilding the agent would do the same thing in-process.
+    #[test]
+    fn a_new_assignment_applies_to_the_running_agent() {
+        let agent = Agent::new(
+            AgentConfig {
+                lines: vec!["读卡器1".to_owned()],
+                expose_all_lines: false,
+                name: "Celmux".to_owned(),
+                id: "celmux".to_owned(),
+            },
+            None,
+        );
+        let revision_before = agent.revision().now();
+        assert!(!agent.exposes("读卡器3"));
+
+        let changed = agent.replace_config(AgentConfig {
+            lines: vec!["读卡器1".to_owned(), "读卡器3".to_owned()],
+            expose_all_lines: true,
+            name: "Celmux".to_owned(),
+            id: "celmux".to_owned(),
+        });
+        assert!(changed, "分配变化应当报告为改变");
+        assert!(agent.exposes("读卡器3"), "新线路立即生效");
+        assert!(
+            agent.revision().now() != revision_before,
+            "revision 要推进，否则手机的长轮询要等满超时"
+        );
+
+        // The same configuration again is not a change, or the reload thread
+        // would log one every poll.
+        let again = agent.replace_config(AgentConfig {
+            lines: vec!["读卡器1".to_owned(), "读卡器3".to_owned()],
+            expose_all_lines: true,
+            name: "Celmux".to_owned(),
+            id: "celmux".to_owned(),
+        });
+        assert!(!again, "相同配置不应报告为改变");
     }
 }

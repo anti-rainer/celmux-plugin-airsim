@@ -1119,9 +1119,11 @@ fn report(context: &Context, fleet: &Arc<Fleet>) -> AgentReport {
         .ok()
         .and_then(|lines| {
             lines.into_iter().find(|line| {
-                agent
-                    .as_ref()
-                    .is_some_and(|a| a.config.primary_line() == line.line_id)
+                agent.as_ref().is_some_and(|a| {
+                    a.lines()
+                        .first()
+                        .is_some_and(|first| *first == line.line_id)
+                })
             })
         })
         .map(|line| line.local_phone)

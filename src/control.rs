@@ -1057,7 +1057,7 @@ impl Control {
         }
         // The line the message arrived on: Celmux names it, and a message belongs
         // to one line.
-        let line = self.agent.config.lines.first().cloned().unwrap_or_default();
+        let line = self.agent.lines().first().cloned().unwrap_or_default();
         std::thread::spawn(move || {
             let Ok(value) = context.client.messages(&line) else {
                 return;
@@ -1242,8 +1242,7 @@ impl Control {
             .collect();
         let mut messages: Vec<Value> = self
             .agent
-            .config
-            .lines
+            .lines()
             .iter()
             .filter_map(|line_id| {
                 let operator = operators.get(line_id).map(String::as_str).unwrap_or("");
@@ -1389,12 +1388,12 @@ impl Control {
             // A slot id carries the card after `#`, which a client may hand back
             // percent-encoded; both name the same line.
             .map(|value| value.replace("%23", "#"))
-            .unwrap_or_else(|| self.agent.config.primary_line().to_owned());
+            .unwrap_or_else(|| self.agent.lines().first().cloned().unwrap_or_default());
         if !self.agent.exposes(&line_id) {
             crate::log_warn!(
                 "celmux-plugin-airsim: 拨号被拒 sim_account={:?} 已暴露={:?}",
                 line_id,
-                self.agent.config.lines
+                self.agent.lines()
             );
             return Response::error(409, "Conflict", "unknown_slot", "该线路未暴露给 AirSIM");
         }
@@ -1484,7 +1483,7 @@ impl Control {
         let line_id = {
             let requested = field(&["sim_account", "line_id"]);
             if requested.is_empty() {
-                self.agent.config.primary_line().to_owned()
+                self.agent.lines().first().cloned().unwrap_or_default()
             } else {
                 // A slot id carries the card after `#`, and a client that built
                 // the value as part of a URL may hand it back percent-encoded.
@@ -1501,7 +1500,7 @@ impl Control {
             crate::log_warn!(
                 "celmux-plugin-airsim: 发短信被拒 sim_account={:?} 已暴露={:?}",
                 line_id,
-                self.agent.config.lines
+                self.agent.lines()
             );
             return Response::error(409, "Conflict", "unknown_slot", "该线路未暴露给 AirSIM");
         }
@@ -1613,7 +1612,8 @@ impl Control {
                 let line = call
                     .get("line_id")
                     .and_then(Value::as_str)
-                    .unwrap_or(self.agent.config.primary_line())
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| self.agent.lines().first().cloned().unwrap_or_default())
                     .to_owned();
                 (
                     "confirmed".to_owned(),
