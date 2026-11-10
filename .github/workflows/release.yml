@@ -47,6 +47,17 @@ jobs:
             sudo apt-get install -y gcc-aarch64-linux-gnu
           fi
 
+      - name: Install Zig and cargo-zigbuild
+        # rustls's C backend (`aws-lc-sys`) compiles C, and musl's linker is not
+        # something the cross-compiler above satisfies for it: cc-rs looks for
+        # `aarch64-linux-musl-gcc` and fails. Zig provides a single toolchain that
+        # links both architectures, which is what the same build does locally.
+        run: |
+          python3 -m pip install --user ziglang==0.13.0
+          cargo install --locked cargo-zigbuild
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
@@ -58,7 +69,11 @@ jobs:
         run: cargo test --release
 
       - name: Build release binary
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        # `zigbuild` rather than `build`: rustls's C backend needs a musl C
+        # compiler per target, and Zig supplies one for every architecture. This
+        # is the same command the local build uses, so a release is built the way
+        # it was verified rather than a second, untested way.
+        run: cargo zigbuild --release --locked --target ${{ matrix.target }}
 
       - name: Package
         run: |
