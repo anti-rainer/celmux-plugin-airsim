@@ -6,24 +6,115 @@
   "settings": [
     {
       "key": "port",
-      "label": "设置接口端口",
+      "label": "插件 UI 入口端口",
       "kind": "number",
       "default": "43769",
-      "hint": "Celmux 插件中心访问本插件设置页与配置接口所用的端口（仅 HTTP）。由 Celmux 内部经 relay 访问，一般无需改动。"
+      "hint": "Celmux 插件中心访问本插件设置页与配置接口所用的端口（仅 HTTP）。只在局域网内使用，不需要对公网开放。"
     },
     {
       "key": "control_port",
-      "label": "控制端口（全局）",
+      "label": "配对控制端口",
       "kind": "number",
       "default": "8642",
-      "hint": "所有线路共用的 AirSIM 控制接口端口：请求带哪条线路的配对密钥，就归哪条线路。"
+      "hint": "手机的控制接口端口，所有线路共用：请求带哪条线路的配对密钥，就归哪条线路。"
     },
     {
       "key": "pcm_port",
-      "label": "PCM 端口（全局）",
+      "label": "PCM 媒体端口",
       "kind": "number",
       "default": "8643",
-      "hint": "所有线路共用的音频端口，握手签名决定归属哪条线路。"
+      "hint": "通话音频端口，所有线路共用，握手签名决定归属哪条线路。"
+    },
+    {
+      "key": "relay_port",
+      "label": "Relay 云端端口",
+      "kind": "number",
+      "default": "43770",
+      "hint": "AirSIM 云端链路入口。把公网域名的反向代理指向这个端口，手机要求 HTTPS，证书由反向代理提供。与插件 UI 入口分开，公网只暴露这一个。"
+    },
+    {
+      "key": "relay_enabled",
+      "label": "启用云端 Relay",
+      "kind": "boolean",
+      "default": "false",
+      "hint": "开启后手机可在任意网络接听来电。这是唯一需要公网可达的监听端口，关闭时只在本局域网使用。"
+    },
+    {
+      "key": "apns_key_id",
+      "label": "APNs Key ID",
+      "kind": "secret",
+      "default": "",
+      "hint": "Apple 开发者后台生成 p8 时显示的 10 位 Key ID。"
+    },
+    {
+      "key": "apns_team_id",
+      "label": "APNs Team ID",
+      "kind": "secret",
+      "default": "",
+      "hint": "该 p8 所属开发者账号的 10 位 Team ID。"
+    },
+    {
+      "key": "apns_bundle_id",
+      "label": "APNs Bundle ID",
+      "kind": "secret",
+      "default": "com.eric3u.airsim",
+      "hint": "推送目标的 Bundle ID。APNs 会拒绝 topic 与 token 所属 App 不一致的推送。"
+    },
+    {
+      "key": "apns_sandbox",
+      "label": "APNs 使用 Sandbox",
+      "kind": "boolean",
+      "default": "false",
+      "hint": "开发签名（Xcode 直接安装）的构建拿到的是 sandbox token，需勾选；TestFlight 与正式版用生产环境。"
+    },
+    {
+      "key": "apns_p8",
+      "label": "APNs 密钥 p8",
+      "kind": "secret",
+      "default": "",
+      "hint": "Apple 开发者后台下载的 .p8 文件内容。必须与 Key ID、Team ID 同属一个开发者账号，否则苹果会拒绝推送。"
+    },
+    {
+      "key": "agent_name",
+      "label": "Agent 名称",
+      "kind": "text",
+      "default": "",
+      "hint": "手机上的显示名称。改名不影响配对。"
+    },
+    {
+      "key": "agent_id",
+      "label": "Agent ID",
+      "kind": "text",
+      "default": "",
+      "hint": "手机保存配对密钥所用的身份。改 ID 会使已配对的手机需要重新配对。留空使用 celmux。"
+    },
+    {
+      "key": "relay_target",
+      "label": "外部 Relay 地址",
+      "kind": "text",
+      "default": "",
+      "hint": "留空表示使用本插件自带的 relay（APNs 密钥配在下方）。填入他人 relay 则事件发往那里，本机不需要 APNs 密钥。"
+    },
+    {
+      "key": "relay_device_id",
+      "label": "外部 Relay 设备 ID",
+      "kind": "secret",
+      "default": "",
+      "hint": "使用外部 relay 时，手机在该 relay 注册后的 device_id。留空则使用本机已注册手机的凭据。"
+    },
+    {
+      "key": "relay_device_secret",
+      "label": "外部 Relay 设备密钥",
+      "kind": "secret",
+      "default": "",
+      "hint": "与上面的 device_id 配对使用。"
+    },
+    {
+      "key": "relay_mode",
+      "label": "Relay 模式",
+      "kind": "text",
+      "default": "own",
+      "hint": "own（自有 relay，本机监听并用本机 APNs 密钥推送）或 external（发往外接 relay，本机不监听）"
     },
     {
       "key": "advertise",

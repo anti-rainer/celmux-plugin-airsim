@@ -12,10 +12,23 @@
 use serde::Deserialize;
 use serde_json::Value;
 
+/// How long the event stream may sit silent before the socket read returns.
+///
+/// Nothing arrives for minutes at a time on a quiet line, so a return here is not
+/// a failure - it is the loop noticing the connection is still there, instead of
+/// blocking for ever on a half-read chunk.
+const SOCKET_IDLE_TIMEOUT: u64 = 60;
+
 pub struct Client {
     base: String,
     token: String,
     plugin_id: String,
+    /// Where call audio goes, from `CELMUX_PLUGIN_AUDIO_URL`.
+    ///
+    /// A socket of its own, not a route on the control port: a plugin carries one
+    /// 20 ms block every 20 ms, and a block per request would make the caller
+    /// hear the request path instead of the carrier.
+    audio: Option<String>,
 }
 
 /// One line as Celmux reports it.
@@ -62,12 +75,19 @@ impl Line {
     /// Whether this line can carry a call or a message right now.
     ///
     /// Two things disqualify a line and they are independent. A bare line on a
-    /// module that also reports Profiles cannot select a card. And any line
-    /// whose voice route Celmux reports as unavailable has nothing to dial
-    /// through - that is what the module in N-standby shows for its own bare
-    /// line, because the voice route belongs to the Profiles.
+    /// module that also reports Profiles cannot select a card - that is what the
+    /// module in N-standby shows for itself, and its `voice_route` is unavailable
+    /// because the voice route belongs to the Profiles rather than to the module.
+    /// A Profile line is therefore callable even when the module's own route reads
+    /// unavailable: judging it by that field counted every N-standby Profile as
+    /// dead.
     pub fn usable(&self) -> bool {
-        self.voice_route != "unavailable"
+        // A Profile line is callable even when the module's own route reads
+        // unavailable: under N-standby the route belongs to the Profile, and the
+        // module's bare line is what carries that field. Conditioning on
+        // `is_bare` here would double up with the filter in `devices`, which is
+        // where bare lines are dropped.
+        self.voice_route != "unavailable" || self.n_standby
     }
 
     /// What the phone shows for this line: device, operator and number.
@@ -154,12 +174,36 @@ impl std::fmt::Display for Error {
 }
 
 impl Client {
-    pub fn new(base: String, token: String, plugin_id: String) -> Self {
+    pub fn new(base: String, token: String, plugin_id: String, audio: Option<String>) -> Self {
         Self {
             base,
             token,
             plugin_id,
+            audio,
         }
+    }
+
+    /// The audio wire's address, as Celmux published it to this plugin.
+    ///
+    /// A missing address is not a fallback case: audio has no other route, so
+    /// saying so plainly is better than opening a socket somewhere else.
+    pub fn audio_wire_address(&self) -> Result<String, String> {
+        let raw = self
+            .audio
+            .as_deref()
+            .ok_or_else(|| "Celmux 未提供 CELMUX_PLUGIN_AUDIO_URL".to_owned())?;
+        raw.strip_prefix("tcp://")
+            .or(Some(raw))
+            .map(str::to_owned)
+            .ok_or_else(|| format!("音频通道地址无效: {raw}"))
+    }
+
+    pub fn plugin_id(&self) -> &str {
+        &self.plugin_id
+    }
+
+    pub fn token(&self) -> &str {
+        &self.token
     }
 
     fn url(&self, path: &str) -> String {
@@ -267,10 +311,13 @@ impl Client {
         );
         let mut stream = std::net::TcpStream::connect((parsed.host.as_str(), parsed.port))
             .map_err(|error| Error::Transport(error.to_string()))?;
-        // No read timeout: this connection is supposed to sit idle for long
-        // stretches, and a timeout would look like a disconnect whenever nothing
-        // happened.
-        let _ = stream.set_read_timeout(None);
+        // A bounded timeout, not "forever". The connection is supposed to sit idle
+        // for long stretches, so a timeout must not be read as a disconnect - but
+        // "forever" is what let this thread die silently: one partial chunk and it
+        // blocked in `read_line` for good, with the frames piling up unread in the
+        // socket (Recv-Q held them while the plugin's log showed nothing at all).
+        // The loop below treats a timeout as "still connected, nothing yet".
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(SOCKET_IDLE_TIMEOUT)));
         {
             use std::io::Write;
             stream
@@ -326,8 +373,26 @@ impl Client {
         // split a JSON object in the middle, and a frame may span two chunks.
         let mut pending = Vec::new();
         loop {
-            if chunked && !read_chunk(&mut reader, &mut pending)? {
-                return Ok(());
+            if chunked {
+                match read_chunk(&mut reader, &mut pending) {
+                    Ok(true) => {}
+                    // The peer closed the body: a normal end, the caller reconnects.
+                    Ok(false) => return Ok(()),
+                    // A silent socket, not a dead one. Celmux sends nothing for
+                    // minutes on a quiet line, and dropping the connection here
+                    // would make every quiet period look like a disconnect. The
+                    // platform words this two ways: `timed out` on some, and
+                    // `Resource temporarily unavailable` (EAGAIN) on others - both
+                    // are a socket-level read timeout, not a closed peer.
+                    Err(Error::Transport(reason))
+                        if reason.contains("timed out")
+                            || reason.contains("temporarily unavailable")
+                            || reason.contains("os error 11") =>
+                    {
+                        continue
+                    }
+                    Err(error) => return Err(error),
+                }
             }
             if !chunked {
                 // No chunking: the body is the frames, read as it arrives.
@@ -404,78 +469,6 @@ impl Client {
             .cloned()
             .unwrap_or_else(|| Value::Array(Vec::new()));
         serde_json::from_value(devices).map_err(|error| Error::Decode(error.to_string()))
-    }
-
-    /// Pull the carrier's next block: signed 16-bit LE mono, base64 encoded.
-    ///
-    /// An empty `samples` is not an error - the carrier produces audio on its
-    /// own clock, so "nothing yet" is the normal answer for a poll that comes
-    /// between two blocks.
-    pub fn pull_audio(&self, call_id: u64) -> Result<Option<Vec<u8>>, Error> {
-        let value = self.request("GET", &format!("/audio?call_id={call_id}"), None)?;
-        let encoded = value.get("samples").and_then(Value::as_str).unwrap_or("");
-        if encoded.is_empty() {
-            return Ok(None);
-        }
-        crate::config::base64_url_decode(encoded)
-            .map(Some)
-            .ok_or_else(|| Error::Decode("音频帧不是有效的 base64".to_owned()))
-    }
-
-    /// Send captured audio to the caller. Celmux resamples to the carrier's own
-    /// clock, so 8 kHz mono is accepted for every carrier codec.
-    pub fn push_audio(&self, call_id: u64, samples: &[u8]) -> Result<(), Error> {
-        self.request(
-            "POST",
-            &format!("/audio?call_id={call_id}"),
-            Some(serde_json::json!({
-                "samples": crate::config::base64_url_encode(samples),
-                "sample_rate": crate::pcm::SAMPLE_RATE,
-            })),
-        )
-        .map(|_| ())
-    }
-
-    /// The call the bridge is currently carrying, if any.
-    ///
-    /// The PCM gateway is opened by the phone separately from the control
-    /// request that answered a call, so it has to learn which call it belongs
-    /// to. Calling the call list is enough: a plugin carries one call at a time
-    /// and the active one is the only call in a talking state.
-    pub fn active_call_id(&self, line_id: &str) -> Option<u64> {
-        let value = self.calls().ok()?;
-        value
-            .get("calls")
-            .and_then(Value::as_array)?
-            .iter()
-            .find_map(|call| {
-                // Scoped to this agent's line: two agents bridge two calls at
-                // once, and each has to pick its own.
-                if call.get("line_id").and_then(Value::as_str) != Some(line_id) {
-                    return None;
-                }
-                let state = call.get("state").and_then(Value::as_str)?;
-                if !matches!(state, "active" | "connected" | "talking") {
-                    return None;
-                }
-                call.get("call_id").and_then(Value::as_u64).or_else(|| {
-                    call.get("call_id")
-                        .and_then(Value::as_str)
-                        .and_then(|text| text.parse().ok())
-                })
-            })
-    }
-
-    /// Whether `call_id` is still the active call.
-    ///
-    /// Passing `None` asks "is there any active call", which is what the gateway
-    /// needs before it knows its own id.
-    pub fn call_still_active(&self, line_id: &str, call_id: Option<u64>) -> bool {
-        match (self.active_call_id(line_id), call_id) {
-            (Some(active), Some(expected)) => active == expected,
-            (Some(_), None) => true,
-            (None, _) => false,
-        }
     }
 }
 
@@ -573,6 +566,9 @@ fn read_chunk(
 
 /// Percent-encode a value for a query string.
 ///
+/// Whether one of Celmux's call rows belongs to `line_id`.
+///
+/// Celmux's call rows do not carry the line label; they carry `device_id` and
 /// A line label can carry `#` (a Profile line is `module#iccid`), and an
 /// unencoded `#` would truncate the query at the fragment, silently asking
 /// Celmux for the module's line instead of the Profile's.

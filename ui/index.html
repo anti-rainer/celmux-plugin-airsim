@@ -5,6 +5,20 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>AirSIM 桥接</title>
 <style>
+/* Two sides of one choice: visually a switch, not two checkboxes. */
+.relay-switch{display:inline-flex;padding:3px;gap:3px;border:1px solid var(--border);
+  border-radius:9px;background:var(--bg);margin-bottom:14px}
+.relay-mode{padding:6px 15px;border:0;border-radius:6px;background:transparent;
+  color:var(--muted);font:inherit;font-size:13px;cursor:pointer}
+.relay-mode.active{background:var(--accent);color:#fff;font-weight:600}
+
+.device-list{list-style:none;margin:12px 0 0;padding:0;display:flex;flex-direction:column;gap:8px}
+.device-row{display:flex;align-items:center;gap:10px;padding:9px 12px;border:1px solid var(--line);border-radius:8px}
+.device-id{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.device-remove{padding:5px 11px;font-size:12px;border-radius:6px;border:1px solid var(--line);background:transparent;color:inherit;cursor:pointer}
+.device-remove:hover{border-color:#e5534b;color:#e5534b}
+.device-empty{color:var(--dim);font-size:13px;padding:6px 2px}
+
   :root {
     --bg: #ffffff; --fg: #1f2937; --muted: #6b7280; --border: #e5e7eb;
     --accent: #7c3aed; --ok: #059669; --warn: #d97706; --err: #dc2626;
@@ -18,8 +32,11 @@
   }
   * { box-sizing: border-box; }
   body {
-    margin: 0; padding: 16px; background: var(--bg); color: var(--fg);
+    padding: 16px; background: var(--bg); color: var(--fg);
     font: 14px/1.55 -apple-system, system-ui, "Segoe UI", "Noto Sans SC", sans-serif;
+    /* Centred and capped: this page is hosted inside Celmux's plugin frame, so on
+       a wide screen the full width would be a column of very long lines. */
+    max-width: 980px; margin-inline: auto;
   }
   .tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--border);
           margin-bottom: 18px; overflow-x: auto; }
@@ -35,14 +52,101 @@
        text-transform: uppercase; letter-spacing: .04em; }
   .hint { color: var(--muted); font-size: 12px; margin: 0 0 12px; }
   .grid { display: grid; gap: 12px; }
-  .grid.stats { grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); }
   .card { border: 1px solid var(--border); border-radius: 10px; padding: 14px; background: var(--panel); }
-  .stat-value { font-size: 26px; font-weight: 700; line-height: 1.1; }
-  .stat-label { font-size: 12px; color: var(--muted); margin-top: 2px; }
+  /* Equal cells: a dashboard whose boxes differ in height looks broken before
+     anyone reads it. Every card is the same shape, with the label on top, the
+     number in a fixed slot and the detail clamped to two lines. */
+  /* Two columns, cells stretched to the row height. `stretch` is what keeps the
+     top edges level: with `start` each cell sat at its own content height and the
+     row looked stepped. The row is as tall as its tallest cell, and the shorter
+     one grows its inner spacing rather than its border box. */
+  .grid.stats { grid-template-columns: repeat(2, minmax(0, 1fr));
+                align-items: stretch; margin-top: 4px; }
+  /* Each panel is a title and a short list of readings. Fixed rows rather than a
+     hero number: the panels carry two or three facts each, and a big number would
+     leave the others as small print - which is what made the first two boxes look
+     misaligned, one being a digit and the other a word. */
+  /* Every cell is the same height. Rows carry two or three readings, so the cell
+     height is set by the tallest panel; letting the others shrink made the grid
+     look ragged from one row to the next. */
+  .card.stat { display: flex; flex-direction: column; gap: 10px; padding: 14px;
+               height: 100%; }
+  .stat-title { font-size: 12px; color: var(--muted); font-weight: 600;
+                letter-spacing: .03em; }
+  .stat-rows { display: flex; flex-direction: column; gap: 7px; }
+  .stat-row { display: flex; align-items: baseline; justify-content: space-between;
+              gap: 10px; font-size: 13px; }
+  .stat-row-label { color: var(--muted); white-space: nowrap; }
+  .stat-row-value { font-weight: 600; font-variant-numeric: tabular-nums;
+                    text-align: right; overflow-wrap: anywhere; }
+  .stat-row-value.ok { color: var(--ok); }
+  .stat-row-value.warn { color: var(--warn); }
   .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
   .row + .row { margin-top: 10px; }
   .grow { flex: 1; min-width: 140px; }
   label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+
+  /* A form field is one unit: its label sits above its control and the pair moves
+     together. Laid out as bare flex siblings, a label and its input wrap
+     independently on a phone and the value ends up under the next label. */
+  .fields { display: grid; gap: 12px 14px;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+  .field { display: flex; flex-direction: column; min-width: 0; }
+  .field > label { margin-bottom: 6px; }
+  .field > input, .field > textarea, .field > select { width: 100%; }
+  /* A checkbox reads better beside its own label than under it. */
+  .field.check { flex-direction: row; align-items: center; gap: 8px; grid-column: 1 / -1; }
+  .field.check > label { margin: 0; }
+  .field.check > input { width: auto; }
+  /* Full-width fields, for a long value or a key block. */
+  .field.wide { grid-column: 1 / -1; }
+  .actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+             margin-top: 14px; }
+  .note { font-size: 12.5px; line-height: 1.65; color: var(--muted); margin-top: 10px; }
+  .note p { margin: 0 0 6px; }
+  .note p:last-child { margin-bottom: 0; }
+  .note b { color: var(--fg); font-weight: 600; }
+  /* A URL breaks at its own boundaries, not mid-word: `https://airs|im.example`
+     reads as two different addresses. */
+  .note .mono { color: var(--fg); overflow-wrap: anywhere; word-break: normal; }
+  .section-title { font-size: 13px; font-weight: 600; margin: 0 0 4px; }
+  .section-head { display: flex; align-items: center; justify-content: space-between;
+                  gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
+  /* Spacing between cards that stack down a page. Not inside a grid: there the
+     gap is the grid's own, and a sibling margin would push only every second
+     cell down - which is exactly how a two-column dashboard ends up with its
+     right-hand boxes 14px lower than the left. */
+  .panel > .card + .card { margin-top: 14px; }
+  textarea { font-family: ui-monospace, monospace; font-size: 12px; line-height: 1.5;
+             padding: 9px 10px; border-radius: 7px; resize: vertical;
+             border: 1px solid var(--border); background: var(--bg); color: var(--fg); }
+
+  /* Phones: one field per row, larger touch targets, and no side-by-side
+     squeezing. The tab strip scrolls instead of wrapping into a second line. */
+  /* A settings form does not get easier to read by being 1400px wide. */
+  .tabs { scrollbar-width: none; }
+  .tabs::-webkit-scrollbar { display: none; }
+
+  @media (min-width: 900px) {
+    .fields { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
+    .field.wide { grid-column: 1 / span 2; }
+  }
+
+  @media (max-width: 560px) {
+    .fields { grid-template-columns: 1fr; gap: 14px; }
+    .field.check { grid-column: auto; }
+    input, select, textarea { padding: 10px 12px; font-size: 16px; }
+    button { padding: 10px 16px; font-size: 14px; }
+    .actions button { flex: 1 1 auto; }
+    .note { font-size: 13px; }
+    .card { padding: 16px; }
+    /* Five labels have to fit 390px: tighter padding rather than a strip that
+       cuts the last one off, with scrolling kept as the fallback for a narrower
+       phone. */
+    .tabs { overflow-x: auto; flex-wrap: nowrap; -webkit-overflow-scrolling: touch;
+            gap: 0; margin-inline: -4px; }
+    .tab { flex: 0 1 auto; padding: 10px 9px; font-size: 13.5px; }
+  }
   input, select { width: 100%; padding: 7px 9px; border-radius: 7px; font: inherit;
                   border: 1px solid var(--border); background: var(--bg); color: var(--fg); }
   button { padding: 7px 14px; border-radius: 7px; font: inherit; cursor: pointer;
@@ -60,20 +164,68 @@
           padding: 14px; text-align: center; background: var(--bg);
           border-radius: 8px; border: 1px dashed var(--accent); color: var(--accent); }
   .mono { font-family: ui-monospace, monospace; font-size: 12px; }
+  /* A read-only value that reads as a value, not as a label. */
+  .readable { display: block; padding: 9px 10px; border-radius: 7px;
+              border: 1px solid var(--border); background: var(--bg);
+              color: var(--fg); font-size: 13px; overflow-wrap: anywhere; }
   .err { color: var(--err); font-size: 12px; }
   .logs { font-family: ui-monospace, monospace; font-size: 12px; line-height: 1.5;
           background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
           padding: 12px; max-height: 520px; overflow: auto; white-space: pre-wrap;
           word-break: break-all; margin: 0; }
+  /* A line card: three rows of identity, one action pinned to the corner. */
+  /* The action sits at the bottom-right corner of the card: the body takes the
+     width, the button is aligned to the end of the cross axis. */
+  .line-body { min-width: 0; grid-column: 1; grid-row: 1 / span 2;
+               align-self: stretch; display: flex; flex-direction: column;
+               justify-content: center; }
+  .line-row { display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap;
+              font-size: 13px; line-height: 1.5; }
+  .line-row + .line-row { margin-top: 3px; color: var(--muted); }
+  .line-row-1 { font-weight: 600; color: var(--fg); }
+  .line-device { font-weight: 600; }
+  .line-mode { font-weight: 400; color: var(--muted); font-size: 12.5px; }
+  .line-dot { color: var(--border); }
+  .line-iccid { font-size: 11.5px; color: var(--muted); letter-spacing: .01em; }
+  .line-action { grid-column: 2; grid-row: 2; align-self: end; justify-self: end;
+                 white-space: nowrap; }
+
+  /* Blurred, not removed: the value stays where it was, so the length of a
+     number still tells two lines apart while it is hidden. */
+  .masked { filter: blur(5px); user-select: none; transition: filter .12s ease; }
+  .masked:hover, .masked:focus { filter: blur(5px); }
+
+  /* The privacy switch reads as an icon button. */
+  .eye { padding: 6px 12px; font-size: 12.5px; color: var(--muted); }
+  .eye::before { content: '👁'; margin-right: 6px; }
+  .eye.on::before { content: '🙈'; }
+
+  /* A dialog for the one block of configuration that does not fit a card: a PEM
+     key plus two identifiers, used once when the operator sets the gateway up. */
+  .dialog-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.42);
+                     display: flex; align-items: center; justify-content: center;
+                     padding: 16px; z-index: 50; }
+  .dialog-backdrop[hidden] { display: none; }
+  .dialog { background: var(--panel); border: 1px solid var(--border);
+            border-radius: 12px; padding: 18px; width: 100%; max-width: 560px;
+            max-height: 90vh; overflow-y: auto;
+            box-shadow: 0 12px 40px rgba(0,0,0,.28); }
+
+  /* The card is not a control any more: it shows a line and one button, so it
+     does not take a click of its own. */
+  /* Two columns: the identity block spans the card, the action occupies the
+     bottom-right cell. Grid rather than flex so the button lands in the corner
+     regardless of how many rows the identity block ends up with. */
+  /* Two columns and two rows: the identity block fills the left column down both
+     rows, the action occupies the bottom-right cell. Flex could only centre the
+     button against the text; a grid can put it in the corner. */
   .line-card { border: 1px solid var(--border); border-radius: 10px;
-               padding: 14px; margin-bottom: 10px; cursor: pointer; }
-  .line-card:hover { border-color: var(--accent); }
-  .line-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
+               padding: 14px; margin-bottom: 10px;
+               display: grid; gap: 8px 12px;
+               grid-template-columns: minmax(0, 1fr) auto;
+               grid-template-rows: 1fr auto; }
+  .line-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
   .line-name { font-weight: 600; }
-  .kv { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 8px; }
-  .kv div { font-size: 12px; }
-  .kv span { color: var(--muted); }
-  .detail { border-top: 1px solid var(--border); margin-top: 12px; padding-top: 12px; }
   a { color: var(--accent); }
 </style>
 </head>
@@ -81,32 +233,184 @@
   <nav class="tabs" id="tabs">
     <button class="tab active" data-tab="home">主页</button>
     <button class="tab" data-tab="lines">线路</button>
+    <button class="tab" data-tab="settings">插件设置</button>
     <button class="tab" data-tab="logs">插件日志</button>
     <button class="tab" data-tab="info">插件信息</button>
   </nav>
 
   <section class="panel active" id="panel-home">
     <div class="grid stats" id="home-stats"></div>
-    <h3 style="margin-top:20px">已暴露的线路</h3>
-    <div id="home-agents"></div>
   </section>
 
   <section class="panel" id="panel-lines">
-    <!-- The ports belong to the installation, not to a line: every line shares
-         them, and the line is identified by which secret signed the request.
-         One row, because it is two numbers and a button. -->
-    <div class="card" style="margin-bottom:14px">
-      <div class="row" style="align-items:center">
-        <label style="margin:0">控制端口</label>
-        <input type="number" id="port-control" placeholder="8642" style="width:100px">
-        <label style="margin:0">PCM 端口</label>
-        <input type="number" id="port-pcm" placeholder="8643" style="width:100px">
-        <button id="save-ports" class="primary">保存</button>
-        <span class="hint" id="ports-note" style="margin:0"></span>
-      </div>
+    <div class="section-head">
+      <div class="section-title">线路</div>
+      <!-- Privacy is remembered for the session, not the installation: it is a
+           "someone is looking at my screen" switch, not a setting. -->
+      <button id="privacy-toggle" class="eye" type="button"></button>
     </div>
     <div id="lines-list"></div>
     <p class="hint" id="save-note" style="margin-top:12px"></p>
+  </section>
+
+  <section class="panel" id="panel-settings">
+    <!-- Three cards in setup order: the agent the phone pairs with, the cloud
+         path it can reach from outside, and the local listener Celmux uses to
+         host this page. -->
+
+    <div class="card">
+      <div class="section-head">
+        <div class="section-title">Agent</div>
+        <span class="tag" id="pair-state">未配对</span>
+      </div>
+      <div class="fields">
+        <div class="field">
+          <label for="agent-name-input">Agent 名称</label>
+          <input type="text" id="agent-name-input" placeholder="Celmux">
+        </div>
+        <div class="field">
+          <label for="agent-id-input">Agent ID（更改后需重新配对）</label>
+          <input type="text" id="agent-id-input" class="mono" placeholder="celmux"
+                 autocapitalize="off" autocorrect="off" spellcheck="false">
+        </div>
+        <div class="field">
+          <label for="port-control">配对控制端口</label>
+          <input type="number" id="port-control" placeholder="8642" inputmode="numeric">
+        </div>
+        <div class="field">
+          <label for="port-pcm">PCM 媒体端口</label>
+          <input type="number" id="port-pcm" placeholder="8643" inputmode="numeric">
+        </div>
+      </div>
+      <div class="actions">
+        <button id="save-agent" class="primary">保存</button>
+        <button id="pair-start">开始配对</button>
+        <button id="pair-forget" class="danger" style="display:none">解除配对</button>
+        <span class="hint" id="agent-note" style="margin:0"></span>
+      </div>
+      <div id="pair-code" style="display:none;margin-top:14px"></div>
+    </div>
+
+    <div class="card">
+      <div class="section-head">
+        <div class="section-title">云端 Relay</div>
+        <span class="tag" id="relay-state">未启用</span>
+      </div>
+
+      <!-- One relay, not two. The switch is the choice: whichever side is
+           selected, the other is off - its listener is not opened and its fields
+           are not read. Leaving both configured made "which one is in charge"
+           a question the operator had to answer from behaviour. -->
+      <div class="relay-switch" role="tablist">
+        <button type="button" class="relay-mode" data-mode="own" role="tab">自有 Relay</button>
+        <button type="button" class="relay-mode" data-mode="external" role="tab">外部 Relay</button>
+      </div>
+
+      <!-- Own relay: this process is the endpoint, and it needs a public path
+           plus the APNs key that actually sends the push. -->
+      <div id="relay-own" class="fields">
+        <div class="field check">
+          <input type="checkbox" id="relay-enabled">
+          <label for="relay-enabled">启用云端 Relay</label>
+        </div>
+        <div class="field">
+          <label for="port-relay">Relay 监听端口</label>
+          <input type="number" id="port-relay" placeholder="43770" inputmode="numeric">
+        </div>
+      </div>
+
+      <!-- External relay: somebody else's endpoint holds the push key, so this
+           installation needs none, and the phone registers over there. -->
+      <div id="relay-external" class="fields" hidden>
+        <div class="field wide">
+          <label for="relay-target">外部 Relay 地址</label>
+          <input type="text" id="relay-target" class="mono" placeholder="https://relay.example.com"
+                 autocapitalize="off" autocorrect="off" spellcheck="false">
+        </div>
+        <!-- The credential is the phone's, not the operator's: it is generated on
+             the phone and registered with that relay, and it arrives here once
+             inside the pairing claim. Asking for it by hand would be asking the
+             operator for something only the phone knows. -->
+        <div class="field wide">
+          <label>手机在该 relay 的凭据</label>
+          <span class="readable" id="relay-credential-state">未配对，配对后自动获取</span>
+        </div>
+      </div>
+
+      <div class="actions">
+        <button id="save-relay" class="primary">保存</button>
+        <button id="open-apns">APNs 推送配置</button>
+        <span class="hint" id="relay-note" style="margin:0"></span>
+      </div>
+      <div class="note" id="relay-own-note">
+        <p>手机填 <span class="mono">https://你的域名</span> · <span id="relay-apns-summary"></span></p>
+        <p>需要自己的 APNs 密钥（p8），换来的是一台完全由自己掌握的推送端点。</p>
+      </div>
+      <div class="note" id="relay-external-note" hidden>
+        <p>只填地址，不需要任何密钥——推送由那台 relay 用它自己的 p8 发。</p>
+        <p>手机设置里的「云端 Relay」必须填同一个地址：两边指向不同 relay 时，注册与命令互相看不见。</p>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="section-head">
+        <div class="section-title">Celmux 托管内部端口</div>
+        <span class="tag">仅内网</span>
+      </div>
+      <div class="fields">
+        <div class="field">
+          <label for="port-ui">插件 UI 入口</label>
+          <input type="number" id="port-ui" placeholder="43769" inputmode="numeric">
+        </div>
+      </div>
+      <div class="actions">
+        <button id="save-port-ui" class="primary">保存</button>
+        <span class="hint" id="ports-note" style="margin:0"></span>
+      </div>
+    </div>
+
+    <!-- The key is a block of PEM text plus two identifiers: a dialog keeps it out
+         of the page until an operator actually has one to paste. -->
+    <div class="dialog-backdrop" id="apns-dialog" hidden>
+      <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="apns-dialog-title">
+        <div class="section-head">
+          <div class="section-title" id="apns-dialog-title">APNs 推送配置</div>
+          <span class="tag" id="apns-state">未配置</span>
+        </div>
+        <div class="fields">
+          <div class="field">
+            <label for="apns-key-id">Key ID</label>
+            <input type="text" id="apns-key-id" placeholder="ABC123DEFG" class="mono"
+                   autocapitalize="off" autocorrect="off" spellcheck="false">
+          </div>
+          <div class="field">
+            <label for="apns-team-id">Team ID</label>
+            <input type="text" id="apns-team-id" placeholder="1A2B3C4D5E" class="mono"
+                   autocapitalize="off" autocorrect="off" spellcheck="false">
+          </div>
+          <div class="field wide">
+            <label for="apns-bundle-id">Bundle ID</label>
+            <input type="text" id="apns-bundle-id" placeholder="com.eric3u.airsim" class="mono"
+                   autocapitalize="off" autocorrect="off" spellcheck="false">
+          </div>
+          <div class="field wide">
+            <label for="apns-p8">密钥（.p8 内容）</label>
+            <textarea id="apns-p8" rows="6" autocapitalize="off" autocorrect="off" spellcheck="false"
+                      placeholder="-----BEGIN PRIVATE KEY-----&#10;…&#10;-----END PRIVATE KEY-----"></textarea>
+          </div>
+          <div class="field check">
+            <input type="checkbox" id="apns-sandbox">
+            <label for="apns-sandbox">Sandbox 环境（Xcode 直接安装的构建）</label>
+          </div>
+        </div>
+        <div class="note" id="apns-help"></div>
+        <div class="actions">
+          <button id="save-apns" class="primary">保存密钥</button>
+          <button id="close-apns">关闭</button>
+          <span class="hint" id="apns-note" style="margin:0"></span>
+        </div>
+      </div>
+    </div>
   </section>
 
   <section class="panel" id="panel-logs">
@@ -123,7 +427,13 @@
   </section>
 
 <script>
-const state = { lines: [], agents: [], assignment: [], codes: {}, info: {}, openLine: '' };
+const state = {
+  lines: [], agents: [], assignment: [], codes: {}, codeOwner: '', info: {}, totals: {}, relayMode: 'own', relayCredential: {},
+  // Starts hidden: the line list is the one page here that shows phone numbers and
+  // ICCIDs, and it is opened in shared spaces far more often than it is opened to
+  // read one out. It is a "someone is looking" switch, so it is per session.
+  privacyHidden: true,
+};
 
 function el(tag, props = {}, children = []) {
   const node = document.createElement(tag);
@@ -175,14 +485,6 @@ async function pluginFetch(path, options = {}) {
   return response.json();
 }
 
-function lineLabel(line) {
-  const parts = [line.device_name];
-  if (line.n_standby && line.profile_name) parts.push(line.profile_name);
-  else if (line.operator_name) parts.push(line.operator_name);
-  if (line.local_phone) parts.push(line.local_phone);
-  return parts.filter(Boolean).join(' · ') || line.line_id;
-}
-
 function accessLabel(line) {
   if (line.n_standby && line.n_standby_active) return 'N待 VoWiFi';
   if (line.vowifi_active) return 'VoWiFi';
@@ -214,37 +516,99 @@ for (const tab of document.querySelectorAll('.tab')) {
 
 function renderHome() {
   const stats = document.getElementById('home-stats');
-  const exposed = state.agents.length;
-  const paired = state.agents.filter((agent) => agent.paired).length;
-  const callable = state.lines.filter((line) => line.online && line.voice_route !== 'unavailable').length;
-  stats.replaceChildren(...[
-    ['已暴露线路', exposed], ['已配对', paired],
-    ['未配对', exposed - paired], ['可拨打线路', callable],
-  ].map(([label, value]) => el('div', { className: 'card' }, [
-    el('div', { className: 'stat-value' }, [String(value)]),
-    el('div', { className: 'stat-label' }, [label]),
-  ])));
+  const totals = state.totals || {};
+  const agent = (state.agents || [])[0] || {};
+  const config = state.config || {};
+  const relayOn = String(config.relay_enabled) === 'true';
+  const paired = Boolean(agent.paired);
 
-  const container = document.getElementById('home-agents');
-  container.replaceChildren();
-  if (!state.agents.length) {
-    container.append(el('p', { className: 'hint' }, ['还没有接入任何线路。到「线路」标签点开一条线路接入。']));
-    return;
-  }
-  for (const agent of state.agents) {
-    const tag = agent.paired
-      ? el('span', { className: 'tag ok' }, ['已配对'])
-      : el('span', { className: 'tag warn' }, ['未配对']);
-    container.append(el('div', { className: 'card', style: 'margin-bottom:10px' }, [
-      el('div', { className: 'row' }, [
-        el('span', { style: 'font-weight:600' }, [agent.name]), tag,
-        el('span', { className: 'mono', style: 'color:var(--muted)' }, [agent.agent_id]),
-      ]),
-      el('div', { className: 'mono hint', style: 'margin:6px 0 0' }, [
-        `${agent.line_id} · 控制 ${agent.control_port} · PCM ${agent.pcm_port}`,
-      ]),
-    ]));
-  }
+  // Six panels in the order an operator checks them: is it running, what can it
+  // reach, what has moved, and how is it configured.
+  //
+  // Each panel is a title plus rows of `label  value`, one row per fact. A row
+  // rather than a hero number, because these panels carry two to three readings
+  // each and a big number per panel would leave the rest as small print.
+  const panels = [
+    {
+      title: '运行状态',
+      rows: [
+        ['运行时长', formatUptime(totals.uptime_seconds)],
+        ['内存占用', totals.memory_kb ? `${(totals.memory_kb / 1024).toFixed(1)} MB` : '—'],
+        ['线程数量', totals.threads || '—'],
+      ],
+    },
+    {
+      title: '线路统计',
+      rows: [
+        ['线路总数', totals.lines || 0],
+        ['可用线路', totals.lines_callable || 0],
+        ['AirSIM 线路', totals.lines_exposed || 0],
+      ],
+    },
+    {
+      title: '通话统计',
+      rows: [
+        ['去电', totals.calls_outgoing || 0],
+        ['来电', totals.calls_incoming || 0],
+      ],
+    },
+    {
+      title: '短信统计',
+      rows: [
+        ['发信', totals.sms_sent || 0],
+        ['收信', totals.sms_received || 0],
+      ],
+    },
+    {
+      title: 'Agent 状态',
+      // The ports are configuration, so they are shown even when unpaired: they
+      // are what the operator needs in order to set the phone up.
+      rows: [
+        ['配对状态', paired ? '已配对' : '未配对', paired ? 'ok' : 'warn'],
+        ['配对端口', config.control_port || '—'],
+        ['媒体端口', config.pcm_port || '—'],
+      ],
+    },
+    {
+      title: 'Relay 状态',
+      rows: [
+        ['启用状态', relayOn ? '已启用' : '未启用', relayOn ? 'ok' : ''],
+        ['Relay 端口', relayOn ? (config.relay_port || '—') : '—'],
+        ['APNs', apnsConfigured() ? '已配置' : '未配置', apnsConfigured() ? 'ok' : 'warn'],
+      ],
+    },
+  ];
+
+  stats.replaceChildren(...panels.map((panel) => el('div', { className: 'card stat' }, [
+    el('div', { className: 'stat-title' }, [panel.title]),
+    el('div', { className: 'stat-rows' }, panel.rows.map(([label, value, tone]) =>
+      el('div', { className: 'stat-row' }, [
+        el('span', { className: 'stat-row-label' }, [label]),
+        el('span', { className: `stat-row-value${tone ? ' ' + tone : ''}` }, [String(value)]),
+      ])
+    )),
+  ])));
+}
+
+// A duration in the units a person reads: seconds only when it just started.
+function formatUptime(seconds) {
+  if (!seconds) return '—';
+  const days = Math.floor(seconds / 86400);
+  const hours = Math.floor((seconds % 86400) / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  if (days) return `${days}天 ${hours}小时`;
+  if (hours) return `${hours}小时 ${minutes}分`;
+  if (minutes) return `${minutes}分`;
+  return `${Math.floor(seconds)}秒`;
+}
+
+// Whether a key and both identifiers are stored. The page only ever sees the key
+// masked, so presence is what it reports.
+function apnsConfigured() {
+  const config = state.config || {};
+  const hasKey = Boolean((config.apns_p8 || '').trim() && config.apns_p8 !== '********');
+  const hasIds = Boolean((config.apns_key_id || '').trim() && (config.apns_team_id || '').trim());
+  return hasKey && hasIds;
 }
 
 function renderLines() {
@@ -255,132 +619,166 @@ function renderLines() {
     return;
   }
   for (const line of state.lines) {
-    const agent = line.agent;
-    const statusTag = agent
-      ? (agent.paired ? el('span', { className: 'tag ok' }, ['AirSIM 已配对'])
-                      : el('span', { className: 'tag warn' }, ['AirSIM 未配对']))
-      : el('span', { className: 'tag' }, ['未接入 AirSIM']);
-
-    // Three lines: what the line is, how it is doing, and its label. The
-    // details are one tap away in the expansion, because the list is read at a
-    // glance to pick a line to expose, not to audit it.
+    // Three lines of identity and one action in the corner:
+    //
+    //   device · mode
+    //   operator · number
+    //   ICCID
+    //
+    // The action belongs in the corner rather than beside the name: it is about
+    // the whole card, and a full-width button under the text made every card tall
+    // enough that only two fit on a phone.
     const card = el('div', { className: 'line-card' });
-    card.append(
-      el('div', { className: 'line-head' }, [
-        el('span', { className: 'line-name' }, [lineLabel(line)]),
-      ]),
-      el('div', { className: 'line-head', style: 'margin-top:6px' }, [
-        el('span', { className: accessTagClass(line) }, [accessLabel(line)]),
-        statusTag,
-      ]),
-      el('div', { className: 'mono', style: 'color:var(--muted);margin-top:6px;font-size:12px' }, [
-        line.line_id,
-      ])
-    );
-    card.onclick = () => {
-      state.openLine = state.openLine === line.line_id ? '' : line.line_id;
-      renderLines();
+
+    const action = el('button', { className: exposeButtonClass(line) + ' line-action' }, [
+      exposeButtonLabel(line),
+    ]);
+    action.onclick = (event) => {
+      event.stopPropagation();
+      void exposeLine(line);
     };
-    if (state.openLine === line.line_id) card.append(renderLineDetail(line));
+
+    // The identifier is the mode when N-standby is on: the Profile name is what
+    // tells two lines of the same device apart, and the operator would otherwise
+    // be repeated on both rows.
+    // The mode is the Profile name under N-standby - that is what tells two lines
+    // of one device apart - falling back to the voice route otherwise. It keeps
+    // its state colour: "readcard 1 · Vodafone eSIM" says which line, and the pill
+    // still says whether it works.
+    // Row one is the device and how the line currently stands. The operator is
+    // row two; putting the Profile name here read as a second operator, because
+    // for an eSIM profile the two are the same string.
+    const mode = el('span', { className: accessTagClass(line) }, [accessLabel(line)]);
+
+    const body = el('div', { className: 'line-body' }, [
+      el('div', { className: 'line-row line-row-1' }, [
+        el('span', { className: 'line-device' }, [line.device_name || line.line_id]),
+        el('span', { className: 'line-dot' }, ['·']),
+        mode,
+      ]),
+      el('div', { className: 'line-row' }, [
+        el('span', {}, [line.operator_name || '—']),
+        el('span', { className: 'line-dot' }, ['·']),
+        el('span', { className: 'mono private' }, [line.local_phone || '—']),
+      ]),
+      el('div', { className: 'line-row' }, [
+        el('span', { className: 'line-iccid mono private' }, [line.iccid || '—']),
+      ]),
+    ]);
+
+    card.append(body, action);
     container.append(card);
   }
+  applyPrivacy();
 }
 
-function renderLineDetail(line) {
-  const detail = el('div', { className: 'detail' });
-  if (line.agent) {
-    const agent = line.agent;
-    // The ports are shared by every line and are edited once at the top of this
-    // page, so repeating them per card would only suggest each line has its own.
-    detail.append(
-      el('div', { className: 'mono hint' }, [`Agent ${agent.agent_id}`])
-    );
-
-    const row = el('div', { className: 'row', style: 'margin-top:10px' });
-    const pair = el('button', { className: 'primary' }, ['开始配对']);
-    pair.onclick = (event) => { event.stopPropagation(); void startPairing(agent.agent_id); };
-    row.append(pair);
-    if (agent.paired) {
-      const unpair = el('button', { className: 'danger' }, ['解除配对']);
-      unpair.onclick = (event) => { event.stopPropagation(); void unpairAgent(agent.agent_id); };
-      row.append(unpair);
-    }
-    const removeLine = el('button', { className: 'danger' }, ['移出 AirSIM']);
-    removeLine.onclick = (event) => { event.stopPropagation(); void exposeLine(line); };
-    row.append(removeLine);
-    detail.append(row);
-
-    const code = state.codes[agent.agent_id];
-    if (code) {
-      detail.append(
-        el('div', { className: 'code', style: 'margin-top:12px' }, [code.code]),
-        el('p', { className: 'hint', style: 'text-align:center' }, [
-          `在 AirSIM 里选「手动地址配对」，地址 ${location.hostname}，端口 ${agent.control_port}`,
-        ])
-      );
-    }
-  } else {
-    detail.append(el('p', { className: 'hint' }, ['这条线路还没有接入 AirSIM。']));
-    const button = el('button', { className: 'primary' }, ['接入 AirSIM']);
-    button.onclick = (event) => { event.stopPropagation(); void exposeLine(line); };
-    detail.append(button);
+/// Hide or show every value the privacy toggle governs.
+///
+/// Blur rather than removal: the operator still sees that a number is there and
+/// how long it is, which is how they tell two lines apart while reading the page
+/// over someone's shoulder.
+function applyPrivacy() {
+  const hidden = state.privacyHidden;
+  for (const node of document.querySelectorAll('.private')) {
+    node.classList.toggle('masked', hidden);
   }
-  return detail;
-}
-
-/**
- * The next free port pair.
- *
- * Each agent owns two ports - control and PCM - and they must not collide with
- * one already assigned, or the second agent fails to bind at startup.
- */
-function nextPorts() {
-  const used = new Set();
-  for (const row of state.assignment) {
-    used.add(Number(row.control_port));
-    used.add(Number(row.pcm_port));
+  const toggle = document.getElementById('privacy-toggle');
+  if (toggle) {
+    toggle.textContent = hidden ? '显示' : '隐藏';
+    toggle.setAttribute('aria-label', hidden ? '显示手机号与 ICCID' : '隐藏手机号与 ICCID');
+    toggle.classList.toggle('on', !hidden);
   }
-  let control = 8642;
-  while (used.has(control) || used.has(control + 3)) control += 10;
-  return { control, pcm: control + 3 };
 }
 
-/** Take a line into or out of the set AirSIM sees, and apply it. */
+/** Take one line into or out of the set the phone sees, and apply it. */
 async function exposeLine(line) {
   const existing = state.assignment.findIndex((row) => row.line_id === line.line_id);
   if (existing >= 0) state.assignment.splice(existing, 1);
-  else {
-    const ports = nextPorts();
-    state.assignment.push({
-      line_id: line.line_id,
-      name: line.device_name || line.line_id,
-      control_port: ports.control,
-      pcm_port: ports.pcm,
-    });
-  }
+  else state.assignment.push({ line_id: line.line_id });
   await saveAssignment();
   await refresh();
 }
 
-async function startPairing(agentId) {
-  try {
-    const data = await pluginFetch('/api/pair', {
-      method: 'POST', body: JSON.stringify({ agent_id: agentId }),
-    });
-    state.codes[agentId] = { code: data.code, expires_at: data.expires_at };
-    renderLines();
-  } catch (error) {
-    alert('开始配对失败：' + error.message);
+// The plugin's own answer, not what this page last saved: the config can be
+// changed elsewhere, and the two would then disagree until a reload.
+function isExposed(line) {
+  return Boolean(line.exposed);
+}
+
+function exposeButtonLabel(line) {
+  return isExposed(line) ? '移出 AirSIM' : '加入 AirSIM';
+}
+
+function exposeButtonClass(line) {
+  return isExposed(line) ? 'danger' : 'primary';
+}
+
+// Pairing is per installation, so these take no agent: there is one, and the
+// page should not have to know its id to offer a button.
+function agentID() {
+  const agent = (state.agents || [])[0];
+  return agent ? agent.agent_id : '';
+}
+
+function renderPairing() {
+  const agent = (state.agents || [])[0];
+  const tag = document.getElementById('pair-state');
+  const forget = document.getElementById('pair-forget');
+  const code = document.getElementById('pair-code');
+  if (!tag || !code) return;
+  const paired = Boolean(agent && agent.paired);
+  tag.className = paired ? 'tag ok' : 'tag warn';
+  tag.textContent = paired ? '已配对' : '未配对';
+  if (forget) forget.style.display = paired ? '' : 'none';
+  // Keyed by the recorded id first: a window opened moments ago must still show
+  // its code even if the status poll has not filled the agent list yet.
+  const pending = state.codes[state.codeOwner] || state.codes[agentID()];
+  if (pending) {
+    code.style.display = '';
+    code.replaceChildren(
+      el('div', { className: 'code' }, [pending.code]),
+      el('p', { className: 'hint', style: 'text-align:center' }, [
+        `在 AirSIM 里选「手动地址配对」，地址 ${location.hostname}，端口 ${(sharedPorts()).control}`,
+      ])
+    );
+  } else {
+    code.style.display = 'none';
+    code.replaceChildren();
   }
 }
 
-async function unpairAgent(agentId) {
-  if (!confirm('解除配对？手机需要重新配对才能再使用这个 Agent。')) return;
+async function startPairing() {
+  const note = document.getElementById('agent-note');
+  const id = agentID();
+  if (!id) {
+    note.textContent = '没有可配对的设备';
+    return;
+  }
   try {
-    await pluginFetch('/api/unpair', { method: 'POST', body: JSON.stringify({ agent_id: agentId }) });
+    const data = await pluginFetch('/api/pair', {
+      method: 'POST', body: JSON.stringify({ agent_id: id }),
+    });
+    state.codes[id] = { code: data.code, expires_at: data.expires_at };
+    state.codeOwner = id;
+    note.textContent = '';
+    renderPairing();
+  } catch (error) {
+    note.textContent = '开始配对失败：' + (error.message || error);
+  }
+}
+
+async function forgetPairing() {
+  const note = document.getElementById('agent-note');
+  const id = agentID();
+  if (!id) return;
+  if (!confirm('解除配对？手机需要重新配对才能再使用。')) return;
+  try {
+    await pluginFetch('/api/unpair', { method: 'POST', body: JSON.stringify({ agent_id: id }) });
+    delete state.codes[id];
+    note.textContent = '';
     await refresh();
   } catch (error) {
-    alert('解除配对失败：' + error.message);
+    note.textContent = '解除配对失败：' + (error.message || error);
   }
 }
 
@@ -390,50 +788,297 @@ async function unpairAgent(agentId) {
 function sharedPorts() {
   const config = state.config || {};
   return {
+    ui: Number(config.port) || 43769,
     control: Number(config.control_port) || 8642,
     pcm: Number(config.pcm_port) || 8643,
+    relay: Number(config.relay_port) || 43770,
   };
 }
 
-// Save the installation-wide port pair. Written to the plugin config, not to a
-// line, because changing it changes every line at once.
-async function savePorts() {
-  const note = document.getElementById('ports-note');
-  const control = Number(document.getElementById('port-control').value) || 0;
-  const pcm = Number(document.getElementById('port-pcm').value) || 0;
-  if (!control || !pcm) {
-    note.className = 'hint err';
-    note.textContent = '端口不能为空';
-    return;
-  }
-  if (control === pcm) {
-    note.className = 'hint err';
-    note.textContent = '控制端口与 PCM 端口不能相同';
-    return;
-  }
-  note.className = 'hint';
-  note.textContent = '保存中…';
+// Save the installation-wide ports. Written to the plugin config, not to a line,
+// because each one is a listener this process opens for every line at once.
+// --- Agent card -------------------------------------------------------------
+
+// Name and id are saved on their own: they are the agent's identity, while the
+// ports on the same card are a different concern.
+async function saveAgent() {
+  const note = document.getElementById('agent-note');
+  const name = document.getElementById('agent-name-input').value.trim();
+  const id = document.getElementById('agent-id-input').value.trim();
+  if (note) { note.className = 'hint'; note.textContent = '保存中…'; }
   try {
+    const previous = ((state.agents || [])[0] || {}).agent_id || '';
     await pluginFetch('/api/config', {
       method: 'POST',
-      body: JSON.stringify({
-        values: { control_port: String(control), pcm_port: String(pcm) },
-      }),
+      body: JSON.stringify({ values: { agent_name: name, agent_id: id } }),
     });
-    state.config = { ...(state.config || {}), control_port: String(control), pcm_port: String(pcm) };
-    note.textContent = `已保存：控制端口 ${control}、PCM 端口 ${pcm}（所有线路共用，重启插件后生效）`;
+    state.config = { ...(state.config || {}), agent_name: name, agent_id: id };
+    if (note) {
+      note.className = 'hint';
+      // A new id orphans the secret the phone filed under the old one, so the
+      // operator is told instead of discovering it at the next call.
+      note.textContent = previous && id && id !== previous
+        ? `已保存。Agent ID 由 ${previous} 改为 ${id}，手机需要重新配对（重启插件后生效）。`
+        : '已保存（重启插件后生效）';
+    }
   } catch (error) {
-    note.className = 'hint err';
-    note.textContent = `保存失败：${error.message || error}`;
+    if (note) { note.className = 'hint err'; note.textContent = `保存失败：${error.message || error}`; }
   }
 }
 
+// The two ports on the agent card, saved with it or separately as the operator
+// prefers: one button per card is fewer decisions than one per field.
+async function saveAgentPorts() {
+  const note = document.getElementById('agent-note');
+  const control = Number(document.getElementById('port-control').value) || 0;
+  const pcm = Number(document.getElementById('port-pcm').value) || 0;
+  if (!control || !pcm) {
+    if (note) { note.className = 'hint err'; note.textContent = '端口不能为空'; }
+    return;
+  }
+  if (control === pcm) {
+    if (note) { note.className = 'hint err'; note.textContent = '配对控制端口与 PCM 媒体端口不能相同'; }
+    return;
+  }
+  if (note) { note.className = 'hint'; note.textContent = '保存中…'; }
+  try {
+    const values = { control_port: String(control), pcm_port: String(pcm) };
+    await pluginFetch('/api/config', { method: 'POST', body: JSON.stringify({ values }) });
+    state.config = { ...(state.config || {}), ...values };
+    if (note) { note.className = 'hint'; note.textContent = `已保存：配对控制 ${control}、PCM ${pcm}（重启插件后生效）`; }
+  } catch (error) {
+    if (note) { note.className = 'hint err'; note.textContent = `保存失败：${error.message || error}`; }
+  }
+}
+
+// --- Relay card ------------------------------------------------------------
+
+// Which relay is in charge. Held in the page and written on save: reading it back
+// from the config would make a half-edited form disagree with itself.
+function relayMode() {
+  return state.relayMode === 'external' ? 'external' : 'own';
+}
+
+/// Show one side of the switch and hide the other.
+///
+/// Hidden rather than dimmed: a field that is visible but ignored is the state
+/// this rework removed - the operator could fill in an address and see nothing
+/// happen.
+function applyRelayMode(mode) {
+  state.relayMode = mode === 'external' ? 'external' : 'own';
+  const external = state.relayMode === 'external';
+  for (const button of document.querySelectorAll('.relay-mode')) {
+    button.classList.toggle('active', button.dataset.mode === state.relayMode);
+    button.setAttribute('aria-selected', button.dataset.mode === state.relayMode ? 'true' : 'false');
+  }
+  const own = document.getElementById('relay-own');
+  const ext = document.getElementById('relay-external');
+  const ownNote = document.getElementById('relay-own-note');
+  const extNote = document.getElementById('relay-external-note');
+  if (own) own.hidden = external;
+  if (ext) ext.hidden = !external;
+  if (ownNote) ownNote.hidden = external;
+  if (extNote) extNote.hidden = !external;
+  renderRelayCard();
+}
+
+async function saveRelay() {
+  const note = document.getElementById('relay-note');
+  const enabled = document.getElementById('relay-enabled').checked;
+  const port = Number(document.getElementById('port-relay').value) || 0;
+  if (relayMode() === 'own' && !port) {
+    if (note) { note.className = 'hint err'; note.textContent = 'Relay 监听端口不能为空'; }
+    return;
+  }
+  if (relayMode() === 'external' && !document.getElementById('relay-target').value.trim()) {
+    if (note) { note.className = 'hint err'; note.textContent = '外部 Relay 地址不能为空'; }
+    return;
+  }
+  if (note) { note.className = 'hint'; note.textContent = '保存中…'; }
+  try {
+    const values = {
+      relay_mode: relayMode(),
+      relay_enabled: enabled ? 'true' : 'false',
+      relay_port: String(port),
+      relay_target: document.getElementById('relay-target').value.trim(),
+    };
+    await pluginFetch('/api/config', { method: 'POST', body: JSON.stringify({ values }) });
+    state.config = { ...(state.config || {}), ...values };
+    if (note) { note.className = 'hint'; note.textContent = '已保存（重启插件后生效）'; }
+    renderRelayCard();
+  } catch (error) {
+    if (note) { note.className = 'hint err'; note.textContent = `保存失败：${error.message || error}`; }
+  }
+}
+
+// A generated segment rather than a typed one, so it is long enough to be worth
+// having.
+
+// Show exactly what to paste into the phone: the segment only works if the URL
+// the operator enters carries it.
+
+// --- Celmux host port ------------------------------------------------------
+
+async function savePortUi() {
+  const note = document.getElementById('ports-note');
+  const port = Number(document.getElementById('port-ui').value) || 0;
+  if (!port) {
+    if (note) { note.className = 'hint err'; note.textContent = '端口不能为空'; }
+    return;
+  }
+  if (note) { note.className = 'hint'; note.textContent = '保存中…'; }
+  try {
+    await pluginFetch('/api/config', {
+      method: 'POST',
+      body: JSON.stringify({ values: { port: String(port) } }),
+    });
+    state.config = { ...(state.config || {}), port: String(port) };
+    if (note) { note.className = 'hint'; note.textContent = '已保存（重启插件后生效）'; }
+  } catch (error) {
+    if (note) { note.className = 'hint err'; note.textContent = `保存失败：${error.message || error}`; }
+  }
+}
+
+// --- APNs dialog -----------------------------------------------------------
+
+function openApnsDialog() {
+  const dialog = document.getElementById('apns-dialog');
+  if (!dialog) return;
+  dialog.hidden = false;
+  // The stored key never comes back from the server, so the field starts empty
+  // and an empty field on save means "leave the stored one alone".
+  const p8 = document.getElementById('apns-p8');
+  if (p8) p8.value = '';
+  renderApnsState();
+}
+
+function closeApnsDialog() {
+  const dialog = document.getElementById('apns-dialog');
+  if (dialog) dialog.hidden = true;
+}
+
+// What the cloud path can and cannot do, said plainly. A gateway with no key is
+// the common case, and the operator needs to know it is a signing-identity
+// problem rather than a misconfiguration they can fix here.
+function renderApnsState() {
+  const config = state.config || {};
+  const hasKey = Boolean((config.apns_p8 || '').trim() && config.apns_p8 !== '********');
+  const hasIds = Boolean((config.apns_key_id || '').trim() && (config.apns_team_id || '').trim());
+  const tag = document.getElementById('apns-state');
+  const help = document.getElementById('apns-help');
+  const summary = document.getElementById('relay-apns-summary');
+  if (tag) {
+    tag.textContent = hasKey && hasIds ? '已配置' : (hasKey || hasIds ? '不完整' : '未配置');
+    tag.className = hasKey && hasIds ? 'tag ok' : (hasKey || hasIds ? 'tag warn' : 'tag');
+  }
+  if (help) {
+    help.innerHTML = hasKey && hasIds
+      ? '<p>已配置，锁屏来电走 APNs。</p>'
+      : '<p>未配置：锁屏后收不到来电，手机需自行保持连接。</p>'
+        + '<p><b>p8 必须来自给这个 App 签名的开发者账号</b>，他人签名的 App 会被苹果以 '
+        + '<span class="mono">DeviceTokenNotForTopic</span> 拒绝。</p>';
+  }
+  if (summary) {
+    summary.innerHTML = hasKey && hasIds
+      ? '推送已配置'
+      : '推送未配置，锁屏收不到来电';
+  }
+}
+
+async function saveApns() {
+  const note = document.getElementById('apns-note');
+  const values = {
+    apns_key_id: document.getElementById('apns-key-id').value.trim(),
+    apns_team_id: document.getElementById('apns-team-id').value.trim(),
+    apns_bundle_id: document.getElementById('apns-bundle-id').value.trim(),
+    apns_sandbox: document.getElementById('apns-sandbox').checked ? 'true' : 'false',
+  };
+  const p8 = document.getElementById('apns-p8').value.trim();
+  if (p8) values.apns_p8 = p8;
+  if ((values.apns_key_id && !values.apns_team_id) || (!values.apns_key_id && values.apns_team_id)) {
+    if (note) { note.className = 'hint err'; note.textContent = 'Key ID 与 Team ID 必须同时填写'; }
+    return;
+  }
+  if (note) { note.className = 'hint'; note.textContent = '保存中…'; }
+  try {
+    await pluginFetch('/api/config', { method: 'POST', body: JSON.stringify({ values }) });
+    state.config = { ...(state.config || {}), ...values };
+    if (note) { note.className = 'hint'; note.textContent = '已保存（重启插件后生效）'; }
+    renderApnsState();
+  } catch (error) {
+    if (note) { note.className = 'hint err'; note.textContent = `保存失败：${error.message || error}`; }
+  }
+}
+
+// --- form population -------------------------------------------------------
+
+function renderRelayCard() {
+  const config = state.config || {};
+  const enabled = String(config.relay_enabled) === 'true';
+  const stateTag = document.getElementById('relay-state');
+  const external = relayMode() === 'external';
+  if (stateTag) {
+    if (external) {
+      // An external relay is in charge as soon as it is selected: there is no
+      // listener here to switch on.
+      stateTag.textContent = '外部';
+      stateTag.className = 'tag ok';
+    } else {
+      stateTag.textContent = enabled ? '已启用' : '未启用';
+      stateTag.className = enabled ? 'tag ok' : 'tag';
+    }
+  }
+  const checkbox = document.getElementById('relay-enabled');
+  if (checkbox && !checkbox.dataset.touched) checkbox.checked = enabled;
+  // What the phone registered with that relay under, captured at pairing. The
+  // operator cannot type this - only the phone knows it - so its presence is
+  // reported rather than asked for.
+  const credential = document.getElementById('relay-credential-state');
+  if (credential) {
+    const captured = state.relayCredential || {};
+    if (captured.present) {
+      const relay = captured.relay_url || '（手机未报告地址）';
+      credential.textContent = `${captured.device_id} · ${relay}`;
+      credential.classList.remove('err');
+    } else {
+      credential.textContent = '未获取：手机尚未在该 relay 注册，或配对早于本次更新，请重新配对';
+      credential.classList.add('err');
+    }
+  }
+  renderApnsState();
+}
+
+// Fill every input from the stored configuration. Called on load and after a
+// save, so a value the server masked does not read as an empty one.
 function fillPortInputs() {
-  const ports = sharedPorts();
-  const control = document.getElementById('port-control');
-  const pcm = document.getElementById('port-pcm');
-  if (control) control.value = ports.control;
-  if (pcm) pcm.value = ports.pcm;
+  const config = state.config || {};
+  const setField = (id, value) => {
+    const input = document.getElementById(id);
+    if (input && !input.dataset.touched) input.value = value;
+  };
+  setField('port-ui', config.port || '43769');
+  setField('port-control', config.control_port || '8642');
+  setField('port-pcm', config.pcm_port || '8643');
+  setField('port-relay', config.relay_port || '43770');
+  setField('relay-target', config.relay_target || '');
+  // The stored mode wins; an unset one falls back to whichever side has an
+  // address, so an installation configured before this switch keeps working.
+  const storedMode = String(config.relay_mode || '').trim().toLowerCase();
+  const inferred = storedMode === 'external' || storedMode === 'own'
+    ? storedMode
+    : (String(config.relay_target || '').trim() ? 'external' : 'own');
+  applyRelayMode(inferred);
+  setField('agent-name-input', config.agent_name || '');
+  setField('agent-id-input', config.agent_id || '');
+  setField('apns-key-id', config.apns_key_id || '');
+  setField('apns-team-id', config.apns_team_id || '');
+  setField('apns-bundle-id', config.apns_bundle_id || 'com.eric3u.airsim');
+  const sandbox = document.getElementById('apns-sandbox');
+  if (sandbox) sandbox.checked = String(config.apns_sandbox) === 'true';
+  // A stored key comes back masked, so its textarea stays empty.
+  const p8 = document.getElementById('apns-p8');
+  if (p8) p8.value = '';
+  renderRelayCard();
 }
 
 async function saveAssignment() {
@@ -442,11 +1087,6 @@ async function saveAssignment() {
   try {
     for (const row of state.assignment) {
       if (!row.line_id) throw new Error('有线路未选择');
-    }
-    // Every line shares the same two ports, so equal ports are the one thing
-    // that cannot work: they are checked once, not once per line.
-    if (sharedPorts().control === sharedPorts().pcm) {
-      throw new Error('控制端口与 PCM 端口不能相同');
     }
     // Through the relay, so this page needs nothing but the token it was
     // opened with: Celmux owns the config, and the relay applies it as the
@@ -512,11 +1152,17 @@ function switchTab(name) {
 }
 
 async function refresh() {
-  try { state.agents = (await pluginFetch('/api/status')).agents || []; } catch { state.agents = []; }
+  try {
+    const status = await pluginFetch('/api/status');
+    state.agents = status.agents || [];
+    state.totals = status.totals || {};
+    state.relayCredential = status.relay_credential || {};
+  } catch { state.agents = []; state.totals = {}; }
   try { state.lines = (await pluginFetch('/api/lines')).lines || []; } catch { state.lines = []; }
   try { state.info = await pluginFetch('/api/info'); } catch { state.info = {}; }
   renderHome();
   renderLines();
+  renderPairing();
   renderInfo();
 }
 
@@ -533,7 +1179,31 @@ async function loadConfig() {
 }
 
 document.getElementById('refresh-logs').onclick = loadLogs;
-document.getElementById('save-ports').onclick = () => void savePorts();
+document.getElementById('privacy-toggle').onclick = () => {
+  state.privacyHidden = !state.privacyHidden;
+  applyPrivacy();
+};
+document.getElementById('save-agent').onclick = () => {
+  void saveAgent();
+  void saveAgentPorts();
+};
+document.getElementById('save-relay').onclick = () => void saveRelay();
+for (const button of document.querySelectorAll('.relay-mode')) {
+  button.onclick = () => applyRelayMode(button.dataset.mode);
+}
+document.getElementById('save-port-ui').onclick = () => void savePortUi();
+document.getElementById('open-apns').onclick = openApnsDialog;
+document.getElementById('close-apns').onclick = closeApnsDialog;
+document.getElementById('save-apns').onclick = () => void saveApns();
+document.getElementById('apns-dialog').onclick = (event) => {
+  // Clicking the backdrop closes; clicking inside the dialog must not.
+  if (event.target.id === 'apns-dialog') closeApnsDialog();
+};
+document.getElementById('relay-enabled').onchange = () => {
+  document.getElementById('relay-enabled').dataset.touched = '1';
+};
+document.getElementById('pair-start').onclick = () => void startPairing();
+document.getElementById('pair-forget').onclick = () => void forgetPairing();
 
 (async function init() {
   await loadConfig();

@@ -24,8 +24,15 @@ const LOG_FILE: &str = "airsim.log";
 /// Roll the file once it grows past this. A plugin's lines are short and the
 /// interesting window is a trial run, so this is days of normal use.
 const MAX_BYTES: u64 = 4 * 1024 * 1024;
-/// Keep one previous file, so a roll never loses the run that just happened.
-const PREVIOUS_FILE: &str = "airsim.log.1";
+/// How many days of rolled files to keep.
+///
+/// The log is a diagnostic aid, not an archive: three days covers "it broke
+/// yesterday" and "it has been flaky since Monday", and anything older is a file
+/// nobody opens that slowly fills the reader's flash. Rolled files are named by
+/// date, so this is enforced by comparing names rather than by counting files.
+const KEPT_DAYS: u32 = 3;
+/// The prefix a rolled file carries: `airsim.log.<YYYY-MM-DD>`.
+const ROLLED_PREFIX: &str = "airsim.log.";
 
 static SINK: OnceLock<Mutex<Sink>> = OnceLock::new();
 static LEVEL: OnceLock<Level> = OnceLock::new();
@@ -95,6 +102,9 @@ pub fn init(root: &Path, level: Level) -> Option<PathBuf> {
         .map(|metadata| metadata.len())
         .unwrap_or(0);
     let opened = file.is_some();
+    // Pruned at startup as well as at roll: a gateway that never reaches the size
+    // limit would otherwise keep every rolled file forever.
+    prune(&path);
     let _ = SINK.set(Mutex::new(Sink {
         file,
         path: path.clone(),
@@ -154,15 +164,99 @@ pub fn write(level: Level, message: &str) {
 }
 
 /// Move the current file aside and start a new one.
+///
+/// The rolled name is the date the file was closed, so pruning is a name
+/// comparison and needs no index of its own. A name that collides - two rolls in
+/// one day - gets a counter suffix rather than overwriting the earlier file.
 fn roll(sink: &mut Sink) {
-    let previous = sink.path.with_file_name(PREVIOUS_FILE);
-    let _ = std::fs::rename(&sink.path, &previous);
+    let stamp = date_stamp();
+    let mut target = sink.path.with_file_name(format!("{ROLLED_PREFIX}{stamp}"));
+    let mut suffix = 1;
+    while target.exists() {
+        target = sink.path.with_file_name(format!("{ROLLED_PREFIX}{stamp}.{suffix}"));
+        suffix += 1;
+        if suffix > 99 {
+            break;
+        }
+    }
+    let _ = std::fs::rename(&sink.path, &target);
     sink.file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(&sink.path)
         .ok();
     sink.written = 0;
+    prune(&sink.path);
+}
+
+/// Delete rolled files older than [`KEPT_DAYS`].
+///
+/// Compared as dates, not as file ages: a rolled file keeps the timestamp it was
+/// written at, and a filesystem that does not carry mtimes (or a copied file that
+/// lost one) would otherwise keep everything or delete the wrong thing.
+fn prune(current: &Path) {
+    let Some(directory) = current.parent() else {
+        return;
+    };
+    let today = today_days();
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(rest) = name.strip_prefix(ROLLED_PREFIX) else {
+            continue;
+        };
+        // `YYYY-MM-DD`, optionally with a `.N` collision suffix.
+        let Some(stamp) = rest.split('.').next() else {
+            continue;
+        };
+        let Some(days) = days_from_stamp(stamp) else {
+            continue;
+        };
+        if today.saturating_sub(days) > KEPT_DAYS as i64 {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// `YYYY-MM-DD` for right now, UTC.
+fn date_stamp() -> String {
+    let (year, month, day) = civil_from_days(today_days());
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+/// Days since the Unix epoch, UTC.
+fn today_days() -> i64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    (now / 86_400) as i64
+}
+
+/// Parse a `YYYY-MM-DD` stamp back into days since the epoch.
+fn days_from_stamp(stamp: &str) -> Option<i64> {
+    let mut parts = stamp.split('-');
+    let year: i64 = parts.next()?.parse().ok()?;
+    let month: u32 = parts.next()?.parse().ok()?;
+    let day: u32 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    Some(days_from_civil(year, month, day))
+}
+
+/// Days since the Unix epoch for a calendar date. The inverse of
+/// [`civil_from_days`], and the same algorithm.
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let yoe = (year - era * 400) as u64;
+    let month = month as u64;
+    let doy = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day as u64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe as i64 - 719_468
 }
 
 /// `YYYY-MM-DD HH:MM:SS`, UTC, without pulling in a date library.

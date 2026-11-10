@@ -53,16 +53,22 @@ impl Revision {
 
     /// Wait until the revision passes `after`, or `timeout` expires.
     ///
-    /// Returns the revision to report. A poll that arrives with a revision ahead
-    /// of ours - the app's clock ran faster, or the plugin restarted - is answered
-    /// immediately rather than held for the full timeout, because the app is
-    /// already waiting for a number it will never see.
+    /// Returns the revision to report.
+    ///
+    /// An `after` ahead of ours is *not* a reason to answer at once. The app starts
+    /// from `AgentEventCursor.initial`, which is `u64::MAX` - a sentinel meaning
+    /// "I have no position yet", not a timestamp. Answering such a poll immediately
+    /// (the old behaviour) meant every long poll returned within a millisecond,
+    /// carrying `active: null`, so the app spun as fast as the network allowed and
+    /// a ringing call could only be seen if it happened to exist at the exact
+    /// moment of one of those answers. Treating it as "unknown, so from now on" is
+    /// what lets the first poll actually wait for the ring.
     pub fn wait_past(&self, after: u64, timeout: Duration) -> u64 {
         let timeout = timeout.min(MAX_HOLD);
         let start = self.now();
-        if after > start {
-            return start;
-        }
+        // A position ahead of us is a sentinel or a restart, never a real reading:
+        // wait from here. A position behind ours is a real reading with news
+        // waiting, so it answers at once - that is the point of the revision.
         if start > after {
             return start;
         }
@@ -70,10 +76,14 @@ impl Revision {
         // Polled rather than driven by a condvar: a change can come from a thread
         // that must not block on this lock, and a 50ms tick is far below the
         // latency the app can perceive.
+        //
+        // Compared against `start`, not `after`. `after` may be a sentinel that
+        // never equals a real timestamp, so testing `current != after` returned on
+        // the first tick - a long poll that lasted 50ms and then spun.
         while Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(50));
             let current = self.now();
-            if current != after {
+            if current != start {
                 return current;
             }
         }
@@ -155,4 +165,35 @@ mod tests {
         let requested = Duration::from_secs(31_536_000);
         assert_eq!(requested.min(MAX_HOLD), MAX_HOLD);
     }
+    /// A poll asking from `u64::MAX` waits; it does not answer at once.
+    ///
+    /// That value is the app's "no position yet" sentinel. Answering immediately
+    /// turned every long poll into a sub-millisecond return, so the app spun and an
+    /// incoming call was only ever visible by luck.
+    #[test]
+    fn a_poll_from_the_future_sentinel_waits_instead_of_answering_at_once() {
+        let revision = Revision::default();
+        let started = Instant::now();
+        let answered = revision.wait_past(u64::MAX, Duration::from_millis(300));
+        assert!(
+            started.elapsed() >= Duration::from_millis(250),
+            "哨兵值必须挂起等待，不能立刻返回（实际 {:?}）",
+            started.elapsed()
+        );
+        assert_eq!(answered, revision.now());
+    }
+
+    /// A poll already behind the current revision answers at once: there is news.
+    #[test]
+    fn a_poll_behind_the_revision_answers_at_once() {
+        let revision = Revision::default();
+        let started = Instant::now();
+        revision.wait_past(0, Duration::from_secs(5));
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "已知落后于当前 revision 时应当立刻返回（实际 {:?}）",
+            started.elapsed()
+        );
+    }
+
 }

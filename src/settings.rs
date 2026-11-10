@@ -9,7 +9,8 @@
 //! endpoints directly. It is the only listener the operator configures, and the
 //! only one with a stable port: agent ports move with the assignment.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -28,6 +29,10 @@ const PAIRING_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// The key the assignment is stored under in Celmux's plugin configuration.
 const ASSIGNMENT_KEY: &str = "agents";
+/// The display name, stored apart from the line list.
+const AGENT_NAME_KEY: &str = "agent_name";
+/// The credential id, stored apart from the line list.
+const AGENT_ID_KEY: &str = "agent_id";
 
 /// One line the operator assigned to an agent.
 #[derive(Debug, Clone, Deserialize)]
@@ -50,16 +55,28 @@ struct AssignedLine {
 /// need a schema for a plugin's own structure.
 pub fn load_assignment(client: &Client) -> Result<Vec<AgentConfig>, String> {
     let value = client.config().map_err(|error| error.to_string())?;
-    let raw = value
-        .get("config")
+    let config = value.get("config");
+    let read = |key: &str| -> String {
+        config
+            .and_then(|config| config.get(key))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_owned()
+    };
+    // The identity is its own configuration, not part of the line list: the list
+    // is the operator's ordering of lines, and folding a name into it would make
+    // renaming the agent rewrite every row.
+    let identity = (read(AGENT_NAME_KEY), read(AGENT_ID_KEY));
+    let raw = config
         .and_then(|config| config.get(ASSIGNMENT_KEY))
         .and_then(Value::as_str)
         .unwrap_or("");
-    parse_assignment(raw)
+    parse_assignment(raw, identity)
 }
 
 /// Parse the stored assignment, tolerating an empty value.
-fn parse_assignment(raw: &str) -> Result<Vec<AgentConfig>, String> {
+fn parse_assignment(raw: &str, identity: (String, String)) -> Result<Vec<AgentConfig>, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Ok(Vec::new());
@@ -73,10 +90,13 @@ fn parse_assignment(raw: &str) -> Result<Vec<AgentConfig>, String> {
         .map(|line| line.line_id.trim().to_owned())
         .filter(|line_id| !line_id.is_empty())
         .collect();
+    let (name, id) = identity;
     if lines.is_empty() {
+        // No lines is no agent, but the operator may still have set a name before
+        // assigning any: keeping it means the page shows what they typed.
         return Ok(Vec::new());
     }
-    Ok(vec![AgentConfig { lines }])
+    Ok(vec![AgentConfig { lines, name, id }])
 }
 
 /// Route one request on the settings listener.
@@ -88,22 +108,30 @@ pub fn handle(
     >,
     host: &str,
     ports: &crate::control::Ports,
+    relay_state: &Arc<crate::relay::State>,
     request: Request,
 ) -> Response {
     match (request.method.as_str(), request.path.as_str()) {
-        ("GET", "/api/status") => status(fleet, host, ports),
+        ("GET", "/api/status") => status(fleet, client, host, ports, relay_state),
         ("POST", "/api/pair") => open_pairing(fleet, advertisements, &request),
         ("POST", "/api/unpair") => unpair(fleet, &request),
-        ("GET", "/api/lines") => lines(fleet, client, ports),
+        ("GET", "/api/lines") => lines(fleet, client),
         ("GET", "/api/logs") => logs(&request),
         ("GET", "/api/config") => config_read(client),
+        ("GET", "/api/relay/devices") => relay_devices(relay_state),
         ("GET", "/api/info") => info_page(),
         _ => Response::error(404, "Not Found", "not_found", "接口不存在"),
     }
 }
 
 /// What the page shows: every agent, whether it is paired, and where it listens.
-fn status(fleet: &Arc<Fleet>, host: &str, ports: &crate::control::Ports) -> Response {
+fn status(
+    fleet: &Arc<Fleet>,
+    client: &Arc<Client>,
+    host: &str,
+    ports: &crate::control::Ports,
+    relay_state: &Arc<crate::relay::State>,
+) -> Response {
     let agents: Vec<Value> = fleet
         .list()
         .into_iter()
@@ -125,10 +153,128 @@ fn status(fleet: &Arc<Fleet>, host: &str, ports: &crate::control::Ports) -> Resp
     Response::ok(json!({
         "ok": true,
         "host": host,
+        // Whether the phone's own relay credential was captured at pairing. The
+        // external mode cannot sign an event without it, and the operator cannot
+        // supply it, so the page has to say whether it is there.
+        "relay_credential": relay_state.phone_relay().map(|relay| json!({
+            "device_id": relay.device_id,
+            "relay_url": relay.relay_url,
+            "present": true,
+        })).unwrap_or_else(|| json!({"present": false})),
         "plugin_port": crate::config::DEFAULT_PORT,
         "agents": agents,
+        // What the home page counts. Built here rather than from three requests
+        // in the page, so the numbers describe one moment instead of three.
+        "totals": totals(fleet, client),
     }))
 }
+
+/// The counts the home page shows.
+///
+/// Every line the operator exposed is asked for its messages, and the calls come
+/// from Celmux's one call list. A line that cannot be reached is left out of the
+/// count rather than failing the whole document: the page is a status view, and
+/// one unreachable reader should not blank it.
+fn totals(fleet: &Arc<Fleet>, client: &Arc<Client>) -> Value {
+    // Only the lines the operator exposed: the page describes what the phone can
+    // reach, not everything the readers happen to hold.
+    let assigned: Vec<String> = fleet
+        .list()
+        .into_iter()
+        .flat_map(|agent| agent.config.lines.clone())
+        .collect();
+    let lines: Vec<crate::celmux::Line> = client
+        .lines()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|line| assigned.contains(&line.line_id))
+        .collect();
+    let mut sent = 0_u64;
+    let mut received = 0_u64;
+    for line in &lines {
+        let Ok(value) = client.messages(&line.line_id) else {
+            continue;
+        };
+        for message in value
+            .get("messages")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            match message.get("direction").and_then(Value::as_str) {
+                Some("outgoing") => sent += 1,
+                Some("incoming") => received += 1,
+                _ => {}
+            }
+        }
+    }
+    let calls = client.calls().unwrap_or(Value::Null);
+    let rows: Vec<&Value> = calls
+        .get("calls")
+        .and_then(Value::as_array)
+        .map(|rows| rows.iter().collect())
+        .unwrap_or_default();
+    let outgoing_calls = rows
+        .iter()
+        .filter(|row| row.get("direction").and_then(Value::as_str) == Some("outgoing"))
+        .count();
+    let incoming_calls = rows
+        .iter()
+        .filter(|row| row.get("direction").and_then(Value::as_str) == Some("incoming"))
+        .count();
+    // Everything the readers hold, not just what was exposed: the home page
+    // separates "lines this gateway knows about" from "lines the phone can use".
+    let known = client.lines().map(|rows| rows.len()).unwrap_or(0);
+    json!({
+        "lines": known,
+        "lines_callable": lines.iter().filter(|line| line.usable()).count(),
+        "lines_exposed": lines.len(),
+        "sms_sent": sent,
+        "sms_received": received,
+        "calls_outgoing": outgoing_calls,
+        "calls_incoming": incoming_calls,
+        "uptime_seconds": uptime_seconds(),
+        "memory_kb": memory_kb(),
+        "threads": threads(),
+    })
+}
+
+/// How long this process has been running, in seconds.
+fn uptime_seconds() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_secs()
+}
+
+/// Resident memory in kilobytes, read from the process itself.
+///
+/// `/proc/self/status` is the only source that needs no dependency and no
+/// syscall wrapper, and this runs on Linux only.
+fn memory_kb() -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            status
+                .lines()
+                .find(|line| line.starts_with("VmRSS:"))
+                .and_then(|line| line.split_whitespace().nth(1).and_then(|value| value.parse().ok()))
+        })
+        .unwrap_or(0)
+}
+
+/// How many threads this process has.
+fn threads() -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            status
+                .lines()
+                .find(|line| line.starts_with("Threads:"))
+                .and_then(|line| line.split_whitespace().nth(1).and_then(|value| value.parse().ok()))
+        })
+        .unwrap_or(0)
+}
+
+
 
 #[derive(Deserialize)]
 struct PairRequest {
@@ -226,7 +372,7 @@ fn unpair(fleet: &Arc<Fleet>, request: &Request) -> Response {
 /// to expose needs to know which module carries it and whether its voice route
 /// is actually up. Celmux keeps those two facts in two routes, so they are
 /// joined here rather than by the page.
-fn lines(fleet: &Arc<Fleet>, client: &Arc<Client>, ports: &crate::control::Ports) -> Response {
+fn lines(fleet: &Arc<Fleet>, client: &Arc<Client>) -> Response {
     let lines = match client.lines() {
         Ok(lines) => lines,
         Err(error) => {
@@ -246,20 +392,12 @@ fn lines(fleet: &Arc<Fleet>, client: &Arc<Client>, ports: &crate::control::Ports
             let module = by_id.get(device);
             // Whether the operator exposed this line. There is one agent, so
             // the question is membership rather than which agent.
-            let agent = agents
+            // Whether this line is exposed at all. Pairing and the ports belong
+            // to the installation, so they are reported once at the top of the
+            // page rather than repeated on every card.
+            let exposed = agents
                 .iter()
-                .find(|agent| agent.config.lines.contains(&line.line_id))
-                .map(|agent| {
-                    json!({
-                        "agent_id": agent.id(),
-                        // This row already carries the line's own parts, so the
-                        // name is built from them rather than fetched again.
-                        "name": line.card_name(),
-                        "control_port": ports.control,
-                        "pcm_port": ports.pcm,
-                        "paired": agent.paired(),
-                    })
-                });
+                .any(|agent| agent.config.lines.contains(&line.line_id));
             json!({
                 "line_id": line.line_id,
                 "device_id": device,
@@ -301,7 +439,7 @@ fn lines(fleet: &Arc<Fleet>, client: &Arc<Client>, ports: &crate::control::Ports
                     .and_then(|device| device.modem.as_ref())
                     .and_then(|modem| modem.model.clone())
                     .unwrap_or_default(),
-                "agent": agent,
+                "exposed": exposed,
             })
         })
         .collect();
@@ -313,6 +451,21 @@ fn lines(fleet: &Arc<Fleet>, client: &Arc<Client>, ports: &crate::control::Ports
 /// Read through the plugin token rather than from the environment: the page has
 /// to show what the operator saved, and the environment the process started with
 /// may predate the last save.
+/// Which devices this relay knows, and which one it signs as.
+///
+/// Read-only: registration is open to any phone whose credential it can present,
+/// exactly as the upstream relay works, so there is no list to edit. Saying so on
+/// the page is more honest than offering an approval switch that no longer gates
+/// anything.
+fn relay_devices(state: &Arc<crate::relay::State>) -> Response {
+    Response::ok(json!({
+        "ok": true,
+        "devices": state.devices(),
+        "acting": state.credentials().map(|(id, _)| id).unwrap_or_default(),
+        "push": state.voip_token().is_some(),
+    }))
+}
+
 fn config_read(client: &Arc<Client>) -> Response {
     match client.config() {
         Ok(value) => Response::ok(json!({
@@ -375,8 +528,8 @@ mod tests {
     /// agents yet, and the operator picks lines in the page.
     #[test]
     fn an_empty_assignment_yields_no_agents() {
-        assert!(parse_assignment("").unwrap().is_empty());
-        assert!(parse_assignment("   ").unwrap().is_empty());
+        assert!(parse_assignment("", Default::default()).unwrap().is_empty());
+        assert!(parse_assignment("   ", Default::default()).unwrap().is_empty());
     }
 
     /// The assignment is one JSON field in Celmux's config, so it has to parse
@@ -387,6 +540,7 @@ mod tests {
         let agents = parse_assignment(
             r#"[{"line_id":"dji1","control_port":8642,"pcm_port":8643},
                 {"line_id":"读卡器1#8904","name":"Globe","control_port":8652,"pcm_port":8653}]"#,
+            Default::default(),
         )
         .unwrap();
         assert_eq!(agents.len(), 1, "只有一个 agent");
@@ -399,6 +553,7 @@ mod tests {
         let agents = parse_assignment(
             r#"[{"line_id":"","control_port":8642,"pcm_port":8643},
                 {"line_id":"dji1","control_port":8644,"pcm_port":8645}]"#,
+            Default::default(),
         )
         .unwrap();
         assert_eq!(agents.len(), 1);
@@ -407,7 +562,7 @@ mod tests {
 
     #[test]
     fn a_malformed_assignment_names_the_problem() {
-        let error = parse_assignment("not json").unwrap_err();
+        let error = parse_assignment("not json", Default::default()).unwrap_err();
         assert!(error.contains("JSON"));
     }
 

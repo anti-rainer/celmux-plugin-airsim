@@ -24,6 +24,8 @@ const FILE: &str = "paired-secrets";
 
 pub struct Store {
     path: PathBuf,
+    /// The relay credential file, beside the pairing secrets.
+    relay_path: PathBuf,
 }
 
 impl Store {
@@ -31,6 +33,7 @@ impl Store {
     pub fn new(root: &Path) -> Self {
         Self {
             path: root.join(FILE),
+            relay_path: root.join("relay-credentials"),
         }
     }
 
@@ -101,6 +104,74 @@ impl Store {
         }
         std::fs::rename(&temporary, &self.path)
             .map_err(|error| format!("无法保存配对密钥: {error}"))
+    }
+
+    /// Write the phone's relay credential, `0600`, replacing any previous one.
+    ///
+    /// Three fields on one line: the device id, the secret, and the relay it
+    /// belongs to. A credential is only valid for the relay that issued it, so
+    /// the third field is what stops a leftover from being presented to a new
+    /// endpoint and being refused for reasons nothing on screen explains.
+    pub fn save_relay(&self, id: &str, relay: &crate::agents::RelayCredentials) -> Result<(), String> {
+        let mut lines: Vec<String> = Vec::new();
+        if let Ok(text) = std::fs::read_to_string(&self.relay_path) {
+            for line in text.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') || line.starts_with(&format!("{id} ")) {
+                    continue;
+                }
+                lines.push(line.to_owned());
+            }
+        }
+        lines.push(format!(
+            "{} {} {} {}",
+            id, relay.device_id, relay.device_secret, relay.relay_url
+        ));
+        let text = format!(
+            "# AirSIM relay credentials. One line per agent: id, device id, device secret, relay.\n{}\n",
+            lines.join("\n")
+        );
+        let temporary = self.relay_path.with_extension("tmp");
+        {
+            let mut file = std::fs::File::create(&temporary)
+                .map_err(|error| format!("无法写入 relay 凭据: {error}"))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+            }
+            file.write_all(text.as_bytes())
+                .map_err(|error| format!("无法写入 relay 凭据: {error}"))?;
+        }
+        std::fs::rename(&temporary, &self.relay_path)
+            .map_err(|error| format!("无法保存 relay 凭据: {error}"))
+    }
+
+    /// Read back what was stored for one agent.
+    pub fn load_relay(&self, id: &str) -> Option<crate::agents::RelayCredentials> {
+        let text = std::fs::read_to_string(&self.relay_path).ok()?;
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let mut fields = line.splitn(4, ' ');
+            if fields.next() != Some(id) {
+                continue;
+            }
+            let device_id = fields.next().unwrap_or("").to_owned();
+            let device_secret = fields.next().unwrap_or("").to_owned();
+            let relay_url = fields.next().unwrap_or("").to_owned();
+            if device_id.is_empty() || device_secret.is_empty() {
+                return None;
+            }
+            return Some(crate::agents::RelayCredentials {
+                device_id,
+                device_secret,
+                relay_url,
+            });
+        }
+        None
     }
 
     /// Forget one agent's secret, so its next pairing starts clean.

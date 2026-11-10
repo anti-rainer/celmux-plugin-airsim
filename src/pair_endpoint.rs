@@ -190,6 +190,24 @@ fn claim(agent: &Arc<Agent>, ports: &crate::control::Ports, request: &Request) -
     // time the plugin restarts, which is every config save and every upgrade.
     agent.persist_secret();
     agent.close_pairing();
+    // The phone's relay credential arrives once, here, and never again: it is
+    // generated on the phone and registered with whatever relay the phone was
+    // pointed at. Keeping it is what lets an external-relay installation sign its
+    // events without the operator copying a secret by hand - and without this,
+    // the external mode has nothing to authenticate with at all.
+    if let Some(device_secret) = registration.device_secret.clone() {
+        agent.set_relay_credentials(
+            registration.device_id.clone(),
+            device_secret,
+            registration.relay_url.clone().unwrap_or_default(),
+        );
+        agent.persist_relay_credentials();
+        crate::log_info!(
+            "celmux-plugin-airsim: 已保存手机的 relay 凭据 device={} relay={}",
+            if registration.device_id.is_empty() { "?" } else { &registration.device_id },
+            registration.relay_url.as_deref().unwrap_or("本机")
+        );
+    }
     let proof = pairing::route_proof(
         &secret,
         session_id,
@@ -258,6 +276,7 @@ mod tests {
         Arc::new(Agent::new(
             AgentConfig {
                 lines: vec!["dji1".to_owned()],
+                ..Default::default()
             },
             None,
         ))

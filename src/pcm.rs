@@ -38,12 +38,25 @@ use crate::celmux::Client;
 pub const CLIENT_HELLO_PREFIX: &str = "AIRSIMVWL1 ";
 /// What the client waits for before it sends frames.
 pub const SERVER_READY: &[u8] = b"AIRSIMREADY";
+
+/// The longest handshake line accepted.
+///
+/// The reference form is `AIRSIMVWL1 <ts> <nonce> <signature>`, well under 200
+/// bytes. A peer that sends more than this is not sending a handshake, and
+/// reading until it stops would hold the connection open for it to say anything.
+const MAX_HELLO_BYTES: usize = 1024;
 /// 320 bytes: 160 samples at 8 kHz, 20 ms.
 pub const FRAME_BYTES: usize = 320;
 /// 20 ms, which is what paces both directions.
 pub const FRAME_INTERVAL: Duration = Duration::from_millis(20);
 /// The rate both ends speak. Celmux resamples to the carrier's own clock.
 pub const SAMPLE_RATE: u32 = 8_000;
+/// How long to keep retrying the audio wire while Celmux has no call to bind.
+///
+/// A dial takes a moment to become visible on Celmux's side, and the phone's
+/// audio arrives before that. Long enough to cover the race, short enough that a
+/// plugin with no call does not hold a thread for the length of a call.
+const WIRE_BIND_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Accept PCM connections until the listener closes.
 ///
@@ -54,7 +67,9 @@ pub const SAMPLE_RATE: u32 = 8_000;
 /// carries.
 pub fn serve_shared(listener: TcpListener, client: Arc<Client>, fleet: Arc<Fleet>) {
     for stream in listener.incoming() {
-        let Ok(stream) = stream else { continue };
+        let Ok(stream) = stream else {
+            continue;
+        };
         let client = Arc::clone(&client);
         let fleet = Arc::clone(&fleet);
         std::thread::spawn(move || {
@@ -74,13 +89,38 @@ fn handle_shared(mut stream: TcpStream, client: Arc<Client>, fleet: Arc<Fleet>) 
         .map(|address| address.to_string())
         .unwrap_or_else(|_| "?".to_owned());
 
+    // Logged before the handshake: "no connection at all" and "a connection that
+    // failed its handshake" are different problems, and from the phone both look
+    // like audio that never starts.
+    crate::log_info!("celmux-plugin-airsim: PCM 连接建立 {peer}，等待握手");
     let mut hello = String::new();
     {
-        use std::io::BufRead;
-        let mut reader = std::io::BufReader::new(&stream);
-        if let Err(error) = reader.read_line(&mut hello) {
-            crate::log_warn!("celmux-plugin-airsim: PCM 握手读取失败（{peer}）: {error}");
-            return Ok(());
+        // Read exactly one line, one byte at a time. A buffered reader would also
+        // pull in whatever arrived right behind the handshake, and those bytes -
+        // the phone's first audio frames - have no way back into the socket.
+        use std::io::Read as _;
+        let mut byte = [0_u8; 1];
+        loop {
+            match stream.read(&mut byte) {
+                Ok(0) => {
+                    crate::log_warn!("celmux-plugin-airsim: PCM 对方关闭连接，未发送握手（{peer}）");
+                    return Ok(());
+                }
+                Ok(_) => {
+                    if byte[0] == b'\n' {
+                        break;
+                    }
+                    hello.push(byte[0] as char);
+                    if hello.len() > MAX_HELLO_BYTES {
+                        crate::log_warn!("celmux-plugin-airsim: PCM 握手过长，已拒绝（{peer}）");
+                        return Ok(());
+                    }
+                }
+                Err(error) => {
+                    crate::log_warn!("celmux-plugin-airsim: PCM 握手读取失败（{peer}）: {error}");
+                    return Ok(());
+                }
+            }
         }
     }
     let Some(agent) = handshake_line(&fleet, hello.trim_end()) else {
@@ -93,6 +133,12 @@ fn handle_shared(mut stream: TcpStream, client: Arc<Client>, fleet: Arc<Fleet>) 
     );
     stream.write_all(SERVER_READY)?;
     stream.flush()?;
+    // The handshake timeouts above exist for the handshake only. Leaving them on
+    // the call would end the audio the first time either side went quiet for two
+    // seconds - which a real conversation does constantly, and which reads as
+    // Celmux hanging up on a call nobody dropped.
+    stream.set_read_timeout(None)?;
+    stream.set_write_timeout(None)?;
     bridge(stream, client, agent)
 }
 
@@ -111,32 +157,108 @@ fn handshake_line(fleet: &Fleet, hello: &str) -> Option<Arc<Agent>> {
 /// phone on the same port names a different line, and therefore a different
 /// call - which is why the port can be shared at all.
 fn bridge(stream: TcpStream, client: Arc<Client>, agent: Arc<Agent>) -> std::io::Result<()> {
-    // Audio is per call, not per device: two slots can be on two calls at once,
-    // so this socket follows whichever exposed line is on a call, and gives up
-    // when none is. The handshake identified the device; the call identifies the
-    // card.
-    let Some((line, call_id)) = agent.active_call(&client) else {
-        crate::log_warn!(
-            "celmux-plugin-airsim: agent {} 没有进行中的通话，PCM 连接结束",
-            agent.id()
-        );
-        return Ok(());
+    // The phone decides when to open audio, and it can only do that once, at the
+    // moment the call needs sound. Turning it away because the call is not
+    // visible yet leaves it retrying and the first seconds of speech with nowhere
+    // to go - which is what a handshake that waits for `active` does. The wire to
+    // Celmux is therefore opened here too, and Celmux names the call it bound.
+    //
+    // Audio is still per call: whichever exposed line is on a call carries this
+    // socket, and the line the handshake named is the only one considered.
+    let wire = match connect_wire(&client, &agent) {
+        Ok(wire) => wire,
+        Err(error) => {
+            crate::log_warn!("celmux-plugin-airsim: PCM 音频通道不可用: {error}");
+            return Ok(());
+        }
     };
-
-    let read_half = stream.try_clone()?;
-    let reader = {
-        let client = Arc::clone(&client);
-        let line_id = line.clone();
-        std::thread::spawn(move || read_loop(read_half, client, Some(call_id), line_id))
+    let (upstream_reader, upstream_writer, call_id) = match wire.split() {
+        Ok(parts) => parts,
+        Err(error) => {
+            crate::log_warn!("celmux-plugin-airsim: PCM 音频通道拆分失败: {error}");
+            return Ok(());
+        }
     };
-    let writer = {
-        let client = Arc::clone(&client);
-        std::thread::spawn(move || write_loop(stream, client, Some(call_id), line))
-    };
-    // Either direction ending means the call is over for this client.
-    let _ = reader.join();
-    let _ = writer.join();
+    crate::log_info!("celmux-plugin-airsim: PCM 音频已对接通话 {call_id}");
+    let phone_reader = stream.try_clone()?;
+    // Either direction ending ends the bridge. Joining both would leave the other
+    // blocked on a read that has nothing left to read, so the socket is shut down
+    // once the first one returns - which is what makes the phone's own hang-up
+    // and Celmux's end of the call both take effect immediately.
+    let phone_writer = stream.try_clone()?;
+    let upstream_shutdown = upstream_reader.try_clone();
+    // Phone -> Celmux.
+    let upload = std::thread::spawn(move || {
+        copy_frames(phone_reader, upstream_writer);
+        let _ = phone_writer.shutdown(std::net::Shutdown::Both);
+    });
+    // Celmux -> phone.
+    let download = std::thread::spawn(move || {
+        copy_frames(upstream_reader, stream);
+        if let Ok(handle) = upstream_shutdown {
+            let _ = handle.shutdown(std::net::Shutdown::Both);
+        }
+    });
+    let _ = upload.join();
+    let _ = download.join();
     Ok(())
+}
+
+/// Open the wire, retrying while Celmux has no call to bind yet.
+///
+/// A dial takes a moment to become visible on Celmux's side, and the phone's
+/// audio arrives before that. Retrying is what keeps that race from costing the
+/// greeting.
+fn connect_wire(client: &Arc<Client>, agent: &Arc<Agent>) -> Result<crate::audio_wire::Wire, String> {
+    let address = client.audio_wire_address()?;
+    let plugin_id = client.plugin_id();
+    let token = client.token();
+    // Every line this agent exposes, tried in order: which of them is on a call
+    // is Celmux's answer to give, not this side's to assume.
+    let lines = agent.lines();
+    if lines.is_empty() {
+        return Err("插件没有配置任何线路".to_owned());
+    }
+    let deadline = std::time::Instant::now() + WIRE_BIND_TIMEOUT;
+    loop {
+        for line in &lines {
+            match crate::audio_wire::Wire::connect(&address, plugin_id, token, line) {
+                Ok(Some(wire)) => return Ok(wire),
+                // Celmux is up and this line has no call to bind yet.
+                Ok(None) => {}
+                Err(crate::audio_wire::Error::Refused(detail)) => {
+                    return Err(detail);
+                }
+                Err(error) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(error.to_string());
+                    }
+                }
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("等待 Celmux 绑定通话超时".to_owned());
+        }
+        std::thread::sleep(FRAME_INTERVAL);
+    }
+}
+
+/// Move whole 320-byte blocks from one socket to the other.
+///
+/// Both ends of this bridge speak the same framing, so no conversion belongs
+/// here: a block read is a block written, and anything that re-frames it would be
+/// the thing that makes the audio uneven.
+fn copy_frames(mut from: TcpStream, mut to: TcpStream) {
+    let mut frame = vec![0_u8; FRAME_BYTES];
+    loop {
+        if from.read_exact(&mut frame).is_err() {
+            return;
+        }
+        if to.write_all(&frame).is_err() {
+            return;
+        }
+        let _ = to.flush();
+    }
 }
 
 /// Check the handshake's signature against the secret the phone paired with.
@@ -162,69 +284,6 @@ fn verify_handshake(agent: &Arc<Agent>, hello: &str) -> bool {
     crate::auth::signature_matches(&secret, "PCM", "/v1/pcm", b"", timestamp, nonce, signature)
 }
 
-/// Phone -> Celmux: 320-byte frames in, resampled by Celmux on the way out.
-fn read_loop(mut stream: TcpStream, client: Arc<Client>, call_id: Option<u64>, line_id: String) {
-    let mut frame = vec![0_u8; FRAME_BYTES];
-    loop {
-        match stream.read_exact(&mut frame) {
-            Ok(()) => {}
-            // A read timeout is not an error here: it is what lets the loop
-            // notice a call that ended while the phone stayed connected.
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                if !client.call_still_active(&line_id, call_id) {
-                    return;
-                }
-                continue;
-            }
-            Err(_) => return,
-        }
-        let Some(call_id) = call_id else { continue };
-        // One failed upload must not end the call: the carrier may be between
-        // media states, and the next frame can succeed.
-        let _ = client.push_audio(call_id, &frame);
-    }
-}
-
-/// Celmux -> phone: pull a block, pace it to 20 ms, write it.
-fn write_loop(mut stream: TcpStream, client: Arc<Client>, call_id: Option<u64>, line_id: String) {
-    loop {
-        let Some(call_id) = call_id else {
-            std::thread::sleep(FRAME_INTERVAL);
-            if !client.call_still_active(&line_id, None) {
-                return;
-            }
-            continue;
-        };
-        match client.pull_audio(call_id) {
-            Ok(Some(frame)) => {
-                // The gateway frame is fixed at 320 bytes; a short block is
-                // padded with silence so the client's framing never shifts.
-                let mut out = vec![0_u8; FRAME_BYTES];
-                let take = frame.len().min(FRAME_BYTES);
-                out[..take].copy_from_slice(&frame[..take]);
-                if stream.write_all(&out).is_err() {
-                    return;
-                }
-                let _ = stream.flush();
-            }
-            // Nothing from the carrier yet. Sleeping one frame keeps this loop
-            // from spinning against Celmux while an idle call holds the line.
-            Ok(None) => std::thread::sleep(FRAME_INTERVAL),
-            Err(_) => {
-                if !client.call_still_active(&line_id, Some(call_id)) {
-                    return;
-                }
-                std::thread::sleep(FRAME_INTERVAL);
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod handshake_tests {
     use super::*;
@@ -234,6 +293,7 @@ mod handshake_tests {
         Arc::new(Agent::new(
             AgentConfig {
                 lines: vec!["读卡器1".to_owned()],
+                ..Default::default()
             },
             secret,
         ))

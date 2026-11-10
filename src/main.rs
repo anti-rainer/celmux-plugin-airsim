@@ -19,6 +19,9 @@
 //! ```
 
 mod agents;
+mod apns;
+mod apns_http;
+mod audio_wire;
 mod auth;
 mod celmux;
 mod config;
@@ -31,6 +34,9 @@ mod pair_endpoint;
 mod pair_probe;
 mod pairing;
 mod pcm;
+mod relay;
+mod relay_agent;
+mod relay_endpoint;
 mod revision;
 mod secrets;
 mod settings;
@@ -73,6 +79,7 @@ fn main() {
         config.celmux_url.clone(),
         config.celmux_token.clone(),
         config::PLUGIN_ID.to_owned(),
+        config.audio_url.clone(),
     ));
     // Fail loudly at startup rather than on the first dial: a wrong token means
     // every call the phone places fails, and the operator would have no clue
@@ -119,12 +126,56 @@ fn main() {
         }
     }
 
+    // The cloud path gets a listener of its own. It is the only one an operator
+    // is expected to put behind a public reverse proxy, and the settings routes -
+    // pairing, logs, configuration - must not travel with it: a proxy opened for
+    // the relay would otherwise expose all of them to the internet.
+    let relay_context = Arc::new(relay_endpoint::Context {
+        state: Arc::new(relay::State::persistent(&root)),
+        agent: Arc::new(relay_agent::Agent::new(
+            relay_agent::Target::from_mode(&config.relay_mode, &config.relay_target, config.relay_port),
+            relay_agent::Credentials {
+                // The phone's credentials are what a relay authenticates an event
+                // with. When this process is the relay it registered that phone
+                // itself and these are adopted from that registration; an external
+                // relay needs the pair the phone registered there with, which
+                // arrives in the pairing claim. A manually configured pair is the
+                // last resort, for a phone paired before this was captured.
+                device_id: config.relay_device_id.clone(),
+                device_secret: config.relay_device_secret.clone(),
+            },
+            "celmux",
+        )),
+        // Built even when the cloud path is off, so the settings page can report
+        // why pushes would not work rather than showing nothing.
+        pusher: Arc::new(apns::Pusher::new(
+            &config.apns_p8,
+            &config.apns_key_id,
+            &config.apns_team_id,
+            &config.apns_bundle_id,
+            config.apns_sandbox,
+        )),
+        client: Arc::clone(&client),
+        agent_id: fleet
+            .list()
+            .first()
+            .map(|agent| agent.id())
+            .unwrap_or_else(|| "celmux".to_owned()),
+        pcm_port: config.pcm_port,
+        plugin_version: relay::VERSION.to_owned(),
+        default_line: fleet
+            .list()
+            .first()
+            .map(|agent| agent.config.primary_line().to_owned())
+            .unwrap_or_default(),
+    });
     let host = local_address().unwrap_or_else(|| "0.0.0.0".to_owned());
     let advertisements = start_agents(
         Arc::clone(&fleet),
         Arc::clone(&client),
         &host,
         &config,
+        Some(Arc::clone(&relay_context)),
     );
 
     // The settings listener is what Celmux's plugin centre relays to: it serves
@@ -152,15 +203,74 @@ fn main() {
         control: config.control_port,
         pcm: config.pcm_port,
     };
+    // The heartbeat starts before the listener so the directory is populated the
+    // moment anything can read it, not one interval later.
+    // The listener is opened only when this installation is its own relay. With an
+    // external relay the events travel out and the phone registers there, so a
+    // listener here would accept registrations nobody uses and expose a port for
+    // no reason. The two modes are exclusive in the running process, not just in
+    // the settings form.
+    let own_relay = relay_context.agent.target().is_own();
+    if config.relay_enabled && own_relay {
+        relay_endpoint::spawn_heartbeat(Arc::clone(&relay_context));
+        start_relay_listener(Arc::clone(&relay_context), Arc::clone(&fleet), config.relay_port);
+    } else if !config.relay_enabled {
+        crate::log_info!(
+            "celmux-plugin-airsim: Relay 云端已关闭（relay_enabled=false），不监听 {}",
+            config.relay_port
+        );
+    } else {
+        crate::log_info!(
+            "celmux-plugin-airsim: 使用外部 Relay {}，本机不监听 {}",
+            config.relay_target,
+            config.relay_port
+        );
+    }
     let handler = {
         let fleet = Arc::clone(&fleet);
         let client = Arc::clone(&client);
         let host = host.clone();
+        let relay_state = Arc::clone(&relay_context.state);
         Arc::new(move |request: http::Request| {
-            settings::handle(&fleet, &client, &advertisements, &host, &settings_ports, request)
+            settings::handle(
+                &fleet,
+                &client,
+                &advertisements,
+                &host,
+                &settings_ports,
+                &relay_state,
+                request,
+            )
         }) as Arc<dyn Fn(http::Request) -> http::Response + Send + Sync>
     };
     http::serve(listener, handler);
+}
+
+/// Serve the AirSIM cloud path on its own port.
+///
+/// Bound on every interface because a reverse proxy has to reach it; the phone
+/// requires `https`, and terminating TLS is the proxy's job, not this process's.
+/// Every route here authenticates with the credentials the phone registered, so an
+/// open port is not an open interface.
+fn start_relay_listener(
+    context: Arc<relay_endpoint::Context>,
+    fleet: Arc<Fleet>,
+    port: u16,
+) {
+    let listener = match std::net::TcpListener::bind(("0.0.0.0", port)) {
+        Ok(listener) => listener,
+        Err(error) => {
+            crate::log_warn!("celmux-plugin-airsim: 无法监听 Relay 端口 {port}: {error}");
+            return;
+        }
+    };
+    crate::log_info!("celmux-plugin-airsim: Relay 云端接口 http://0.0.0.0:{port}");
+    let handler = Arc::new(move |request: http::Request| {
+        relay_endpoint::handle(&context, &fleet, &request).unwrap_or_else(|| {
+            http::Response::error(404, "Not Found", "not_found", "Relay 路由不存在")
+        })
+    }) as Arc<dyn Fn(http::Request) -> http::Response + Send + Sync>;
+    std::thread::spawn(move || http::serve(listener, handler));
 }
 
 /// Bring up one control listener and one PCM listener per configured agent.
@@ -172,6 +282,7 @@ fn start_agents(
     client: Arc<celmux::Client>,
     host: &str,
     config: &crate::config::Config,
+    relay_context: Option<Arc<relay_endpoint::Context>>,
 ) -> BTreeMap<String, discovery::Advertisement> {
     let mut advertisements = BTreeMap::new();
     let agents = fleet.list();
@@ -200,7 +311,15 @@ fn start_agents(
     // happens over HTTP, so the phone has to reach it *before* there is a
     // secret. Which routes it answers is decided per request, from whether a
     // secret exists at that moment.
-    start_shared_control_listener(Arc::clone(&fleet), Arc::clone(&client), host, ports);
+    start_shared_control_listener(
+        Arc::clone(&fleet),
+        Arc::clone(&client),
+        host,
+        ports,
+        // Only when the cloud path is on: a push needs a listener to land on, and
+        // an operator who turned the cloud path off has nothing to push to.
+        relay_context.clone(),
+    );
     start_shared_pcm_listener(Arc::clone(&fleet), Arc::clone(&client), ports.pcm);
     // Each line follows Celmux's event stream. Without this the phone's long
     // poll only ever answers on its timeout, so an incoming call or a received
@@ -211,6 +330,12 @@ fn start_agents(
             agent: Arc::clone(agent),
             revision: agent.revision(),
             ports,
+            // The per-agent follower has no cloud path of its own: one shared
+            // control instance owns the event stream, so an incoming call is
+            // pushed once rather than once per line.
+            relay_context: None,
+            call_push: Arc::new(std::sync::Mutex::new(control::CallPush::default())),
+            acked_messages: agent.acked_messages(),
         };
         Arc::new(control).follow_celmux();
     }
@@ -227,6 +352,7 @@ fn start_shared_control_listener(
     client: Arc<celmux::Client>,
     host: &str,
     ports: crate::control::Ports,
+    relay_context: Option<Arc<relay_endpoint::Context>>,
 ) {
     let port = ports.control;
     let listener = match std::net::TcpListener::bind(("0.0.0.0", port)) {
@@ -241,7 +367,7 @@ fn start_shared_control_listener(
         let fleet = Arc::clone(&fleet);
         let client = Arc::clone(&client);
         Arc::new(move |request: http::Request| {
-            control::handle_shared(&fleet, &client, &ports, request)
+            control::handle_shared(&fleet, &client, &ports, relay_context.clone(), request)
         }) as Arc<dyn Fn(http::Request) -> http::Response + Send + Sync>
     };
     std::thread::spawn(move || http::serve(listener, handler));

@@ -34,8 +34,12 @@ pub fn call_record(
     direction: &str,
     started_at: &str,
     line: &str,
+    android_id: &str,
 ) -> Value {
     json!({
+        // The phone's own id for this call. It is opaque to the app, but the app
+        // hands it back when it hangs up, so it has to be something this side can
+        // still resolve - see `android_id` below.
         "id": format!("celmux-call-{started_at}"),
         "index": 0,
         "direction": direction,
@@ -48,6 +52,10 @@ pub fn call_record(
         // reads this to name the card, so a call arriving on the second line is
         // not shown as one on the first.
         "line_id": line,
+        // Celmux's own numeric call id. Celmux answers `answer`/`hangup` only for
+        // a call it knows by that number, so it has to travel with the record
+        // rather than be reconstructed from the display id.
+        "android_id": android_id,
     })
 }
 
@@ -57,13 +65,19 @@ pub fn call_record(
 /// treats absence as "legacy agent": `event_driven` and `revision` are what
 /// switch it from polling to the event stream, and claiming support we do not
 /// implement would leave it waiting on a stream instead of polling.
-pub fn call_status(active: Option<Value>, history: Vec<Value>) -> Value {
+pub fn call_status(active: Option<Value>, history: Vec<Value>, revision: u64) -> Value {
     json!({
         "active": active,
         "history": history,
-        "polling": true,
-        "poll_interval_s": 2,
+        // Event-driven, as the upstream agent reports itself: the phone then waits
+        // on `/api/calls/events` instead of polling on a timer. Claiming `polling:
+        // true` with a two-second interval told it to poll, so a call that rang
+        // between two polls was seen late - or missed.
+        "polling": false,
+        "event_driven": true,
+        "poll_interval_s": 0,
         "last_poll_error": "",
+        "revision": revision,
     })
 }
 
@@ -103,13 +117,20 @@ pub fn sim_slot(line: &Line) -> Value {
     })
 }
 
-/// What a person reads in a slot picker.
+/// The first two of the three things a person reads in a slot picker.
 ///
-/// The same string the line is named by everywhere else - device, operator,
-/// number - because the picker and the line list describe the same thing and two
-/// names for one line is what makes an operator pick the wrong card.
+/// The client renders a slot as `label · number`, so the label carries device and
+/// operator and the number is supplied separately: together they read
+/// `device · operator · number`, which is how a line is named everywhere else in
+/// Celmux. Putting the number here would print it twice, and putting the operator
+/// only in `carrier_name` would make the title lose it.
 fn slot_label(line: &Line) -> String {
-    line.card_name()
+    [line.device_name.as_str(), line.operator_name.as_str()]
+        .into_iter()
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<&str>>()
+        .join(" · ")
 }
 
 /// `AgentEventStatus` for `api/events`.
@@ -139,7 +160,7 @@ pub fn agent_event_status(
 /// a `direction` of its own. Getting this wrong is not cosmetic: the app keys
 /// its history on `delivery_id` and would show every message as incoming with
 /// the phone's own number as the correspondent.
-pub fn sms_message(row: &Value) -> Option<Value> {
+pub fn sms_message(row: &Value, operator_name: &str) -> Option<Value> {
     let text = |key: &str| {
         row.get(key)
             .and_then(Value::as_str)
@@ -197,14 +218,38 @@ pub fn sms_message(row: &Value) -> Option<Value> {
         "timestamp": timestamp,
         "delivery_id": delivery,
         "direction": if outgoing { "outgoing" } else { "incoming" },
-        // Which line carried it, which is what the app labels a message with
-        // when the installation has more than one.
-        "sim_slot": row.get("device_name").and_then(Value::as_str).unwrap_or(""),
+        // Which line carried it, which is what the app labels a message with.
+        // The full name, not just the device: several cards live on one device
+        // and the device alone would not say which one sent this.
+        "sim_slot": message_slot_label(row, operator_name),
     }))
 }
 
+/// How a message says which line carried it.
+///
+/// Device, operator and number - the same name the line has everywhere else, so
+/// a bubble and the picker agree on which card a message came from. The number
+/// is included here, unlike a slot's label: the app prints `sim_slot` verbatim
+/// rather than composing it with a number of its own.
+fn message_slot_label(row: &Value, operator_name: &str) -> String {
+    let text = |key: &str| row.get(key).and_then(Value::as_str).unwrap_or("");
+    let device = text("device_name");
+    if device.is_empty() {
+        return text("device_id").to_owned();
+    }
+    // Celmux stores a message against the card, not against the line, so the
+    // operator is not on the row: it is passed in from the line the message
+    // arrived on.
+    [device, operator_name, text("local_phone")]
+        .into_iter()
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<&str>>()
+        .join(" · ")
+}
+
 /// The `messages` array of a `GET /api/sms` answer.
-pub fn sms_messages(value: &Value) -> Vec<Value> {
+pub fn sms_messages(value: &Value, operator_name: &str) -> Vec<Value> {
     // Celmux answers this route with a bare array. The wrapped forms are kept
     // because that is what this function was written against and an older
     // installation may still send one - but reading only those made every list
@@ -220,7 +265,9 @@ pub fn sms_messages(value: &Value) -> Vec<Value> {
                 .cloned()
         })
         .unwrap_or_default();
-    rows.iter().filter_map(sms_message).collect()
+    rows.iter()
+        .filter_map(|row| sms_message(row, operator_name))
+        .collect()
 }
 
 #[cfg(test)]
@@ -251,6 +298,7 @@ mod tests {
             "outgoing",
             "2026-01-01T00:00:00Z",
             "读卡器2#89441000400501246765",
+            "21",
         );
         for key in ["id", "index", "direction", "state", "started_at", "updated_at"] {
             assert!(!record[key].is_null(), "{key} must be present");
@@ -262,12 +310,15 @@ mod tests {
     /// Claiming the event stream without implementing it would leave the app
     /// waiting on a socket instead of polling.
     #[test]
-    fn call_status_polls_rather_than_claiming_an_event_stream() {
-        let status = call_status(None, Vec::new());
-        assert_eq!(status["polling"], true);
-        assert!(status.get("event_driven").is_none());
-        assert!(status.get("revision").is_none());
-        assert_eq!(status["poll_interval_s"], 2);
+    fn call_status_reports_an_event_stream_rather_than_a_poll() {
+        let status = call_status(None, Vec::new(), 11);
+        // The upstream agent reports itself this way, and the phone behaves
+        // differently depending on it: `polling: true` with a timer means poll,
+        // which is how a short ring was missed.
+        assert_eq!(status["polling"], false);
+        assert_eq!(status["event_driven"], true);
+        assert_eq!(status["poll_interval_s"], 0);
+        assert_eq!(status["revision"], 11, "手机用 revision 等待下一次变化");
     }
 
     /// A slot with no number must send an empty string: the client treats the
@@ -276,12 +327,11 @@ mod tests {
     fn a_slot_is_labelled_the_same_way_the_line_is_named() {
         // Device, operator, number - the same string the line carries
         // everywhere else, so the picker and the line list agree.
+        // Device and operator only: the client appends the number itself, so a
+        // number here shows up twice in the picker.
         let with_operator = sim_slot(&line("l1", "读卡器1", "Globe", ""));
         assert_eq!(with_operator["label"], "读卡器1 · Globe");
         assert_eq!(with_operator["id"], "l1");
-
-        let profile_only = sim_slot(&line("l2", "读卡器2", "", "旅行卡"));
-        assert_eq!(profile_only["label"], "读卡器2 · 旅行卡");
 
         let bare = sim_slot(&line("l3", "dji1", "", ""));
         assert_eq!(bare["label"], "dji1");
@@ -300,12 +350,12 @@ mod tests {
             "timestamp": "2026-01-01T00:00:00Z", "device_name": "读卡器1",
             "message_id": "abc",
         });
-        let message = sms_message(&row).unwrap();
+        let message = sms_message(&row, "LoopDL").unwrap();
         assert_eq!(message["sender"], "+447385886256");
         assert_eq!(message["direction"], "outgoing");
         assert_eq!(message["content"], "hello");
         assert_eq!(message["delivery_id"], "abc");
-        assert_eq!(message["sim_slot"], "读卡器1");
+        assert_eq!(message["sim_slot"], "读卡器1 · LoopDL");
     }
 
     /// A received message keeps its sender as the correspondent. Celmux stores
@@ -319,10 +369,10 @@ mod tests {
             "recipient": "+447469192531", "content": "hello",
             "timestamp": "2026-01-01T00:00:01Z", "device_name": "读卡器1",
         });
-        let message = sms_message(&row).unwrap();
+        let message = sms_message(&row, "LoopDL").unwrap();
         assert_eq!(message["sender"], "+447464383173");
         assert_eq!(message["direction"], "incoming");
-        assert_eq!(message["sim_slot"], "读卡器1");
+        assert_eq!(message["sim_slot"], "读卡器1 · LoopDL");
         // A numeric id still has to become a usable de-duplication key.
         assert_eq!(message["delivery_id"], "21");
     }
@@ -335,7 +385,7 @@ mod tests {
             "recipient": "+447385886256", "content": "hi",
             "timestamp": "2026-01-01T00:00:01Z", "message_id": "读卡器1-abc",
         });
-        let message = sms_message(&row).unwrap();
+        let message = sms_message(&row, "LoopDL").unwrap();
         assert_eq!(message["direction"], "outgoing");
         assert_eq!(message["sender"], "+447385886256");
         assert_eq!(message["delivery_id"], "读卡器1-abc");
@@ -349,7 +399,7 @@ mod tests {
             "id": "db-3", "type": "status_report", "sender": "",
             "recipient": "+44", "content": "", "timestamp": "2026-01-01T00:00:02Z",
         });
-        assert!(sms_message(&row).is_none());
+        assert!(sms_message(&row, "LoopDL").is_none());
     }
 
     /// The app keys its history on `delivery_id`, so a row without the queue id
@@ -360,17 +410,17 @@ mod tests {
             "id": "db-4", "type": "sms", "sender": "+44", "content": "x",
             "timestamp": "2026-01-01T00:00:03Z",
         });
-        assert_eq!(sms_message(&row).unwrap()["delivery_id"], "db-4");
+        assert_eq!(sms_message(&row, "LoopDL").unwrap()["delivery_id"], "db-4");
     }
 
     /// The nested `call` object is what the app reads; a flat status would
     /// decode as a failure and stop the poll loop.
     #[test]
     fn the_event_status_nests_the_call_status() {
-        let status = agent_event_status(7, call_status(None, Vec::new()), 3, Vec::new());
+        let status = agent_event_status(7, call_status(None, Vec::new(), 0), 3, Vec::new());
         assert_eq!(status["revision"], 7);
         assert_eq!(status["sms_pending"], 3);
-        assert_eq!(status["call"]["polling"], true);
+        assert_eq!(status["call"]["polling"], false, "嵌套的通话状态同样是事件驱动");
         assert_eq!(status["sim_revision"], 7);
     }
     /// Celmux answers the plugin's SMS route with a bare array. Reading only the
@@ -387,9 +437,23 @@ mod tests {
             "local_phone": "+200",
             "timestamp": "2026-11-09T16:00:00Z",
         }]);
-        let messages = sms_messages(&row);
+        let messages = sms_messages(&row, "LoopDL");
         assert_eq!(messages.len(), 1, "裸数组应被读取");
         let wrapped = json!({"messages": row.as_array().unwrap().clone()});
-        assert_eq!(sms_messages(&wrapped).len(), 1, "包装形式仍应可读");
+        assert_eq!(sms_messages(&wrapped, "LoopDL").len(), 1, "包装形式仍应可读");
+    }
+    /// A bubble says which card carried a message, and the number is part of
+    /// that: several cards share a device, and the device alone would not tell
+    /// them apart.
+    #[test]
+    fn a_message_names_its_card_by_device_operator_and_number() {
+        let row = json!({
+            "id": 31, "type": 1, "sender": "+447464383173",
+            "recipient": "+447469192531", "content": "hi",
+            "timestamp": "2026-01-01T00:00:03Z",
+            "device_name": "读卡器2", "local_phone": "+447464383173",
+        });
+        let message = sms_message(&row, "LoopDL").unwrap();
+        assert_eq!(message["sim_slot"], "读卡器2 · LoopDL · +447464383173");
     }
 }

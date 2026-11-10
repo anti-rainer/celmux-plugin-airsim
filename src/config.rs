@@ -33,12 +33,28 @@ pub const DEFAULT_CONTROL_PORT: u16 = 8642;
 /// The PCM port, shared by all lines for the same reason.
 pub const DEFAULT_PCM_PORT: u16 = 8643;
 
+/// The port the AirSIM cloud path reaches this process on.
+///
+/// A listener of its own, not a route on the settings port, because the two have
+/// opposite exposure: the cloud path has to be reachable from the internet
+/// through a reverse proxy, and the settings page must not be. Sharing a port
+/// would put pairing, log reading and configuration behind whatever proxy the
+/// operator set up for the relay.
+pub const DEFAULT_RELAY_PORT: u16 = 43770;
+
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Where Celmux's HTTP API listens. The plugin reaches it over loopback.
     pub celmux_url: String,
     /// The private token Celmux minted at install time.
     pub celmux_token: String,
+    /// Where call audio goes: Celmux's own audio wire, as
+    /// `CELMUX_PLUGIN_AUDIO_URL` publishes it.
+    ///
+    /// Not a route on the HTTP API. A plugin carries one 20 ms block every
+    /// 20 ms, and a block per request would make the caller hear the request
+    /// path rather than the carrier.
+    pub audio_url: Option<String>,
     /// The AirSIM-facing port: the API the settings page drives, and the
     /// pairing endpoints.
     pub port: u16,
@@ -49,11 +65,72 @@ pub struct Config {
     pub control_port: u16,
     /// The PCM port, shared by every line for the same reason.
     pub pcm_port: u16,
+    /// Whether the AirSIM cloud path is served at all.
+    ///
+    /// Off by default. The cloud path is the one part of this plugin that is
+    /// meant to be reachable from the internet, and an operator who only ever
+    /// uses the phone on the same LAN should not have that listener open. Turning
+    /// it on is a deliberate act, and it is the only thing that starts the relay
+    /// listener, the heartbeat, and the APNs machinery.
+    pub relay_enabled: bool,
+    /// The port the AirSIM cloud path reaches this process on, behind a proxy
+    /// that terminates TLS for it.
+    pub relay_port: u16,
+    /// Where the agent side sends its events.
+    ///
+    /// Empty means this plugin's own relay. An operator who runs somebody else's
+    /// relay - the AirSIM author's, for instance - puts that address here and the
+    /// events travel there instead. The difference is not cosmetic: the relay is
+    /// what holds the APNs key, so pointing this elsewhere means this
+    /// installation needs no key of its own.
+    pub relay_target: String,
+
+    /// Which relay this installation uses: `own` or `external`.
+    ///
+    /// The two are exclusive by nature - one APNs key, one place events are
+    /// signed for - but the choice used to be implicit in whether an address was
+    /// filled in. That left a state where both looked configured and only one was
+    /// in effect. Naming the mode makes the choice visible and the other side
+    /// switched off, not merely outvoted.
+    pub relay_mode: String,
+    /// The device credentials the events are signed with.
+    ///
+    /// A relay authenticates an event as the phone, because the phone's record is
+    /// what carries the push token. When this plugin runs the relay it is also
+    /// what registered the phone, so it already has these; an external relay
+    /// requires the phone to have registered there.
+    pub relay_device_id: String,
+    pub relay_device_secret: String,
+    /// The APNs signing key, as the full PEM an operator pastes in.
+    ///
+    /// Empty means this plugin sends no pushes. It then says so honestly on
+    /// every route that could imply one, because a phone waiting for a push that
+    /// never comes is worse than a phone that knows it has to stay connected.
+    pub apns_p8: String,
+    /// The 10-character Key ID Apple showed when the key was created.
+    pub apns_key_id: String,
+    /// The 10-character Team ID the key belongs to.
+    pub apns_team_id: String,
+    /// The bundle the pushes are addressed to. APNs rejects a push whose topic is
+    /// not the app that owns the token, so this is not cosmetic.
+    pub apns_bundle_id: String,
+    /// Whether to address the sandbox APNs host instead of production.
+    ///
+    /// A development-signed build gets a sandbox token and a production host
+    /// answers `BadDeviceToken`, so an operator debugging with Xcode needs this.
+    pub apns_sandbox: bool,
     /// Whether to advertise agents on Bonjour.
     pub advertise: bool,
 }
 
 const REQUIRED: [&str; 2] = ["celmux_url", "celmux_token"];
+/// Keys read for use but not required to be present.
+///
+/// `audio_url` is the audio wire Celmux publishes at plugin launch. It is
+/// optional because a Celmux too old to publish it has no such wire, and the
+/// plugin then has no audio path rather than refusing to start - the control
+/// plane still works, so the operator can see why.
+const OPTIONAL: [&str; 1] = ["audio_url"];
 
 #[derive(Debug)]
 pub enum ConfigError {
@@ -86,6 +163,7 @@ impl Config {
     fn from_map(read: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
         let values: BTreeMap<&str, String> = REQUIRED
             .iter()
+            .chain(OPTIONAL.iter())
             .filter_map(|key| read(key).map(|value| (*key, value)))
             .collect();
         for key in REQUIRED {
@@ -125,17 +203,64 @@ impl Config {
             })
             .transpose()?
             .unwrap_or(DEFAULT_PCM_PORT);
-        if control_port == pcm_port {
-            return Err(ConfigError::Invalid(
-                "control_port 与 pcm_port 不能相同".to_owned(),
-            ));
+        let relay_port = read("relay_port")
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                value.parse().map_err(|_| {
+                    ConfigError::Invalid(format!("relay_port 不是有效端口号: {value}"))
+                })
+            })
+            .transpose()?
+            .unwrap_or(DEFAULT_RELAY_PORT);
+        // Four listeners, all on the same host: two of them sharing a port is not
+        // a preference, it is a plugin that cannot start.
+        let ports = [
+            ("port", port),
+            ("control_port", control_port),
+            ("pcm_port", pcm_port),
+            ("relay_port", relay_port),
+        ];
+        for (index, (name, value)) in ports.iter().enumerate() {
+            if ports[index + 1..]
+                .iter()
+                .any(|(_, other)| other == value)
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "{name} 与另一个端口重复: {value}"
+                )));
+            }
         }
         Ok(Self {
             celmux_url: values["celmux_url"].trim().trim_end_matches('/').to_owned(),
             celmux_token: values["celmux_token"].trim().to_owned(),
+            audio_url: read("audio_url").map(|value| value.trim().to_owned()),
             port,
             control_port,
             pcm_port,
+            relay_enabled: read("relay_enabled")
+                .map(|value| !matches!(value.trim(), "false" | "0" | "off" | "no"))
+                .unwrap_or(false),
+            relay_port,
+            relay_mode: read("relay_mode")
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase(),
+            relay_target: read("relay_target")
+                .map(|value| value.trim().trim_end_matches('/').to_owned())
+                .unwrap_or_default(),
+            relay_device_id: read("relay_device_id").unwrap_or_default(),
+            relay_device_secret: read("relay_device_secret").unwrap_or_default(),
+            apns_p8: read("apns_p8").unwrap_or_default(),
+            apns_key_id: read("apns_key_id").unwrap_or_default(),
+            apns_team_id: read("apns_team_id").unwrap_or_default(),
+            apns_bundle_id: read("apns_bundle_id")
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "com.eric3u.airsim".to_owned()),
+            apns_sandbox: read("apns_sandbox")
+                .map(|value| matches!(value.trim(), "true" | "1" | "on" | "yes"))
+                .unwrap_or(false),
             advertise: read("advertise")
                 .map(|value| value.trim() != "false" && value.trim() != "0")
                 .unwrap_or(true),
@@ -169,6 +294,15 @@ pub fn base64_url_decode(value: &str) -> Option<Vec<u8>> {
 pub fn base64_url_encode(bytes: &[u8]) -> String {
     use base64::Engine;
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// Decode standard base64, as a `.p8` file body is written.
+///
+/// The same decoder serves both alphabets: [`base64_url_decode`] maps the URL
+/// characters onto the standard ones before decoding, so a caller that knows it
+/// has standard input can use this name and be understood.
+pub fn base64_url_decode_standard(value: &str) -> Option<Vec<u8>> {
+    base64_url_decode(value)
 }
 
 #[cfg(test)]
