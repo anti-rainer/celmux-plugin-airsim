@@ -1,7 +1,7 @@
 {
   "id": "airsim",
   "name": "AirSIM 桥接",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "repository": "anti-rainer/celmux-plugin-airsim",
   "description": "让 AirSIM iOS 客户端拨打本机的 VoWiFi/VoLTE 线路",
   "settings": [
