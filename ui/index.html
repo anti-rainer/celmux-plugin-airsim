@@ -702,17 +702,46 @@ function applyPrivacy() {
   }
 }
 
-/** Take one line into or out of the set the phone sees, and apply it. */
+/**
+ * Take one line into or out of the set the phone sees.
+ *
+ * The page answers immediately: the row is flipped here, drawn here, and the
+ * write goes out afterwards. Waiting for the round trip before showing the
+ * change made a click feel broken - two sequential requests, one of them a full
+ * reload of every line from Celmux, for a checkbox.
+ *
+ * The assignment is the page's working copy and the request carries the whole
+ * list, so a write that fails is undone by putting the row back and reloading
+ * the truth from the plugin.
+ */
 async function exposeLine(line) {
   const existing = state.assignment.findIndex((row) => row.line_id === line.line_id);
-  if (existing >= 0) state.assignment.splice(existing, 1);
+  const removed = existing >= 0;
+  if (removed) state.assignment.splice(existing, 1);
   else state.assignment.push({ line_id: line.line_id });
+
+  // Redraw from the working copy so the button and the exposed count move now.
+  applyExposureLocally();
+  renderLines();
   await saveAssignment();
-  await refresh();
 }
 
 // The plugin's own answer, not what this page last saved: the config can be
 // changed elsewhere, and the two would then disagree until a reload.
+/**
+ * Mirror the working assignment onto the rendered rows.
+ *
+ * `line.exposed` comes from the plugin's own answer. While an edit is in flight
+ * the page has already moved on, so the rows are brought up to date with the
+ * working copy instead of waiting for the next reload to say the same thing.
+ */
+function applyExposureLocally() {
+  const exposed = new Set(state.assignment.map((row) => row.line_id));
+  for (const line of state.lines || []) {
+    line.exposed = exposed.has(line.line_id);
+  }
+}
+
 function isExposed(line) {
   return Boolean(line.exposed);
 }
@@ -1100,14 +1129,14 @@ async function saveAssignment() {
     for (const row of state.assignment) {
       if (!row.line_id) throw new Error('有线路未选择');
     }
-    // Through the relay, so this page needs nothing but the token it was
-    // opened with: Celmux owns the config, and the relay applies it as the
-    // operator who opened the page.
+    // The plugin applies the change and answers; persisting it to Celmux happens
+    // behind that answer. Relaying the write through Celmux first meant the page
+    // waited on two processes to see a change it had already made.
     await pluginFetch('/api/config', {
       method: 'POST',
       body: JSON.stringify({ values: { agents: JSON.stringify(state.assignment) } }),
     });
-    if (note) note.textContent = '已保存。Celmux 会重启插件让新的分配生效。';
+    if (note) note.textContent = '';
   } catch (error) {
     if (note) {
       note.className = 'err';
@@ -1239,7 +1268,8 @@ async function saveExposeAll() {
       body: JSON.stringify({ values: { expose_all_lines: value } }),
     });
     state.config = { ...(state.config || {}), expose_all_lines: value };
-    await refresh();
+    // No reload: the switch shows what was just applied. Reloading every line
+    // after a settings change is what made the page feel like it was thinking.
   } catch (error) {
     // Put the switch back where it was: it shows what is in effect, and a failed
     // save leaves the old value in effect.

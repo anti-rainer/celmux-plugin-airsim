@@ -272,6 +272,22 @@ impl Client {
         self.request("GET", "/config", None)
     }
 
+    /// Write settings back through Celmux.
+    ///
+    /// Celmux owns the stored configuration; this process owns what is running.
+    /// A settings change is applied here first and persisted through this call,
+    /// so the operator sees the effect immediately and the file behind it follows.
+    pub fn set_config(
+        &self,
+        values: &std::collections::BTreeMap<String, String>,
+    ) -> Result<Value, Error> {
+        self.request(
+            "PUT",
+            "/config",
+            Some(serde_json::json!({ "values": values })),
+        )
+    }
+
     pub fn dial(&self, line_id: &str, number: &str) -> Result<Value, Error> {
         self.request(
             "POST",

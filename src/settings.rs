@@ -157,6 +157,7 @@ pub fn handle(
         ("GET", "/api/lines") => lines(fleet, client),
         ("GET", "/api/logs") => logs(&request),
         ("GET", "/api/config") => config_read(client),
+        ("POST", "/api/config") => config_write(fleet, client, &request),
         ("GET", "/api/relay/devices") => relay_devices(relay_state),
         ("GET", "/api/info") => info_page(),
         _ => Response::error(404, "Not Found", "not_found", "接口不存在"),
@@ -519,6 +520,107 @@ fn config_read(client: &Arc<Client>) -> Response {
         })),
         Err(error) => Response::error(502, "Bad Gateway", "celmux_unavailable", &error.to_string()),
     }
+}
+
+/// `POST /api/config` — apply a settings change now, persist it behind the page.
+///
+/// The running agent is the thing that acts, so the running agent is what a
+/// settings change has to reach. Persisting through Celmux first made every edit
+/// a round trip through two processes before the page could show the result, and
+/// the page then had to reload everything to see a change it had just made.
+///
+/// So: the new assignment is parsed and applied in memory, the response returns,
+/// and the write to Celmux happens on a thread. A failure there is logged and
+/// leaves the running agent on the value it accepted - the same value the
+/// operator sees - until the periodic reload picks up whatever Celmux ended up
+/// with.
+fn config_write(fleet: &Arc<Fleet>, client: &Arc<Client>, request: &Request) -> Response {
+    let payload: Value = match serde_json::from_slice(&request.body) {
+        Ok(payload) => payload,
+        Err(error) => {
+            return Response::error(400, "Bad Request", "bad_json", &error.to_string());
+        }
+    };
+    let Some(values) = payload.get("values").and_then(Value::as_object) else {
+        return Response::error(400, "Bad Request", "no_values", "缺少 values");
+    };
+    // Only the assignment is applied here. Every other key is read from Celmux by
+    // the code that uses it, so persisting them is the whole job for those.
+    // The two values that change what this gateway offers are applied here. Every
+    // other key is read from Celmux by the code that uses it, so persisting it is
+    // the whole job for those.
+    let running = fleet.list().first().cloned();
+    let current = running
+        .as_ref()
+        .map(|agent| agent.config())
+        .unwrap_or_default();
+    // The identity the running agent answers to, not the raw config value: an
+    // unset `agent_id` in the configuration is the default, and passing the empty
+    // string through would build a config whose id matches no running agent - the
+    // change would be stored and silently not applied.
+    let identity = running
+        .as_ref()
+        .map(|agent| (agent.name(), agent.id()))
+        .unwrap_or_else(|| (current.name.clone(), current.id.clone()));
+    let expose_all = values
+        .get(EXPOSE_ALL_KEY)
+        .and_then(Value::as_str)
+        .map(|value| matches!(value.trim(), "true" | "1" | "on" | "yes"))
+        .unwrap_or(current.expose_all_lines);
+    let assignment = values
+        .get(ASSIGNMENT_KEY)
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if !assignment.is_empty() || values.contains_key(EXPOSE_ALL_KEY) {
+        // An absent assignment keeps the one in effect, so flipping the switch
+        // does not have to send the line list with it.
+        let raw = if assignment.is_empty() {
+            serde_json::to_string(
+                &current
+                    .lines
+                    .iter()
+                    .map(|line| json!({ "line_id": line }))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap_or_else(|_| "[]".to_owned())
+        } else {
+            assignment.to_owned()
+        };
+        match parse_assignment(&raw, (identity.0, identity.1, expose_all)) {
+            Ok(configs) => {
+                fleet.apply_configs(configs);
+            }
+            Err(error) => {
+                return Response::error(400, "Bad Request", "bad_assignment", &error);
+            }
+        }
+    }
+
+    // Persist off this thread: the page has its answer, and a slow or unavailable
+    // Celmux must not turn a click into a spinner.
+    let client = Arc::clone(client);
+    let values: std::collections::BTreeMap<String, String> = values
+        .iter()
+        .filter_map(|(key, value)| value.as_str().map(|text| (key.clone(), text.to_owned())))
+        .collect();
+    std::thread::spawn(move || {
+        if let Err(error) = persist_config(&client, values) {
+            crate::log_warn!("celmux-plugin-airsim: 配置未能写入 Celmux: {error}");
+        }
+    });
+
+    Response::ok(json!({"ok": true}))
+}
+
+/// Write settings back through Celmux.
+fn persist_config(
+    client: &Arc<Client>,
+    values: std::collections::BTreeMap<String, String>,
+) -> Result<(), String> {
+    client
+        .set_config(&values)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 /// The tail of this plugin's own log.
