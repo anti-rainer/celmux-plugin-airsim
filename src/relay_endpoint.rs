@@ -27,34 +27,68 @@ use crate::http::{Request, Response};
 use crate::relay::{AgentReport, SERVICE, State, VERSION};
 
 /// What the relay needs to answer truthfully about the agent it fronts.
+/// The settings a running process can adopt without being restarted.
+#[derive(Clone, Default)]
+pub struct LiveConfig {
+    /// The id the phone binds its pairing to.
+    pub agent_id: String,
+    /// The PCM port a cloud call is handed; the same socket a direct call uses.
+    pub pcm_port: u16,
+    /// The line a command dials from when the phone does not name one.
+    pub default_line: String,
+    /// The push sender. Rebuilt when the APNs key or its identifiers change, so a
+    /// key pasted into the settings page takes effect on the next push.
+    pub pusher: Option<Arc<crate::apns::Pusher>>,
+}
+
 pub struct Context {
     pub state: Arc<State>,
     /// Celmux, for the line details the phone shows.
     pub client: Arc<crate::celmux::Client>,
-    /// The agent id the phone should bind to. Stable across restarts: the phone
-    /// stores its pairing against it.
-    pub agent_id: String,
-    /// The PCM port, so a cloud call is handed the same audio socket a direct
-    /// call uses.
-    pub pcm_port: u16,
+    /// The values a settings change can replace while this process runs.
+    ///
+    /// Everything here used to be a plain field read straight off the config at
+    /// startup, which made a settings page edit mean a restart. A restart drops
+    /// the phone's registration and every open stream, so the values live behind a
+    /// lock and the readers take a copy of the current one instead.
+    pub live: Arc<std::sync::RwLock<LiveConfig>>,
     pub plugin_version: String,
-    /// The line a command dials from when the phone does not name one.
-    pub default_line: String,
     /// The agent half: where this plugin sends its events.
     ///
     /// Either this process's own relay or somebody else's, decided by
     /// `relay_target`. A single code path either way: the difference is only
     /// which side holds the APNs key.
     pub agent: Arc<crate::relay_agent::Agent>,
-    /// The push sender, or one that reports why it cannot push.
-    ///
-    /// Never optional: a phone asking whether it will get pushes gets a truthful
-    /// answer either way, and the answer determines whether it keeps its own
-    /// connection alive.
-    pub pusher: Arc<crate::apns::Pusher>,
 }
 
 impl Context {
+    /// The live settings, copied.
+    fn live(&self) -> LiveConfig {
+        self.live
+            .read()
+            .map(|live| live.clone())
+            .unwrap_or_default()
+    }
+
+    fn agent_id(&self) -> String {
+        self.live().agent_id
+    }
+
+    fn pcm_port(&self) -> u16 {
+        self.live().pcm_port
+    }
+
+    fn default_line(&self) -> String {
+        self.live().default_line
+    }
+
+    /// The push sender, or a stub that says why it cannot push.
+    fn pusher(&self) -> Arc<crate::apns::Pusher> {
+        self.live()
+            .pusher
+            .unwrap_or_else(|| Arc::new(crate::apns::Pusher::new("", "", "", "", false)))
+    }
+
     /// The address the phone should post call-control requests to.
     ///
     /// Upstream puts its own origin in the dial response so a phone pointed at one
@@ -190,7 +224,7 @@ fn register(context: &Context, request: &Request) -> Response {
 /// phone then skips the write - which is what this relay wants, since it sends no
 /// pushes and has nowhere to put a token.
 fn push_status(context: &Context) -> Response {
-    let ready = context.pusher.status().ready();
+    let ready = context.pusher().status().ready();
     Response::ok(json!({
         // `local_mode` is what decides whether the phone hands its APNs token
         // over. It stays true until a key exists: a phone that gave up its token
@@ -204,9 +238,9 @@ fn push_status(context: &Context) -> Response {
         // pushes that never come.
         "call_push_ready": ready,
         "message_push_ready": false,
-        "environment": if context.pusher.host().contains("sandbox") { "sandbox" } else { "production" },
+        "environment": if context.pusher().host().contains("sandbox") { "sandbox" } else { "production" },
         "relay_url": "",
-        "last_error": context.pusher.status().reason().unwrap_or_default(),
+        "last_error": context.pusher().status().reason().unwrap_or_default(),
     }))
 }
 
@@ -263,7 +297,7 @@ fn receive_call(context: &Context, request: &Request) -> Response {
     let mut payload = json!({
         "aps": {"content-available": 1},
         "event": "incoming_call",
-        "agent_id": context.agent_id,
+        "agent_id": context.agent_id(),
         "call_id": call.call_id,
         "call_uuid": call.call_uuid,
         "generation": call.generation,
@@ -278,7 +312,7 @@ fn receive_call(context: &Context, request: &Request) -> Response {
         payload["media_url"] = json!(call.media_url);
     }
     let outcome = context
-        .pusher
+        .pusher()
         .push_voip(&token, &payload, &call.call_uuid, call.expires_unix);
     if !outcome.status.is_some_and(crate::apns::Outcome::accepted) {
         crate::log_warn!(
@@ -309,9 +343,9 @@ fn dispatch_pulled(context: &Arc<Context>, command: &Value) {
     let kind = text("type");
     let number = text("number");
     let message = text("message");
-    let line = match context.default_line.is_empty() {
+    let line = match context.default_line().is_empty() {
         true => text("sim_account"),
-        false => context.default_line.clone(),
+        false => context.default_line().clone(),
     };
     let outcome = match kind.as_str() {
         "dial" => context.client.dial(&line, &number).map(|_| ()),
@@ -399,7 +433,7 @@ pub fn deliver_sms_locally(context: &Arc<Context>, event: &crate::relay_agent::S
     // An alert push is addressed to the bare bundle id, not `<bundle>.voip`: it is
     // an ordinary notification, and the wrong topic is answered `TopicDisallowed`.
     let outcome = context
-        .pusher
+        .pusher()
         .push_alert(&token, &payload, &event.delivery_id);
     crate::log_info!(
         "celmux-plugin-airsim: 短信推送 delivery_id={} {}",
@@ -616,11 +650,11 @@ fn push_register(context: &Context, request: &Request) -> Response {
     // The token is kept whatever the key situation: an operator who adds a p8
     // tomorrow should not have to make the phone register again.
     let stored = context.state.store_push_tokens(&body);
-    let ready = context.pusher.status().ready();
+    let ready = context.pusher().status().ready();
     Response::ok(json!({
         "registered": stored && ready,
         "local_mode": !ready,
-        "reason": context.pusher.status().reason().unwrap_or_default(),
+        "reason": context.pusher().status().reason().unwrap_or_default(),
     }))
 }
 
@@ -933,8 +967,8 @@ fn enqueue(context: &Context, fleet: &Arc<Fleet>, request: &Request) -> Response
         state: Arc::clone(&context.state),
         client: Arc::clone(&context.client),
         command: command.clone(),
-        line: context.default_line.clone(),
-        agent_id: context.agent_id.clone(),
+        line: context.default_line().clone(),
+        agent_id: context.agent_id().clone(),
     };
     std::thread::spawn(move || dispatch.run());
     let call_id = format!("outgoing-{}", command.command_id);
@@ -964,7 +998,7 @@ fn enqueue(context: &Context, fleet: &Arc<Fleet>, request: &Request) -> Response
             // already authenticates with the pairing secret, so it is the same
             // credential the direct path uses rather than a second one.
             "call_secret": "",
-            "media_url": format!("tcp://{}:{}", agent.name, context.pcm_port),
+            "media_url": format!("tcp://{}:{}", agent.name, context.pcm_port()),
             "media_transport": "legacy_pcm",
         },
     }))
@@ -1129,7 +1163,7 @@ fn report(context: &Context, fleet: &Arc<Fleet>) -> AgentReport {
         .map(|line| line.local_phone)
         .unwrap_or_default();
     AgentReport {
-        id: context.agent_id.clone(),
+        id: context.agent_id().clone(),
         name,
         model: "celmux".to_owned(),
         number,
@@ -1207,7 +1241,18 @@ mod tests {
             )),
             // No key in these tests: the routes under test do not push, and the
             // ones that report push readiness are asserting the no-key answer.
-            pusher: Arc::new(crate::apns::Pusher::new("", "", "", "com.test.app", false)),
+            live: Arc::new(std::sync::RwLock::new(LiveConfig {
+                agent_id: "celmux".to_owned(),
+                pcm_port: 8643,
+                default_line: "读卡器1".to_owned(),
+                pusher: Some(Arc::new(crate::apns::Pusher::new(
+                    "",
+                    "",
+                    "",
+                    "com.test.app",
+                    false,
+                ))),
+            })),
             state: Arc::new(State::default()),
             client: Arc::new(crate::celmux::Client::new(
                 "http://127.0.0.1:1".to_owned(),
@@ -1215,10 +1260,7 @@ mod tests {
                 "airsim".to_owned(),
                 None,
             )),
-            agent_id: "celmux".to_owned(),
-            pcm_port: 8643,
             plugin_version: "0.2.0".to_owned(),
-            default_line: "读卡器1".to_owned(),
         }
     }
 
@@ -1584,5 +1626,40 @@ mod tests {
         assert!(is_uuid("a064765c-d0d9-4e8d-96e3-636ba9137f44"));
         assert!(!is_uuid("probe-2093624"), "非 UUID 必须被拒绝");
         assert!(!is_uuid("a064765cd0d94e8d96e3636ba9137f44"));
+    }
+    /// The push sender can be replaced while the process runs.
+    ///
+    /// A key pasted into the settings page used to need a restart, and a restart
+    /// drops the phone's registration - so the operator saw "saved" and nothing
+    /// rang. The sender lives behind the same lock as the rest of the live
+    /// configuration, and readers take the current one.
+    #[test]
+    fn the_pusher_can_be_replaced_at_runtime() {
+        let context = context();
+        let before = context.pusher().host().to_owned();
+        assert!(
+            context.pusher().status().reason().is_some(),
+            "没有密钥时应当说明为什么不能推送"
+        );
+
+        if let Ok(mut live) = context.live.write() {
+            live.pusher = Some(Arc::new(crate::apns::Pusher::new(
+                "not-a-real-key",
+                "KEYID12345",
+                "TEAMID1234",
+                "com.test.app",
+                true,
+            )));
+        }
+
+        assert_ne!(
+            context.pusher().host(),
+            before.as_str(),
+            "换到沙盒后主机名应当改变"
+        );
+        assert!(
+            context.pusher().host().contains("sandbox"),
+            "沙盒环境的推送主机名带 sandbox"
+        );
     }
 }

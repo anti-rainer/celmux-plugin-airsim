@@ -721,6 +721,7 @@ async function exposeLine(line) {
   else state.assignment.push({ line_id: line.line_id });
 
   // Redraw from the working copy so the button and the exposed count move now.
+  lastLocalEdit = Date.now();
   applyExposureLocally();
   renderLines();
   await saveAssignment();
@@ -1207,6 +1208,62 @@ async function refresh() {
   renderInfo();
 }
 
+/**
+ * Keep the page showing what the plugin knows, not what it knew at load time.
+ *
+ * A reader plugged in, a tunnel coming up, a call answered: none of it reached
+ * this page, so the dashboard described a moment that had passed. The plugin
+ * already answers `/api/status` with the live projection, so the page polls it
+ * and redraws only when the answer differs - a redraw on every tick would fight
+ * the operator's own clicks and reset scroll position for nothing.
+ */
+const LIVE_INTERVAL_MS = 2000;
+/** How long a local edit is trusted over a poll that may predate it. */
+const LOCAL_EDIT_GRACE_MS = 1500;
+let liveTimer = null;
+let lastLocalEdit = 0;
+
+/** A compact fingerprint of everything the page draws, to notice a change. */
+function stateFingerprint() {
+  const lines = (state.lines || []).map((line) => [
+    line.line_id, line.online, line.exposed, line.voice_route,
+    line.vowifi_active, line.n_standby_active, line.registration, line.local_phone
+  ].join('|')).join(';');
+  const agents = (state.agents || []).map((agent) => [
+    agent.agent_id, agent.paired, agent.pairing_open
+  ].join('|')).join(';');
+  return `${lines}##${agents}##${JSON.stringify(state.totals || {})}`;
+}
+
+async function pollLive() {
+  // A hidden tab has nobody looking; the poll resumes on the way back.
+  if (document.hidden) return;
+  // A click the server has not confirmed yet would be undone by an answer that
+  // was already in flight. The window is short on purpose: the write answers in
+  // tens of milliseconds, and this only has to cover the gap.
+  if (Date.now() - lastLocalEdit < LOCAL_EDIT_GRACE_MS) return;
+  const before = stateFingerprint();
+  try {
+    const status = await pluginFetch('/api/status');
+    state.agents = status.agents || [];
+    state.totals = status.totals || {};
+    state.relayCredential = status.relay_credential || {};
+  } catch { return; }
+  try { state.lines = (await pluginFetch('/api/lines')).lines || []; } catch { return; }
+  if (stateFingerprint() === before) return;
+  renderHome();
+  renderLines();
+  renderPairing();
+}
+
+function startLiveUpdates() {
+  if (liveTimer) clearInterval(liveTimer);
+  liveTimer = setInterval(pollLive, LIVE_INTERVAL_MS);
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) pollLive();
+  });
+}
+
 async function loadConfig() {
   try {
     const data = await pluginFetch('/api/config');
@@ -1268,6 +1325,7 @@ async function saveExposeAll() {
       body: JSON.stringify({ values: { expose_all_lines: value } }),
     });
     state.config = { ...(state.config || {}), expose_all_lines: value };
+    lastLocalEdit = Date.now();
     // No reload: the switch shows what was just applied. Reloading every line
     // after a settings change is what made the page feel like it was thinking.
   } catch (error) {
@@ -1290,6 +1348,7 @@ async function saveExposeAll() {
   fillPortInputs();
   fillExposeAll();
   await refresh();
+  startLiveUpdates();
 })();
 </script>
 </body>

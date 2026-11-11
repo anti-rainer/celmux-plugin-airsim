@@ -31,6 +31,8 @@ const PAIRING_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 const ASSIGNMENT_KEY: &str = "agents";
 /// Expose every line Celmux has, instead of the stored list.
 const EXPOSE_ALL_KEY: &str = "expose_all_lines";
+/// What the settings page shows in place of a secret it may not read back.
+const MASKED_SECRET: &str = "********";
 /// The display name, stored apart from the line list.
 const AGENT_NAME_KEY: &str = "agent_name";
 /// The credential id, stored apart from the line list.
@@ -147,9 +149,10 @@ pub fn handle(
     >,
     host: &str,
     ports: &crate::control::Ports,
-    relay_state: &Arc<crate::relay::State>,
+    relay: &Arc<crate::relay_endpoint::Context>,
     request: Request,
 ) -> Response {
+    let relay_state = &relay.state;
     match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/api/status") => status(fleet, client, host, ports, relay_state),
         ("POST", "/api/pair") => open_pairing(fleet, advertisements, &request),
@@ -157,7 +160,7 @@ pub fn handle(
         ("GET", "/api/lines") => lines(fleet, client),
         ("GET", "/api/logs") => logs(&request),
         ("GET", "/api/config") => config_read(client),
-        ("POST", "/api/config") => config_write(fleet, client, &request),
+        ("POST", "/api/config") => config_write(fleet, client, relay, &request),
         ("GET", "/api/relay/devices") => relay_devices(relay_state),
         ("GET", "/api/info") => info_page(),
         _ => Response::error(404, "Not Found", "not_found", "接口不存在"),
@@ -217,17 +220,16 @@ fn status(
 /// one unreachable reader should not blank it.
 fn totals(fleet: &Arc<Fleet>, client: &Arc<Client>) -> Value {
     // Only the lines the operator exposed: the page describes what the phone can
-    // reach, not everything the readers happen to hold.
-    let assigned: Vec<String> = fleet
-        .list()
-        .into_iter()
-        .flat_map(|agent| agent.lines())
-        .collect();
+    // reach, not everything the readers happen to hold. Asked through `exposes`,
+    // which is the same question the phone's own list answers - a count built from
+    // the stored assignment would ignore the expose-all switch and disagree with
+    // the slot picker.
+    let agents = fleet.list();
     let lines: Vec<crate::celmux::Line> = client
         .lines()
         .unwrap_or_default()
         .into_iter()
-        .filter(|line| assigned.contains(&line.line_id))
+        .filter(|line| agents.iter().any(|agent| agent.exposes(&line.line_id)))
         .collect();
     let mut sent = 0_u64;
     let mut received = 0_u64;
@@ -524,17 +526,20 @@ fn config_read(client: &Arc<Client>) -> Response {
 
 /// `POST /api/config` — apply a settings change now, persist it behind the page.
 ///
-/// The running agent is the thing that acts, so the running agent is what a
-/// settings change has to reach. Persisting through Celmux first made every edit
-/// a round trip through two processes before the page could show the result, and
-/// the page then had to reload everything to see a change it had just made.
+/// Memory is the truth while the process runs; the stored configuration is what
+/// the next start reads. A change is applied here, answered here, and written
+/// through Celmux on a thread.
 ///
-/// So: the new assignment is parsed and applied in memory, the response returns,
-/// and the write to Celmux happens on a thread. A failure there is logged and
-/// leaves the running agent on the value it accepted - the same value the
-/// operator sees - until the periodic reload picks up whatever Celmux ended up
-/// with.
-fn config_write(fleet: &Arc<Fleet>, client: &Arc<Client>, request: &Request) -> Response {
+/// Deliberately no reload: re-reading the stored configuration on a timer meant
+/// the two could disagree for as long as the save took, and the poll would then
+/// put the stale value back over a change the operator had just made and seen. One
+/// writer, one reader, no reconciliation.
+fn config_write(
+    fleet: &Arc<Fleet>,
+    client: &Arc<Client>,
+    relay: &Arc<crate::relay_endpoint::Context>,
+    request: &Request,
+) -> Response {
     let payload: Value = match serde_json::from_slice(&request.body) {
         Ok(payload) => payload,
         Err(error) => {
@@ -588,11 +593,53 @@ fn config_write(fleet: &Arc<Fleet>, client: &Arc<Client>, request: &Request) -> 
         };
         match parse_assignment(&raw, (identity.0, identity.1, expose_all)) {
             Ok(configs) => {
-                fleet.apply_configs(configs);
+                let changed = fleet.apply_configs(configs);
+                crate::log_info!(
+                    "celmux-plugin-airsim: 配置已应用 expose_all={expose_all} lines={} changed={changed}",
+                    current.lines.len()
+                );
             }
             Err(error) => {
                 return Response::error(400, "Bad Request", "bad_assignment", &error);
             }
+        }
+    }
+
+    // The push sender is built from the key and its identifiers, so it has to be
+    // rebuilt when any of them arrives - otherwise pasting a key into the settings
+    // page would still need a restart before a call could ring.
+    const APNS_KEYS: [&str; 5] = [
+        "apns_p8",
+        "apns_key_id",
+        "apns_team_id",
+        "apns_bundle_id",
+        "apns_sandbox",
+    ];
+    if APNS_KEYS.iter().any(|key| values.contains_key(*key)) {
+        let read = |key: &str| -> String {
+            values
+                .get(key)
+                .and_then(Value::as_str)
+                .map(|value| value.trim().to_owned())
+                .unwrap_or_default()
+        };
+        let p8 = read("apns_p8");
+        // An empty key in a save is "leave it alone", not "clear it": the page
+        // shows secrets masked, and a form that round-trips the mask would
+        // otherwise wipe the key every time an unrelated field was saved.
+        if !p8.is_empty() && p8 != MASKED_SECRET {
+            let sandbox = read("apns_sandbox");
+            let pusher = crate::apns::Pusher::new(
+                &p8,
+                &read("apns_key_id"),
+                &read("apns_team_id"),
+                &read("apns_bundle_id"),
+                sandbox == "true" || sandbox == "1",
+            );
+            if let Ok(mut live) = relay.live.write() {
+                live.pusher = Some(Arc::new(pusher));
+            }
+            crate::log_info!("celmux-plugin-airsim: APNs 凭据已更新，无需重启");
         }
     }
 
