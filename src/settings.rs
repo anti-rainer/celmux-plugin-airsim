@@ -8,6 +8,14 @@
 //! module answers the same origin the page runs on, so the page can call these
 //! endpoints directly. It is the only listener the operator configures, and the
 //! only one with a stable port: agent ports move with the assignment.
+//!
+//! The assignment itself is the plugin's own state, on this plugin's own disk
+//! ([`crate::assignment`]). It is not a provider setting: adding a line is a
+//! decision the operator makes on this page, not a value Celmux resolves and
+//! hands down, and routing it through the host made a click into a configuration
+//! write that the plugin could not verify and a schema it did not own could
+//! refuse. Celmux's configuration still answers for the ports, the credentials
+//! and the log level - one place per fact.
 
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
@@ -52,13 +60,46 @@ struct AssignedLine {
     // silently override what the ports page shows.
 }
 
-/// Read the assignment from Celmux's plugin configuration.
+/// Read the assignment this installation has.
 ///
-/// The value is stored as JSON in one config field, so the settings page can
-/// save it with the same call it uses for every other field and Celmux does not
-/// need a schema for a plugin's own structure.
-pub fn load_assignment(client: &Client) -> Result<Vec<AgentConfig>, String> {
-    let value = client.config().map_err(|error| error.to_string())?;
+/// The plugin's own file is the truth. Celmux's plugin configuration is read once
+/// as a **seed**: an installation that had lines before this moved has them in a
+/// host config field, and silently dropping them on upgrade would make every line
+/// disappear and look like the bridge had lost its settings. After the first
+/// read with no file present, the file is written and the host value is never
+/// consulted again - which is what makes this plugin's state its own.
+pub fn load_assignment(
+    client: &Client,
+    store: &crate::assignment::Store,
+) -> Result<Vec<AgentConfig>, String> {
+    let identity = host_identity(client);
+    let document = match store.load() {
+        document if store.path().exists() => document,
+        _ => {
+            let seeded = seed_from_host(client, &identity);
+            if seeded.lines.is_empty() && !seeded.expose_all {
+                seeded
+            } else {
+                crate::log_info!(
+                    "celmux-plugin-airsim: 从 Celmux 配置迁移 {} 条线路到 {}",
+                    seeded.lines.len(),
+                    store.path().display()
+                );
+                let _ = store.save(&seeded);
+                seeded
+            }
+        }
+    };
+    Ok(configs_from_document(&document, &identity))
+}
+
+/// The agent name and id, which stay in the host configuration: they are
+/// provider settings the operator edits on Celmux's page, not this plugin's own
+/// state.
+fn host_identity(client: &Client) -> (String, String) {
+    let Ok(value) = client.config() else {
+        return (String::new(), String::new());
+    };
     let config = value.get("config");
     let read = |key: &str| -> String {
         config
@@ -68,76 +109,56 @@ pub fn load_assignment(client: &Client) -> Result<Vec<AgentConfig>, String> {
             .trim()
             .to_owned()
     };
-    // The identity is its own configuration, not part of the line list: the list
-    // is the operator's ordering of lines, and folding a name into it would make
-    // renaming the agent rewrite every row.
-    // The switch is read from the same place the list is, because they answer the
-    // same question: which lines this gateway offers.
+    (read(AGENT_NAME_KEY), read(AGENT_ID_KEY))
+}
+
+/// A one-time read of an assignment stored in Celmux's configuration.
+fn seed_from_host(client: &Client, _identity: &(String, String)) -> crate::assignment::Document {
+    let Ok(value) = client.config() else {
+        return crate::assignment::Document::default();
+    };
+    let config = value.get("config");
     let expose_all = config
         .and_then(|config| config.get(EXPOSE_ALL_KEY))
         .and_then(Value::as_str)
         .map(|value| matches!(value.trim(), "true" | "1" | "on" | "yes"))
         .unwrap_or(false);
-    let identity = (read(AGENT_NAME_KEY), read(AGENT_ID_KEY), expose_all);
     let raw = config
         .and_then(|config| config.get(ASSIGNMENT_KEY))
         .and_then(Value::as_str)
-        .unwrap_or("");
-    parse_assignment(raw, identity)
+        .unwrap_or("")
+        .trim()
+        .to_owned();
+    if raw.is_empty() {
+        return crate::assignment::from_lines(Vec::<String>::new(), expose_all);
+    }
+    let Ok(lines) = serde_json::from_str::<Vec<AssignedLine>>(&raw) else {
+        crate::log_warn!("celmux-plugin-airsim: Celmux 里的线路分配不是有效 JSON，按未加入处理");
+        return crate::assignment::from_lines(Vec::<String>::new(), expose_all);
+    };
+    crate::assignment::from_lines(lines.into_iter().map(|line| line.line_id), expose_all)
 }
 
-/// Parse the stored assignment, tolerating an empty value.
-fn parse_assignment(
-    raw: &str,
-    identity: (String, String, bool),
-) -> Result<Vec<AgentConfig>, String> {
-    let (_, _, expose_all_lines) = identity.clone();
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        // An empty list is still a gateway when every line is exposed: there is
-        // nothing to curate, and demanding a list first would make the switch
-        // impossible to use on a fresh installation.
-        if expose_all_lines {
-            let (name, id, expose_all_lines) = identity;
-            return Ok(vec![AgentConfig {
-                lines: Vec::new(),
-                expose_all_lines,
-                name,
-                id,
-            }]);
-        }
-        return Ok(Vec::new());
+/// Project a stored assignment onto the agents this gateway runs.
+///
+/// One agent carrying every assigned line. The stored form stays a list because
+/// the operator's order is what the phone shows.
+fn configs_from_document(
+    document: &crate::assignment::Document,
+    identity: &(String, String),
+) -> Vec<AgentConfig> {
+    let (name, id) = identity.clone();
+    if document.lines.is_empty() && !document.expose_all {
+        // No lines is no agent, but the operator may still have set a name
+        // before assigning any: keeping it means the page shows what they typed.
+        return Vec::new();
     }
-    let lines: Vec<AssignedLine> =
-        serde_json::from_str(trimmed).map_err(|error| format!("线路分配不是有效 JSON: {error}"))?;
-    // One agent carrying every assigned line. The stored form stays a list
-    // because the operator's order is what the phone shows.
-    let lines: Vec<String> = lines
-        .into_iter()
-        .map(|line| line.line_id.trim().to_owned())
-        .filter(|line_id| !line_id.is_empty())
-        .collect();
-    let (name, id, _) = identity;
-    if lines.is_empty() && !expose_all_lines {
-        // No lines is no agent, but the operator may still have set a name before
-        // assigning any: keeping it means the page shows what they typed.
-        return Ok(Vec::new());
-    }
-    Ok(vec![AgentConfig {
-        lines,
-        expose_all_lines,
+    vec![AgentConfig {
+        lines: document.lines.clone(),
+        expose_all_lines: document.expose_all,
         name,
         id,
-    }])
-}
-
-/// Parse an assignment the way the settings page does, for tests.
-#[cfg(test)]
-pub(crate) fn parse_assignment_for_tests(
-    raw: &str,
-    identity: (String, String, bool),
-) -> Vec<AgentConfig> {
-    parse_assignment(raw, identity).unwrap_or_default()
+    }]
 }
 
 /// Route one request on the settings listener.
@@ -159,7 +180,7 @@ pub fn handle(
         ("POST", "/api/unpair") => unpair(fleet, &request),
         ("GET", "/api/lines") => lines(fleet, client),
         ("GET", "/api/logs") => logs(&request),
-        ("GET", "/api/config") => config_read(client),
+        ("GET", "/api/config") => config_read(fleet, client),
         ("POST", "/api/config") => config_write(fleet, client, relay, &request),
         ("GET", "/api/relay/devices") => relay_devices(relay_state),
         ("GET", "/api/info") => info_page(),
@@ -514,14 +535,53 @@ fn relay_devices(state: &Arc<crate::relay::State>) -> Response {
     }))
 }
 
-fn config_read(client: &Arc<Client>) -> Response {
-    match client.config() {
-        Ok(value) => Response::ok(json!({
-            "ok": true,
-            "config": value.get("config").cloned().unwrap_or_else(|| json!({})),
-        })),
-        Err(error) => Response::error(502, "Bad Gateway", "celmux_unavailable", &error.to_string()),
-    }
+/// `GET /api/config` — the provider settings, plus the assignment this plugin
+/// owns.
+///
+/// The two travel together because they are one form to the operator, but they
+/// are answered from different places on purpose: the provider settings come
+/// from Celmux, which resolves them, and the assignment comes from this plugin's
+/// own disk, which is where a click is saved. Serving the assignment from the
+/// host's copy is what made the page load a list the plugin had already replaced.
+fn config_read(fleet: &Arc<Fleet>, client: &Arc<Client>) -> Response {
+    let assignment = fleet.assignment_store().load();
+    let mut config = match client.config() {
+        Ok(value) => value
+            .get("config")
+            .cloned()
+            .unwrap_or_else(|| json!({}))
+            .as_object()
+            .cloned()
+            .unwrap_or_default(),
+        // Celmux being unreachable must not hide the line list: the operator can
+        // still see and edit what this plugin offers.
+        Err(_) => serde_json::Map::new(),
+    };
+    config.insert(
+        ASSIGNMENT_KEY.to_owned(),
+        Value::String(
+            serde_json::to_string(
+                &assignment
+                    .lines
+                    .iter()
+                    .map(|line| json!({ "line_id": line }))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap_or_else(|_| "[]".to_owned()),
+        ),
+    );
+    config.insert(
+        EXPOSE_ALL_KEY.to_owned(),
+        Value::String(
+            if assignment.expose_all {
+                "true"
+            } else {
+                "false"
+            }
+            .to_owned(),
+        ),
+    );
+    Response::ok(json!({ "ok": true, "config": config }))
 }
 
 /// `POST /api/config` — apply a settings change now, persist it behind the page.
@@ -549,11 +609,15 @@ fn config_write(
     let Some(values) = payload.get("values").and_then(Value::as_object) else {
         return Response::error(400, "Bad Request", "no_values", "缺少 values");
     };
-    // Only the assignment is applied here. Every other key is read from Celmux by
-    // the code that uses it, so persisting them is the whole job for those.
-    // The two values that change what this gateway offers are applied here. Every
-    // other key is read from Celmux by the code that uses it, so persisting it is
-    // the whole job for those.
+    // The assignment first, and it is the only key this route persists itself.
+    //
+    // Every other key is a provider setting: Celmux resolves it, hands it down at
+    // launch, and reading it from there is the whole job. The line assignment is
+    // a decision made on this page, so it is written to this plugin's own disk -
+    // and written *before* the fleet is told about it, because a click the
+    // operator has already seen must not be one that failed to save. The previous
+    // order reported success and wrote behind the answer, so a refused write came
+    // back to the page as a line that quietly rejoined the list it had just left.
     let running = fleet.list().first().cloned();
     let current = running
         .as_ref()
@@ -572,37 +636,52 @@ fn config_write(
         .and_then(Value::as_str)
         .map(|value| matches!(value.trim(), "true" | "1" | "on" | "yes"))
         .unwrap_or(current.expose_all_lines);
-    let assignment = values
-        .get(ASSIGNMENT_KEY)
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    if !assignment.is_empty() || values.contains_key(EXPOSE_ALL_KEY) {
+    let assignment = values.get(ASSIGNMENT_KEY).and_then(Value::as_str);
+    let expose_all_sent = values.contains_key(EXPOSE_ALL_KEY);
+    if assignment.is_some() || expose_all_sent {
+        let store = fleet.assignment_store();
         // An absent assignment keeps the one in effect, so flipping the switch
         // does not have to send the line list with it.
-        let raw = if assignment.is_empty() {
-            serde_json::to_string(
-                &current
-                    .lines
-                    .iter()
-                    .map(|line| json!({ "line_id": line }))
-                    .collect::<Vec<_>>(),
-            )
-            .unwrap_or_else(|_| "[]".to_owned())
-        } else {
-            assignment.to_owned()
+        let document = match assignment {
+            Some(raw) if !raw.trim().is_empty() => {
+                match serde_json::from_str::<Vec<AssignedLine>>(raw.trim()) {
+                    Ok(lines) => crate::assignment::from_lines(
+                        lines.into_iter().map(|line| line.line_id),
+                        expose_all,
+                    ),
+                    Err(error) => {
+                        return Response::error(
+                            400,
+                            "Bad Request",
+                            "bad_assignment",
+                            &format!("线路分配不是有效 JSON: {error}"),
+                        );
+                    }
+                }
+            }
+            _ => crate::assignment::from_lines(current.lines.iter(), expose_all),
         };
-        match parse_assignment(&raw, (identity.0, identity.1, expose_all)) {
-            Ok(configs) => {
-                let changed = fleet.apply_configs(configs);
-                crate::log_info!(
-                    "celmux-plugin-airsim: 配置已应用 expose_all={expose_all} lines={} changed={changed}",
-                    current.lines.len()
-                );
-            }
-            Err(error) => {
-                return Response::error(400, "Bad Request", "bad_assignment", &error);
-            }
+        if let Err(error) = store.save(&document) {
+            crate::log_warn!("celmux-plugin-airsim: 线路分配未能保存: {error}");
+            return Response::error(500, "Internal Server Error", "assignment_not_saved", &error);
         }
+        // Persisted, so the fleet can be told. A brand-new installation has no
+        // agent yet, and `apply_configs` only updates the ones that exist - so a
+        // first "add this line" has to build the fleet rather than do nothing.
+        let created = running.is_none();
+        let changed = if created {
+            fleet
+                .reconcile(configs_from_document(&document, &identity))
+                .map(|()| true)
+                .unwrap_or(false)
+        } else {
+            fleet.apply_configs(configs_from_document(&document, &identity))
+        };
+        crate::log_info!(
+            "celmux-plugin-airsim: 线路分配已保存 {} expose_all={expose_all} lines={} created={created} changed={changed}",
+            store.path().display(),
+            document.lines.len()
+        );
     }
 
     // The push sender is built from the key and its identifiers, so it has to be
@@ -643,20 +722,37 @@ fn config_write(
         }
     }
 
-    // Persist off this thread: the page has its answer, and a slow or unavailable
-    // Celmux must not turn a click into a spinner.
+    // The remaining keys are provider settings Celmux owns, so they are written
+    // back for the next launch. The assignment is not among them any more: it is
+    // this plugin's own state and it was already saved above, synchronously,
+    // where a failure could still be reported to the page.
+    //
+    // Persisted off this thread: the page has its answer, and a slow or
+    // unavailable Celmux must not turn a click into a spinner.
     let client = Arc::clone(client);
     let values: std::collections::BTreeMap<String, String> = values
         .iter()
+        .filter(|(key, _)| !is_own_state(key))
         .filter_map(|(key, value)| value.as_str().map(|text| (key.clone(), text.to_owned())))
         .collect();
-    std::thread::spawn(move || {
-        if let Err(error) = persist_config(&client, values) {
-            crate::log_warn!("celmux-plugin-airsim: 配置未能写入 Celmux: {error}");
-        }
-    });
+    if !values.is_empty() {
+        std::thread::spawn(move || {
+            if let Err(error) = persist_config(&client, values) {
+                crate::log_warn!("celmux-plugin-airsim: 配置未能写入 Celmux: {error}");
+            }
+        });
+    }
 
     Response::ok(json!({"ok": true}))
+}
+
+/// Keys this plugin owns rather than the host.
+///
+/// Sending them back to Celmux would recreate the shadow copy that made an
+/// "add this line" click into a configuration write: two places to be wrong, and
+/// a host refusal that looked like a success on the page.
+fn is_own_state(key: &str) -> bool {
+    matches!(key, ASSIGNMENT_KEY | EXPOSE_ALL_KEY)
 }
 
 /// Write settings back through Celmux.
@@ -718,109 +814,42 @@ fn random_session_id() -> Result<String, String> {
 mod tests {
     use super::*;
 
-    /// An empty assignment is not an error: a freshly installed plugin has no
-    /// agents yet, and the operator picks lines in the page.
-    #[test]
-    fn an_empty_assignment_yields_no_agents() {
-        assert!(parse_assignment("", Default::default()).unwrap().is_empty());
-        assert!(
-            parse_assignment("   ", Default::default())
-                .unwrap()
-                .is_empty()
-        );
+    fn identity() -> (String, String) {
+        ("Celmux".to_owned(), "celmux".to_owned())
     }
 
-    /// The assignment is one JSON field in Celmux's config, so it has to parse
-    /// from the exact text a page would save. Every assigned line becomes a slot
-    /// on the one agent, in the order the operator put them.
+    /// A line list becomes one agent carrying every line, in the operator's
+    /// order: the phone shows the slots in that order.
     #[test]
-    fn an_assignment_parses_into_one_agent_with_a_slot_per_line() {
-        let agents = parse_assignment(
-            r#"[{"line_id":"dji1","control_port":8642,"pcm_port":8643},
-                {"line_id":"读卡器1#8904","name":"Globe","control_port":8652,"pcm_port":8653}]"#,
-            Default::default(),
-        )
-        .unwrap();
-        assert_eq!(agents.len(), 1, "只有一个 agent");
+    fn an_assignment_becomes_one_agent_with_a_slot_per_line() {
+        let document = crate::assignment::from_lines(["dji1", "读卡器1#8904"], false);
+        let agents = configs_from_document(&document, &identity());
+        assert_eq!(agents.len(), 1, "one agent, not one per line");
         assert_eq!(
             agents[0].lines,
             vec!["dji1".to_owned(), "读卡器1#8904".to_owned()]
         );
+        assert!(!agents[0].expose_all_lines);
+        assert_eq!(agents[0].name, "Celmux");
     }
 
-    /// A row with no line names no agent, so it must not create a ghost.
+    /// Nothing offered is no agent at all: a gateway with no slots would still
+    /// answer the phone and offer it nothing to call.
     #[test]
-    fn a_row_without_a_line_is_skipped() {
-        let agents = parse_assignment(
-            r#"[{"line_id":"","control_port":8642,"pcm_port":8643},
-                {"line_id":"dji1","control_port":8644,"pcm_port":8645}]"#,
-            Default::default(),
-        )
-        .unwrap();
+    fn nothing_offered_is_no_agent() {
+        let document = crate::assignment::from_lines(Vec::<String>::new(), false);
+        assert!(configs_from_document(&document, &identity()).is_empty());
+    }
+
+    /// The "expose everything" switch is a gateway even with an empty list: the
+    /// list is a snapshot and Celmux is not, so the switch is what a fresh
+    /// installation uses before it has curated anything.
+    #[test]
+    fn exposing_everything_needs_no_stored_lines() {
+        let document = crate::assignment::from_lines(Vec::<String>::new(), true);
+        let agents = configs_from_document(&document, &identity());
         assert_eq!(agents.len(), 1);
-        assert_eq!(agents[0].lines, vec!["dji1".to_owned()], "空行不产生槽位");
-    }
-
-    #[test]
-    fn a_malformed_assignment_names_the_problem() {
-        let error = parse_assignment("not json", Default::default()).unwrap_err();
-        assert!(error.contains("JSON"));
-    }
-
-    /// A window is what makes pairing possible at all; it has to last long
-    /// enough to walk to the phone and short enough to stop being useful.
-    #[test]
-    fn the_pairing_window_is_minutes_not_hours() {
-        assert_eq!(PAIRING_TTL.as_secs(), 300);
-    }
-    fn assignment(lines: &[&str]) -> String {
-        let rows: Vec<String> = lines
-            .iter()
-            .map(|line| format!("{{\"line_id\":\"{line}\"}}"))
-            .collect();
-        format!("[{}]", rows.join(","))
-    }
-
-    fn identity(expose_all: bool) -> (String, String, bool) {
-        ("Celmux".to_owned(), "celmux".to_owned(), expose_all)
-    }
-
-    /// The switch survives parsing, and the curated list survives with it.
-    ///
-    /// Both have to be readable afterwards: with the switch on the list is not
-    /// consulted, and an operator who turns the switch back off expects the lines
-    /// they assigned to still be there.
-    #[test]
-    fn the_expose_all_switch_is_parsed_alongside_the_assignment() {
-        let raw = assignment(&["读卡器1", "dji1"]);
-
-        let off = parse_assignment(&raw, identity(false)).expect("parse");
-        assert_eq!(off.len(), 1);
-        assert!(!off[0].expose_all_lines);
-        assert_eq!(off[0].lines, vec!["读卡器1".to_owned(), "dji1".to_owned()]);
-
-        let on = parse_assignment(&raw, identity(true)).expect("parse");
-        assert_eq!(on.len(), 1);
-        assert!(on[0].expose_all_lines);
-        assert_eq!(
-            on[0].lines,
-            vec!["读卡器1".to_owned(), "dji1".to_owned()],
-            "打开开关不清空手动分配的线路"
-        );
-    }
-
-    /// With no assignment at all, the switch alone still yields a gateway.
-    ///
-    /// Otherwise the switch would be unusable on a fresh installation: there is
-    /// nothing to curate yet, and every line is supposed to appear.
-    #[test]
-    fn the_switch_alone_yields_a_gateway_with_no_assignment() {
-        let on = parse_assignment("", identity(true)).expect("parse");
-        assert_eq!(on.len(), 1, "开关打开时没有线路也要有 agent");
-        assert!(on[0].expose_all_lines);
-        assert!(on[0].lines.is_empty());
-
-        let off = parse_assignment("", identity(false)).expect("parse");
-        assert!(off.is_empty(), "开关关闭且没有线路时没有 agent");
+        assert!(agents[0].expose_all_lines);
+        assert!(agents[0].lines.is_empty());
     }
 }

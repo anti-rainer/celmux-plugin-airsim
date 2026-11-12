@@ -1126,23 +1126,31 @@ function fillPortInputs() {
 async function saveAssignment() {
   const note = document.getElementById('save-note');
   if (note) { note.className = 'hint'; note.textContent = '保存中…'; }
+  pendingWrites += 1;
   try {
     for (const row of state.assignment) {
       if (!row.line_id) throw new Error('有线路未选择');
     }
-    // The plugin applies the change and answers; persisting it to Celmux happens
-    // behind that answer. Relaying the write through Celmux first meant the page
-    // waited on two processes to see a change it had already made.
+    // The plugin writes the assignment to its own disk and answers with the
+    // result, so this request is the one that decides whether the click holds.
+    // There is no second process behind it to wait on.
     await pluginFetch('/api/config', {
       method: 'POST',
       body: JSON.stringify({ values: { agents: JSON.stringify(state.assignment) } }),
     });
     if (note) note.textContent = '';
+    lastLocalEdit = Date.now();
   } catch (error) {
     if (note) {
       note.className = 'err';
       note.textContent = '保存失败：' + error.message;
     }
+    // The click did not hold, so the page must stop claiming it did: reload the
+    // assignment the plugin actually has rather than leaving the working copy
+    // disagreeing with it.
+    await reloadAssignment();
+  } finally {
+    pendingWrites -= 1;
   }
 }
 
@@ -1219,7 +1227,23 @@ async function refresh() {
  */
 const LIVE_INTERVAL_MS = 2000;
 /** How long a local edit is trusted over a poll that may predate it. */
-const LOCAL_EDIT_GRACE_MS = 1500;
+/**
+ * How long after a click the poll keeps its hands off, in addition to the
+ * in-flight flag below.
+ *
+ * This is a backstop, not the mechanism: the mechanism is `pendingWrites`, which
+ * is incremented before the request and decremented when it settles. The window
+ * exists because a poll that started before the click can still resolve after
+ * it, and that answer describes the state before the operator's decision.
+ *
+ * It has to outlast a round trip rather than a fixed guess. The previous value
+ * was shorter than the poll interval, so the very next tick redrew from an answer
+ * that predated the write and put the row back - which is what "it un-joins after
+ * a few seconds" looked like.
+ */
+const LOCAL_EDIT_GRACE_MS = 5000;
+/** Writes in flight. The poll is suspended while this is non-zero. */
+let pendingWrites = 0;
 let liveTimer = null;
 let lastLocalEdit = 0;
 
@@ -1241,6 +1265,7 @@ async function pollLive() {
   // A click the server has not confirmed yet would be undone by an answer that
   // was already in flight. The window is short on purpose: the write answers in
   // tens of milliseconds, and this only has to cover the gap.
+  if (pendingWrites > 0) return;
   if (Date.now() - lastLocalEdit < LOCAL_EDIT_GRACE_MS) return;
   const before = stateFingerprint();
   try {
@@ -1262,6 +1287,26 @@ function startLiveUpdates() {
   document.addEventListener('visibilitychange', () => {
     if (!document.hidden) pollLive();
   });
+}
+
+/**
+ * Take the assignment the plugin actually has.
+ *
+ * The click is optimistic: the row moves before the write is answered. When the
+ * write is refused, the page has to stop showing a decision that did not take -
+ * so this asks the plugin and redraws from its answer.
+ */
+async function reloadAssignment() {
+  try {
+    const data = await pluginFetch('/api/config');
+    const raw = String((data.config || {}).agents || '');
+    state.assignment = raw.trim() ? JSON.parse(raw) : [];
+  } catch {
+    state.assignment = [];
+  }
+  applyExposureLocally();
+  renderLines();
+  renderHome();
 }
 
 async function loadConfig() {

@@ -442,6 +442,13 @@ impl Fleet {
             root: root.to_path_buf(),
         }
     }
+
+    /// The store the line assignment lives in: this plugin's own disk, beside
+    /// the pairing secrets. Not Celmux's configuration - adding a line is the
+    /// operator's decision on this page, not a value the host resolves.
+    pub fn assignment_store(&self) -> crate::assignment::Store {
+        crate::assignment::Store::new(&self.root)
+    }
 }
 
 impl Default for Fleet {
@@ -754,21 +761,6 @@ mod tests {
         );
     }
 
-    /// With the switch on the gateway is still a gateway when the list is empty.
-    ///
-    /// Demanding a list first would make the switch impossible to use on a fresh
-    /// installation: there is nothing to curate, and every line should appear.
-    #[test]
-    fn an_empty_list_still_yields_an_agent_when_every_line_is_exposed() {
-        let configs =
-            crate::settings::parse_assignment_for_tests("", ("C".to_owned(), String::new(), true));
-        assert_eq!(configs.len(), 1, "开关打开时没有线路也要有 agent");
-        assert!(configs[0].expose_all_lines);
-
-        let configs =
-            crate::settings::parse_assignment_for_tests("", ("C".to_owned(), String::new(), false));
-        assert!(configs.is_empty(), "开关关闭且没有线路时没有 agent");
-    }
     /// A configuration change applies without rebuilding the agent.
     ///
     /// This is the whole point of the lock: restarting a plugin to read one

@@ -21,6 +21,7 @@
 mod agents;
 mod apns;
 mod apns_http;
+mod assignment;
 mod audio_wire;
 mod auth;
 mod celmux;
@@ -113,7 +114,7 @@ fn main() {
     // The assignment lives in Celmux's plugin configuration, so it survives a
     // restart of this process. Read it before opening any listener: a bridge
     // that starts with no agents accepts connections and answers none of them.
-    match settings::load_assignment(&client) {
+    match settings::load_assignment(&client, &assignment::Store::new(&root)) {
         Ok(configs) => {
             if let Err(error) = fleet.reconcile(configs.clone()) {
                 crate::log_warn!("celmux-plugin-airsim: 无法载入线路分配: {error}");
