@@ -557,7 +557,7 @@ impl Control {
             "transport": "vowlan",
             // A String on the client: an integer here fails decoding and the
             // app's status screen goes blank.
-            "version": "0.2.0",
+            "version": env!("CARGO_PKG_VERSION"),
             "agent_id": agent_id,
             "identity_proof": proof,
             "agent_kind": "standalone",

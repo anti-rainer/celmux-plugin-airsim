@@ -1,7 +1,7 @@
 [package]
 name = "celmux-plugin-airsim"
 description = "AirSIM VoWLAN bridge for Celmux: exposes Celmux voice lines to the AirSIM iOS client"
-version = "0.2.0"
+version = "1.0.2"
 edition = "2024"
 rust-version = "1.85"
 authors = ["anti-rainer"]

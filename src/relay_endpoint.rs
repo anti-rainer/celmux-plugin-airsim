@@ -1260,7 +1260,7 @@ mod tests {
                 "airsim".to_owned(),
                 None,
             )),
-            plugin_version: "0.2.0".to_owned(),
+            plugin_version: env!("CARGO_PKG_VERSION").to_owned(),
         }
     }
 

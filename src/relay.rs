@@ -763,7 +763,7 @@ mod tests {
             name: "celmux".to_owned(),
             model: "MU300".to_owned(),
             number: "+447".to_owned(),
-            version: "0.2.0".to_owned(),
+            version: env!("CARGO_PKG_VERSION").to_owned(),
             at_ok: true,
         }
     }
