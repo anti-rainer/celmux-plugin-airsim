@@ -448,13 +448,33 @@ fn lines(fleet: &Arc<Fleet>, client: &Arc<Client>) -> Response {
             return Response::error(502, "Bad Gateway", "celmux_unavailable", &error.to_string());
         }
     };
+    // What Celmux reports is "is this line usable right now". What the operator
+    // assigned is "this line is mine". The page needs both, because a line that
+    // drops out of the first must not drop out of the second: a module replugged
+    // or a tunnel restarting is a reason to wait, not to silently un-offer the
+    // line the operator chose.
+    let online: std::collections::BTreeSet<String> = lines
+        .iter()
+        .filter(|line| line.online && line.usable())
+        .map(|line| line.line_id.clone())
+        .collect();
+    let store = fleet.assignment_store();
+    let mut assignment = store.load();
+    // Recording the moment a line was last seen is a write, so it happens only
+    // when something actually changed; this route is polled every couple of
+    // seconds.
+    if assignment.observe(&online, now_epoch_seconds()) {
+        if let Err(error) = store.save(&assignment) {
+            crate::log_warn!("celmux-plugin-airsim: 无法记录线路离线时间: {error}");
+        }
+    }
     let devices = client.devices().unwrap_or_default();
     let by_id: std::collections::BTreeMap<&str, &crate::celmux::Device> = devices
         .iter()
         .map(|device| (device.id.as_str(), device))
         .collect();
     let agents = fleet.list();
-    let rows: Vec<Value> = lines
+    let mut rows: Vec<Value> = lines
         .into_iter()
         .map(|line| {
             let device = line.device_id.as_str();
@@ -509,10 +529,62 @@ fn lines(fleet: &Arc<Fleet>, client: &Arc<Client>) -> Response {
                     .and_then(|modem| modem.model.clone())
                     .unwrap_or_default(),
                 "exposed": exposed,
+                // Present now, so the page lists it under the online tab.
+                "present": true,
+                "last_seen": Value::Null,
             })
         })
         .collect();
+
+    // The assigned lines Celmux did not report, as history. They stay in the
+    // phone's face only while they are gone - `exposed` reports what the agent is
+    // configured with, and offering a line that cannot answer would put an entry
+    // in the phone's list that always fails.
+    for line_id in assignment.absent(&online) {
+        let exposed = agents.iter().any(|agent| agent.exposes(line_id));
+        let device_id = line_id.split('#').next().unwrap_or_default();
+        let module = by_id.get(device_id);
+        rows.push(json!({
+            "line_id": line_id,
+            "device_id": device_id,
+            "device_name": device_id.to_owned(),
+            "operator_name": "",
+            "local_phone": "",
+            "n_standby": false,
+            "online": false,
+            "profile_name": "",
+            "voice_route": module.map(|device| device.voice_route.clone()).unwrap_or_default(),
+            "voice_route_reason": module.map(|device| device.voice_route_reason.clone()).unwrap_or_default(),
+            "vowifi_active": false,
+            "n_standby_active": false,
+            "registration": "",
+            "module_running": module.map(|device| device.running).unwrap_or(false),
+            "network_enabled": module.map(|device| device.network_enabled).unwrap_or(false),
+            "module_ims": false,
+            "n_standby_online": 0,
+            "n_standby_total": 0,
+            "signal_dbm": Value::Null,
+            "iccid": "",
+            "imsi": "",
+            "module_model": "",
+            // What the agent is configured with. The page shows this as "will
+            // come back on its own", which is the point of keeping the entry:
+            // the operator does not have to remember to re-add it.
+            "exposed": exposed,
+            "assigned": exposed,
+            "present": false,
+            "last_seen": assignment.last_seen.get(line_id).copied().unwrap_or(0),
+        }));
+    }
     Response::ok(json!({"ok": true, "lines": rows}))
+}
+
+/// Seconds since the epoch, for the offline timestamps.
+fn now_epoch_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// The plugin's own configuration, as Celmux holds it.
@@ -642,7 +714,11 @@ fn config_write(
         let store = fleet.assignment_store();
         // An absent assignment keeps the one in effect, so flipping the switch
         // does not have to send the line list with it.
-        let document = match assignment {
+        // The history travels with the assignment: saving the page must not
+        // erase how long a line has been offline, and a line the operator just
+        // re-added keeps the timestamp it already had.
+        let previous = store.load();
+        let mut document = match assignment {
             Some(raw) if !raw.trim().is_empty() => {
                 match serde_json::from_str::<Vec<AssignedLine>>(raw.trim()) {
                     Ok(lines) => crate::assignment::from_lines(
@@ -661,6 +737,11 @@ fn config_write(
             }
             _ => crate::assignment::from_lines(current.lines.iter(), expose_all),
         };
+        document.last_seen = previous
+            .last_seen
+            .into_iter()
+            .filter(|(line, _)| document.lines.contains(line))
+            .collect();
         if let Err(error) = store.save(&document) {
             crate::log_warn!("celmux-plugin-airsim: 线路分配未能保存: {error}");
             return Response::error(500, "Internal Server Error", "assignment_not_saved", &error);

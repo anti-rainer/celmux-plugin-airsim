@@ -40,6 +40,26 @@
   }
   .tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--border);
           margin-bottom: 18px; overflow-x: auto; }
+  /* The second level: it belongs to the lines panel, so it sits below the
+     page tabs and is quieter than them. Scrolling horizontally rather than
+     wrapping, so a third list would not push the cards down. */
+  .subtabs { display: flex; gap: 2px; margin: 0 0 14px; border-bottom: 1px solid var(--line);
+             overflow-x: auto; scrollbar-width: none; }
+  .subtabs::-webkit-scrollbar { display: none; }
+  .subtab { flex: 0 0 auto; padding: 8px 14px; border: 0; border-bottom: 2px solid transparent;
+            background: none; color: var(--muted); cursor: pointer; font: inherit;
+            font-size: 13.5px; white-space: nowrap; }
+  .subtab:hover { color: var(--fg); }
+  .subtab.active { color: var(--accent); border-bottom-color: var(--accent); font-weight: 600; }
+  .subtab-count { margin-left: 6px; padding: 1px 6px; border-radius: 999px;
+                  background: var(--line); color: var(--muted); font-size: 11.5px;
+                  font-weight: 500; }
+  .subtab-count:empty { display: none; }
+  /* An offline row is present but cannot carry a call: dimmed, and it says when
+     it was last seen rather than pretending to have a live status. */
+  .line-card.offline { opacity: .62; }
+  .line-card.offline .line-device { color: var(--muted); }
+  .line-when { color: var(--muted); font-size: 12px; }
   .tab { padding: 9px 16px; border: 0; background: none; color: var(--muted);
          font: inherit; cursor: pointer; white-space: nowrap;
          border-bottom: 2px solid transparent; margin-bottom: -1px; }
@@ -261,6 +281,17 @@
         <button id="privacy-toggle" class="eye" type="button"></button>
       </div>
     </div>
+    <!-- Two lists, because a line has two states that need different actions.
+         Online is the live picture from Celmux. History is the lines the operator
+         added that Celmux cannot see right now: they keep their place in the
+         assignment, so they come back on their own, and the only thing worth
+         doing to one is removing it for good. -->
+    <nav class="subtabs" role="tablist">
+      <button class="subtab active" data-lines-tab="online" role="tab">在线列表</button>
+      <button class="subtab" data-lines-tab="history" role="tab">
+        历史列表<span class="subtab-count" id="history-count"></span>
+      </button>
+    </nav>
     <div id="lines-list"></div>
     <p class="hint" id="save-note" style="margin-top:12px"></p>
   </section>
@@ -445,6 +476,9 @@ const state = {
   // ICCIDs, and it is opened in shared spaces far more often than it is opened to
   // read one out. It is a "someone is looking" switch, so it is per session.
   privacyHidden: true,
+  // Which list the 线路 tab is showing. In memory only: it is where the operator
+  // was looking, not a setting, and a reload landing on the live list is right.
+  linesTab: 'online',
 };
 
 function el(tag, props = {}, children = []) {
@@ -514,6 +548,18 @@ function accessTagClass(line) {
   if (line.voice_route === 'unavailable') return 'tag err';
   if (!line.online) return 'tag warn';
   return 'tag ok';
+}
+
+for (const subtab of document.querySelectorAll('.subtab')) {
+  subtab.onclick = () => {
+    state.linesTab = subtab.dataset.linesTab;
+    for (const other of document.querySelectorAll('.subtab')) {
+      const active = other === subtab;
+      other.classList.toggle('active', active);
+      other.setAttribute('aria-selected', active ? 'true' : 'false');
+    }
+    renderLines();
+  };
 }
 
 for (const tab of document.querySelectorAll('.tab')) {
@@ -626,11 +672,31 @@ function apnsConfigured() {
 function renderLines() {
   const container = document.getElementById('lines-list');
   container.replaceChildren();
-  if (!state.lines.length) {
-    container.append(el('p', { className: 'hint' }, ['Celmux 没有报告任何线路。']));
+  // Two lists out of one answer. A line is either something Celmux reports now
+  // or something the operator assigned that it cannot see - never both, so the
+  // two lists cannot show a line twice.
+  const present = state.lines.filter((line) => line.present !== false);
+  const history = state.lines.filter((line) => line.present === false);
+  const badge = document.getElementById('history-count');
+  if (badge) badge.textContent = history.length ? String(history.length) : '';
+  const showing = state.linesTab === 'history' ? history : present;
+  if (!showing.length) {
+    container.append(
+      el('p', { className: 'hint' }, [
+        state.linesTab === 'history'
+          ? '没有离线留存。加入过 AirSIM 但当前离线线路会出现在这里。'
+          : state.lines.length
+            ? '当前没有在线线路。已加入的线路在「历史列表」里等待恢复。'
+            : 'Celmux 没有报告任何线路。',
+      ]),
+    );
     return;
   }
-  for (const line of state.lines) {
+  for (const line of showing) {
+    if (line.present === false) {
+      container.append(offlineCard(line));
+      continue;
+    }
     // Three lines of identity and one action in the corner:
     //
     //   device · mode
@@ -703,6 +769,87 @@ function applyPrivacy() {
 }
 
 /**
+ * One row in the history list: a line the operator added that Celmux cannot see.
+ *
+ * It says three things and offers one action. Which line it is - the only thing
+ * that survives while it is gone - when it was last seen, and that it comes back
+ * by itself if it returns. The action is removal, because that is the only
+ * decision left: the line is already not offered, so an "un-expose" toggle would
+ * be a no-op with a misleading label.
+ */
+function offlineCard(line) {
+  const card = el('div', { className: 'line-card offline' });
+
+  // Retained in the assignment, so it returns on its own. Showing that instead of
+  // a "join" button is the whole point of keeping it.
+  const retained = el('span', { className: 'tag' }, ['离线留存']);
+
+  const action = el('button', { className: 'danger line-action' }, ['移除']);
+  action.onclick = (event) => {
+    event.stopPropagation();
+    void forgetLine(line);
+  };
+
+  const body = el('div', { className: 'line-body' }, [
+    el('div', { className: 'line-row line-row-1' }, [
+      el('span', { className: 'line-device' }, [line.device_name || line.line_id]),
+      el('span', { className: 'line-dot' }, ['·']),
+      retained,
+    ]),
+    el('div', { className: 'line-row' }, [
+      el('span', { className: 'line-when' }, [`上次在线：${formatLastSeen(line.last_seen)}`]),
+    ]),
+    el('div', { className: 'line-row' }, [
+      el('span', { className: 'line-iccid mono private' }, [line.line_id]),
+    ]),
+  ]);
+
+  card.append(body, action);
+  return card;
+}
+
+/**
+ * When a line was last seen, in words when that is clearer than a clock.
+ *
+ * The operator's question is "how long has this been gone", not "at what time",
+ * so a recent loss reads as minutes and an old one as a date. An unknown moment -
+ * a line that went offline before this was recorded - says so rather than showing
+ * the epoch.
+ */
+function formatLastSeen(seconds) {
+  if (!seconds) return '未知';
+  const when = new Date(seconds * 1000);
+  if (Number.isNaN(when.getTime())) return '未知';
+  const elapsed = (Date.now() - when.getTime()) / 1000;
+  if (elapsed < 60) return '刚刚';
+  if (elapsed < 3600) return `${Math.floor(elapsed / 60)} 分钟前`;
+  if (elapsed < 86400) return `${Math.floor(elapsed / 3600)} 小时前`;
+  if (elapsed < 86400 * 7) return `${Math.floor(elapsed / 86400)} 天前`;
+  const pad = (value) => String(value).padStart(2, '0');
+  return `${when.getFullYear()}-${pad(when.getMonth() + 1)}-${pad(when.getDate())} ${pad(when.getHours())}:${pad(when.getMinutes())}`;
+}
+
+/**
+ * Remove a line from the assignment for good.
+ *
+ * Distinct from `exposeLine`, which toggles: this is only offered for a line that
+ * is gone, and it drops the retained entry so the line will not come back on its
+ * own the next time it is plugged in.
+ */
+async function forgetLine(line) {
+  const existing = state.assignment.findIndex((row) => row.line_id === line.line_id);
+  if (existing < 0) return;
+  state.assignment.splice(existing, 1);
+  // Drop it from the rendered lists too, so the row goes now rather than after
+  // the next poll.
+  state.lines = state.lines.filter((row) => row.line_id !== line.line_id);
+  lastLocalEdit = Date.now();
+  renderLines();
+  renderHome();
+  await saveAssignment();
+}
+
+/**
  * Take one line into or out of the set the phone sees.
  *
  * The page answers immediately: the row is flipped here, drawn here, and the
@@ -739,7 +886,11 @@ async function exposeLine(line) {
 function applyExposureLocally() {
   const exposed = new Set(state.assignment.map((row) => row.line_id));
   for (const line of state.lines || []) {
-    line.exposed = exposed.has(line.line_id);
+    // `assigned` is the working copy's view. `exposed` on an offline row already
+    // means "will come back on its own", so it is left alone: the plugin answered
+    // that, and the page has no better information about a line it cannot see.
+    line.assigned = exposed.has(line.line_id);
+    if (line.present !== false) line.exposed = line.assigned;
   }
 }
 

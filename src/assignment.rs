@@ -22,7 +22,7 @@
 //! The file is a small JSON document, written whole and replaced atomically. It
 //! holds only line labels, which are public: no secret is ever here.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -39,8 +39,22 @@ pub struct Document {
     #[serde(default)]
     pub expose_all: bool,
     /// The lines the operator added, in the order the page showed them.
+    ///
+    /// Kept whether or not Celmux reports them right now. A line drops out of
+    /// Celmux's list for reasons that have nothing to do with the operator - a
+    /// module replugged, a SIM swapped, a tunnel restarting - and forgetting it
+    /// here would silently un-offer a line they had chosen, then leave them to
+    /// notice and re-add it. What a line *is* survives; whether it can carry a
+    /// call at this moment is asked of Celmux per request.
     #[serde(default)]
     pub lines: Vec<String>,
+    /// When each line was last reported online, for the ones that are not now.
+    ///
+    /// Only the absence is stored: a line that is online has no entry, so the
+    /// map cannot go stale for the lines that matter. Seconds since the epoch,
+    /// because that is what the page formats and what survives a restart.
+    #[serde(default)]
+    pub last_seen: BTreeMap<String, i64>,
 }
 
 impl Document {
@@ -135,6 +149,42 @@ impl Store {
     }
 }
 
+impl Document {
+    /// Record which of the assigned lines Celmux reports right now.
+    ///
+    /// A line that is online needs no timestamp - it is present - so its entry
+    /// goes away. A line that is not keeps the moment it was last seen, or gets
+    /// `now` the first time it is noticed missing, so the page can say how long
+    /// it has been gone rather than only that it is.
+    ///
+    /// Returns whether the document changed, so a poll that learns nothing new
+    /// does not rewrite the file every couple of seconds.
+    pub fn observe(&mut self, online: &BTreeSet<String>, now: i64) -> bool {
+        let before = self.last_seen.clone();
+        let assigned: BTreeSet<&String> = self.lines.iter().collect();
+        for line in assigned {
+            if online.contains(line) {
+                self.last_seen.remove(line);
+            } else {
+                self.last_seen.entry(line.clone()).or_insert(now);
+            }
+        }
+        // A line no longer offered has no history to keep: leaving entries behind
+        // would grow the file forever and resurrect a stale timestamp if the line
+        // were added again much later.
+        self.last_seen.retain(|line, _| self.lines.contains(line));
+        self.last_seen != before
+    }
+
+    /// The lines Celmux did not report, in assignment order.
+    pub fn absent<'a>(&'a self, online: &'a BTreeSet<String>) -> Vec<&'a String> {
+        self.lines
+            .iter()
+            .filter(|line| !online.contains(*line))
+            .collect()
+    }
+}
+
 /// The assignment a page submitted, in the order it sent them.
 ///
 /// Empty labels are dropped rather than stored: a row with no line cannot be
@@ -154,6 +204,7 @@ where
         version: Document::VERSION,
         expose_all,
         lines,
+        last_seen: BTreeMap::new(),
     }
 }
 
@@ -199,6 +250,84 @@ mod tests {
         assert!(loaded.lines.is_empty());
         assert!(!loaded.expose_all);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The point of retention: a line the operator chose stays chosen when
+    /// Celmux stops reporting it, so it is offered again the moment it returns
+    /// without anyone re-adding it.
+    #[test]
+    fn a_line_that_goes_away_is_kept_and_returns_on_its_own() {
+        let mut document = from_lines(["读卡器1#890", "读卡器2#891"], false);
+        let both: std::collections::BTreeSet<String> = ["读卡器1#890", "读卡器2#891"]
+            .map(str::to_owned)
+            .into_iter()
+            .collect();
+
+        // Both present: nothing is offline, so nothing has a timestamp.
+        assert!(!document.observe(&both, 1000));
+        assert!(document.last_seen.is_empty());
+        assert_eq!(document.lines.len(), 2, "两条都还在分配里");
+
+        // One drops out: it stays assigned, and the moment is recorded.
+        let one: std::collections::BTreeSet<String> =
+            ["读卡器2#891"].map(str::to_owned).into_iter().collect();
+        assert!(document.observe(&one, 2000));
+        assert_eq!(document.lines.len(), 2, "离线不改变分配");
+        assert_eq!(document.last_seen.get("读卡器1#890"), Some(&2000));
+        assert!(
+            !document.last_seen.contains_key("读卡器2#891"),
+            "在线的不该有离线时间"
+        );
+
+        // It comes back: the timestamp goes away and the line is offered again by
+        // virtue of still being assigned.
+        assert!(document.observe(&both, 3000));
+        assert!(document.last_seen.is_empty());
+        assert_eq!(document.lines.len(), 2);
+    }
+
+    /// Polling every couple of seconds must not rewrite the file each time: an
+    /// observation that learns nothing reports no change.
+    #[test]
+    fn observing_the_same_state_twice_changes_nothing() {
+        let mut document = from_lines(["读卡器1#890"], false);
+        let none: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        assert!(document.observe(&none, 500), "第一次发现离线要记录时间");
+        assert!(!document.observe(&none, 700), "同一状态不该再写一次");
+        assert_eq!(
+            document.last_seen.get("读卡器1#890"),
+            Some(&500),
+            "时间不刷新"
+        );
+    }
+
+    /// A line the operator removed has no history: entries for it would grow the
+    /// file forever and resurrect a stale timestamp if it were added again later.
+    #[test]
+    fn a_line_no_longer_assigned_leaves_no_history_behind() {
+        let mut document = from_lines(["读卡器1#890", "读卡器2#891"], false);
+        let none: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        document.observe(&none, 1000);
+        assert_eq!(document.last_seen.len(), 2);
+
+        document.lines.retain(|line| line != "读卡器1#890");
+        document.observe(&none, 2000);
+        assert!(
+            !document.last_seen.contains_key("读卡器1#890"),
+            "已移除的线路不该留时间"
+        );
+        assert!(document.last_seen.contains_key("读卡器2#891"));
+    }
+
+    /// The two lists are built from one answer and a line belongs to exactly one.
+    #[test]
+    fn a_line_is_either_present_or_history() {
+        let document = from_lines(["读卡器1#890", "读卡器2#891"], false);
+        let one: std::collections::BTreeSet<String> =
+            ["读卡器2#891"].map(str::to_owned).into_iter().collect();
+        let absent = document.absent(&one);
+        assert_eq!(absent, vec![&"读卡器1#890".to_owned()]);
+        assert!(!absent.iter().any(|line| one.contains(*line)));
     }
 
     /// A line named twice would render one row twice and count it twice.
