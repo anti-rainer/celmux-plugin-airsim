@@ -461,35 +461,69 @@ impl Default for Fleet {
 }
 
 impl Fleet {
-    /// Replace the fleet from configuration.
+    /// Make the running fleet match `configs`, without rebuilding what it can
+    /// keep.
     ///
-    /// A line that keeps its assignment keeps its agent, and therefore its
-    /// secret and its pairing state: re-saving the settings page must not
-    /// unpair a phone. Only lines that appear or disappear change.
-    /// Apply the current assignment without rebuilding the agents.
+    /// This is the only way an assignment change reaches the running process, and
+    /// it has to do all three things - add, update, remove - because the
+    /// assignment is a complete statement of what this gateway offers:
     ///
-    /// `reconcile` replaces agents, which is right at startup and wrong for a
-    /// settings change: a rebuilt agent drops its pairing window, its call
-    /// suppression and the revision the phone's long poll is waiting on. This
-    /// updates what changed and leaves the rest of the running state alone.
+    /// * A line the operator just added has no agent yet, so "update the agents
+    ///   that exist" did nothing and still answered success. That was the click
+    ///   that appeared to apply and then reverted.
+    /// * Removing the last line has to take the agent away, or the page reports
+    ///   nothing offered while the phone keeps dialling the line that is still
+    ///   configured - "remove" that cannot remove is the same bug upside down.
+    /// * An agent that keeps its place must not be rebuilt. Rebuilding drops its
+    ///   pairing window, its call suppression and the revision the phone's long
+    ///   poll is waiting on, so re-saving the page would unpair phones and stall
+    ///   their event streams for a change that never touched them.
     ///
     /// Returns whether anything changed.
     pub fn apply_configs(&self, configs: Vec<AgentConfig>) -> bool {
-        let Ok(agents) = self.agents.lock() else {
+        let Ok(mut agents) = self.agents.lock() else {
             return false;
         };
         let mut changed = false;
+        let mut wanted: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let stored = crate::secrets::Store::new(&self.root).load();
         for config in configs {
             let id = config.agent_id();
-            // An agent that does not exist yet is a startup-shaped change: the
-            // caller's `reconcile` builds it rather than this inventing one.
-            if let Some(agent) = agents.get(&id) {
-                changed |= agent.replace_config(config);
+            wanted.insert(id.clone());
+            match agents.get(&id) {
+                Some(agent) => changed |= agent.replace_config(config),
+                None => {
+                    // A new agent is the agent the phone already paired with, if
+                    // it paired before: the secret lives on disk as well as in
+                    // memory, and dropping it here would answer the phone's next
+                    // request with a signature it cannot produce.
+                    let agent = Agent::new(config, None).with_store(&self.root);
+                    if let Some(secret) = stored.get(&id).cloned() {
+                        agent.set_secret(secret);
+                    }
+                    agents.insert(id, Arc::new(agent));
+                    changed = true;
+                }
             }
+        }
+        let removed: Vec<String> = agents
+            .keys()
+            .filter(|id| !wanted.contains(*id))
+            .cloned()
+            .collect();
+        for id in removed {
+            agents.remove(&id);
+            changed = true;
         }
         changed
     }
 
+    /// Replace the whole fleet at startup.
+    ///
+    /// Startup-shaped on purpose: there is no running state to preserve, and a
+    /// process that has just come up has no phone waiting on a revision yet.
+    /// Settings changes go through `apply_configs`, which keeps the agents it
+    /// can and still adds and removes the ones that changed.
     pub fn reconcile(&self, configs: Vec<AgentConfig>) -> Result<(), String> {
         let mut agents = self
             .agents
@@ -654,6 +688,101 @@ mod tests {
         let agent = restarted.list().into_iter().next().unwrap();
         assert_eq!(agent.secret(), Some(vec![5; 32]));
         assert!(agent.verifier().is_some(), "the pairing must be usable");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The click that started this: a line added to a gateway that already had
+    /// agents was never installed, because only existing agents were updated.
+    #[test]
+    fn adding_a_line_that_has_no_agent_yet_installs_one() {
+        let root = std::env::temp_dir().join("celmux-airsim-add-line");
+        let _ = std::fs::remove_dir_all(&root);
+        let fleet = Fleet::new(&root);
+        // A gateway with no lines has no agent at all.
+        assert!(!fleet.apply_configs(Vec::new()));
+        assert_eq!(fleet.list().len(), 0);
+
+        let added = fleet.apply_configs(vec![AgentConfig {
+            lines: vec!["读卡器1#890".to_owned()],
+            ..Default::default()
+        }]);
+        assert!(added, "加入一条线路必须报告变化");
+        let agents = fleet.list();
+        assert_eq!(agents.len(), 1);
+        assert!(agents[0].exposes("读卡器1#890"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Removing the last line must take the agent with it. Leaving it behind
+    /// reports nothing offered while the phone still dials the line.
+    #[test]
+    fn removing_the_last_line_takes_the_agent_away() {
+        let root = std::env::temp_dir().join("celmux-airsim-remove-last");
+        let _ = std::fs::remove_dir_all(&root);
+        let fleet = Fleet::new(&root);
+        fleet.apply_configs(vec![AgentConfig {
+            lines: vec!["dji1".to_owned()],
+            ..Default::default()
+        }]);
+        assert_eq!(fleet.list().len(), 1);
+
+        assert!(
+            fleet.apply_configs(Vec::new()),
+            "移除最后一条线路必须报告变化"
+        );
+        assert_eq!(fleet.list().len(), 0, "没有线路就不该还有 agent");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An agent that keeps its place must not be rebuilt by a settings save: a
+    /// rebuild drops the revision the phone's long poll waits on.
+    #[test]
+    fn a_save_that_changes_nothing_leaves_the_agent_alone() {
+        let root = std::env::temp_dir().join("celmux-airsim-noop-save");
+        let _ = std::fs::remove_dir_all(&root);
+        let fleet = Fleet::new(&root);
+        let config = AgentConfig {
+            lines: vec!["dji1".to_owned()],
+            ..Default::default()
+        };
+        fleet.apply_configs(vec![config.clone()]);
+        let before = fleet.list()[0].clone();
+        before.set_secret(vec![9; 32]);
+
+        assert!(!fleet.apply_configs(vec![config]), "没有变化就不该报告变化");
+        let after = fleet.list()[0].clone();
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "同一个 agent 必须还是同一个对象，否则长轮询会被打断"
+        );
+        assert_eq!(after.secret(), Some(vec![9; 32]));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A new agent for a line the phone already paired with must find that
+    /// pairing on disk, or the phone's next request is signed with a key we have
+    /// forgotten.
+    #[test]
+    fn a_new_agent_finds_the_pairing_a_previous_one_left() {
+        let root = std::env::temp_dir().join("celmux-airsim-readd");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let config = AgentConfig {
+            lines: vec!["读卡器1#890".to_owned()],
+            ..Default::default()
+        };
+        {
+            let fleet = Fleet::new(&root);
+            fleet.apply_configs(vec![config.clone()]);
+            let agent = fleet.list()[0].clone();
+            agent.set_secret(vec![4; 32]);
+            agent.persist_secret();
+        }
+        // A fresh process over the same directory, where the line is added
+        // again rather than reconciled at startup.
+        let fleet = Fleet::new(&root);
+        fleet.apply_configs(vec![config]);
+        assert_eq!(fleet.list()[0].secret(), Some(vec![4; 32]));
         let _ = std::fs::remove_dir_all(&root);
     }
 

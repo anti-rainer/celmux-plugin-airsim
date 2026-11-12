@@ -665,22 +665,15 @@ fn config_write(
             crate::log_warn!("celmux-plugin-airsim: 线路分配未能保存: {error}");
             return Response::error(500, "Internal Server Error", "assignment_not_saved", &error);
         }
-        // Persisted, so the fleet can be told. A brand-new installation has no
-        // agent yet, and `apply_configs` only updates the ones that exist - so a
-        // first "add this line" has to build the fleet rather than do nothing.
-        let created = running.is_none();
-        let changed = if created {
-            fleet
-                .reconcile(configs_from_document(&document, &identity))
-                .map(|()| true)
-                .unwrap_or(false)
-        } else {
-            fleet.apply_configs(configs_from_document(&document, &identity))
-        };
+        // Persisted, so the fleet can be told. One call adds, updates and
+        // removes: the first line on a fresh installation builds the agent, and
+        // removing the last one takes it away.
+        let changed = fleet.apply_configs(configs_from_document(&document, &identity));
         crate::log_info!(
-            "celmux-plugin-airsim: 线路分配已保存 {} expose_all={expose_all} lines={} created={created} changed={changed}",
+            "celmux-plugin-airsim: 线路分配已保存 {} expose_all={expose_all} lines={} agents={} changed={changed}",
             store.path().display(),
-            document.lines.len()
+            document.lines.len(),
+            fleet.list().len()
         );
     }
 
