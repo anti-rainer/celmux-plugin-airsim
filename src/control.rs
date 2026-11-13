@@ -458,6 +458,15 @@ pub fn handle_shared(
     Response::error(401, "Unauthorized", "unauthorized", "签名不匹配")
 }
 
+/// One DTMF key, in the set the upstream agent accepts.
+///
+/// `len == 1` in bytes rather than characters: the accepted set is ASCII, so a
+/// multi-byte character can never be one of them, and counting bytes keeps a
+/// combining mark from sneaking through as a single character.
+fn valid_dtmf_digit(digit: &str) -> bool {
+    digit.len() == 1 && "0123456789*#".contains(digit)
+}
+
 impl Control {
     /// Route one request that has already been attributed to this line.
     ///
@@ -1663,6 +1672,20 @@ impl Control {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_owned();
+        // A `dtmf` action is the only one that carries data: the one key to play.
+        //
+        // The app sends `digit` - singular, one key per request - which is the
+        // same field the upstream agent decodes on `/api/calls/dtmf`, so a phone
+        // that works against either gateway works against both. The upstream
+        // agent also refuses anything but a single `0-9 * #`, and this side has
+        // to hold the same line: forwarding a sequence into a channel that plays
+        // one key would send the first digit and silently drop the rest.
+        let digit = payload
+            .get("digit")
+            .or_else(|| payload.get("digits"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
         let call_id: String = if call_id.is_empty() {
             // Fall back to whatever is on a call. Acting on the wrong call is
             // impossible here: there is at most one.
@@ -1698,7 +1721,18 @@ impl Control {
                 })
                 .unwrap_or_else(|| call_id.to_owned())
         };
-        match self.client.call_action(action, &call_id) {
+        // The key has to be exactly one of `0-9 * #`, the same set the upstream
+        // agent accepts. Checking here answers with the field name instead of
+        // forwarding a request that cannot succeed.
+        if action == "dtmf" && !valid_dtmf_digit(&digit) {
+            return Response::error(
+                400,
+                "Bad Request",
+                "dtmf_requires_digit",
+                "dtmf 需要 digit 字段，且只能是单个 0-9 * # 字符",
+            );
+        }
+        match self.client.call_action_with_digits(action, &call_id, &digit) {
             Ok(_) => {
                 // The app's call screen follows the revision, so an action the
                 // phone took has to move it or the screen keeps showing the
@@ -1738,6 +1772,11 @@ impl Control {
         };
         let payload: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
         let action = payload.get("action").and_then(Value::as_str).unwrap_or("");
+        let digit = payload
+            .get("digit")
+            .or_else(|| payload.get("digits"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
         let forwarded = match action {
             "answer" => "answer",
             "reject" | "decline" => "reject",
@@ -1752,7 +1791,15 @@ impl Control {
                 );
             }
         };
-        match self.client.call_action(forwarded, call_id) {
+        if forwarded == "dtmf" && !valid_dtmf_digit(digit) {
+            return Response::error(
+                400,
+                "Bad Request",
+                "dtmf_requires_digit",
+                "dtmf 需要 digit 字段，且只能是单个 0-9 * # 字符",
+            );
+        }
+        match self.client.call_action_with_digits(forwarded, call_id, digit) {
             Ok(_) => Response::ok(json!({"ok": true})),
             Err(error) => Response::error(502, "Bad Gateway", "action_failed", &error.to_string()),
         }
@@ -2239,6 +2286,36 @@ mod tests {
             assert_eq!(response.status, 409, "{path}");
             let body: Value = serde_json::from_slice(&response.body).unwrap();
             assert_eq!(body["code"], "no_active_call", "{path}: {body}");
+        }
+    }
+
+    /// A key has to be exactly one of `0-9 * #` - the set the upstream agent
+    /// accepts on its own `/api/calls/dtmf`, and the reason is that a single-key
+    /// channel cannot play a sequence: forwarding `"123"` would send the first
+    /// digit and drop the rest while the phone believed all three went out.
+    #[test]
+    fn a_dtmf_key_that_is_not_one_key_is_refused_before_it_is_forwarded() {
+        let control = control();
+        for (path, body) in [
+            // Missing, empty, a sequence, and a symbol outside the set.
+            ("/api/calls/dtmf", r#"{"call_id":"7"}"#),
+            ("/api/calls/dtmf", r#"{"call_id":"7","digit":""}"#),
+            ("/api/calls/dtmf", r#"{"call_id":"7","digit":"123"}"#),
+            ("/api/calls/dtmf", r#"{"call_id":"7","digit":"A"}"#),
+            ("/v2/calls/abc/actions", r#"{"action":"dtmf"}"#),
+            ("/v2/calls/abc/actions", r#"{"action":"dtmf","digit":"12"}"#),
+        ] {
+            let request = Request {
+                method: "POST".to_owned(),
+                path: path.to_owned(),
+                query: String::new(),
+                headers: std::collections::HashMap::new(),
+                body: body.as_bytes().to_vec(),
+            };
+            let response = control.handle_verified(request);
+            assert_eq!(response.status, 400, "{path} {body}");
+            let decoded: Value = serde_json::from_slice(&response.body).unwrap();
+            assert_eq!(decoded["code"], "dtmf_requires_digit", "{path} {body}");
         }
     }
 

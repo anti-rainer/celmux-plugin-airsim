@@ -297,11 +297,34 @@ impl Client {
     }
 
     pub fn call_action(&self, action: &str, call_id: &str) -> Result<Value, Error> {
-        self.request(
-            "POST",
-            &format!("/{action}"),
-            Some(serde_json::json!({"call_id": call_id})),
-        )
+        self.call_action_with_digits(action, call_id, "")
+    }
+
+    /// One call action, carrying the keypad digits a `dtmf` action needs.
+    ///
+    /// DTMF is the one call action with a payload of its own: `answer` and
+    /// `hangup` act on the call, while `dtmf` is a sequence of keys played into
+    /// it. Sending `{"call_id": …}` for it - which is what this side used to do,
+    /// because it forwarded every action through the same call - reached Celmux
+    /// without a digit and could not do anything with the request.
+    ///
+    /// The field name and the bounds are Celmux's own (`DtmfPayload` on the
+    /// system route): `digits` is 1-32 of `0-9 * # A-D`. Timing is left out
+    /// unless the caller supplies it, so Celmux's defaults apply rather than a
+    /// second set of numbers invented here.
+    pub fn call_action_with_digits(
+        &self,
+        action: &str,
+        call_id: &str,
+        digits: &str,
+    ) -> Result<Value, Error> {
+        let mut body = serde_json::json!({"call_id": call_id});
+        if !digits.is_empty()
+            && let Some(object) = body.as_object_mut()
+        {
+            object.insert("digits".to_owned(), serde_json::json!(digits));
+        }
+        self.request("POST", &format!("/{action}"), Some(body))
     }
 
     pub fn calls(&self) -> Result<Value, Error> {

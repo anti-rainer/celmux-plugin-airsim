@@ -357,6 +357,26 @@ fn dispatch_pulled(context: &Arc<Context>, command: &Value) {
             .client
             .call_action("answer", &text("call_id"))
             .map(|_| ()),
+        // The app enqueues a DTMF key as `type: "dtmf", number: digit`, one key
+        // per command, because that is what a keypress produces. Celmux accepts
+        // the whole sequence at once, so this is forwarded as a one-key sequence.
+        // An empty `number` is an error rather than a silent no-op: the caller
+        // is waiting on this command's result, and reporting success for a key
+        // that was never played would show the operator a keypress that did not
+        // reach the network.
+        "dtmf" => {
+            let digit = text("number");
+            if digit.is_empty() {
+                Err(crate::celmux::Error::Transport(
+                    "DTMF 命令缺少 number 字段".to_owned(),
+                ))
+            } else {
+                context
+                    .client
+                    .call_action_with_digits("dtmf", &text("call_id"), &digit)
+                    .map(|_| ())
+            }
+        }
         // Upstream's name for it: the phone sends `send_sms`.
         "send_sms" | "sms" => context
             .client
@@ -1093,7 +1113,18 @@ impl Dispatch {
                     .ok()
                     .and_then(|value| command_call_id(&value))
                     .unwrap_or_default();
-                self.client.call_action(action, &call_id).map(|_| ())
+                // A relay command has no field of its own for a key, so the app
+                // puts it in `number`: `VoIPPushController.sendCloudDTMF`
+                // enqueues `type: "dtmf", number: digit, message: nil`. Reading
+                // `message` here would have looked right and found nothing.
+                let digits = if action == "dtmf" {
+                    self.command.number.as_str()
+                } else {
+                    ""
+                };
+                self.client
+                    .call_action_with_digits(action, &call_id, digits)
+                    .map(|_| ())
             }
             other => {
                 self.state.complete(
