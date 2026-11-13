@@ -1,7 +1,7 @@
 [package]
 name = "celmux-plugin-airsim"
 description = "AirSIM VoWLAN bridge for Celmux: exposes Celmux voice lines to the AirSIM iOS client"
-version = "1.0.2"
+version = "1.0.3"
 edition = "2024"
 rust-version = "1.85"
 authors = ["anti-rainer"]
@@ -32,7 +32,14 @@ serde_json = "1.0.145"
 sha2 = { version = "0.11.1", default-features = false }
 subtle = "2.6.1"
 tokio = { version = "1.54.1", default-features = false, features = ["rt", "net", "time", "io-util"] }
-tokio-rustls = "0.26"
+# `default-features = false` drops `aws-lc-rs`, which is this crate's default
+# crypto backend. Building it cross-target runs its C build system
+# (`aws-lc-sys`), and its `jitterentropy` component includes POSIX `sched.h` -
+# which a Windows cross build does not have, so the Windows target failed to
+# compile with `fatal error: 'sched.h' file not found`. `ring` is the backend
+# already declared above, needs no C toolchain for this target, and is what the
+# Linux builds have been using all along.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 webpki-roots = { version = "1.0.11", default-features = false }
 x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }
 
