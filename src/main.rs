@@ -440,10 +440,27 @@ fn advertise_agent(
 /// a phone on the LAN cannot reach it. What the phone needs is the address of
 /// the interface the LAN segment is on, so a private address on a non-tunnel
 /// interface is preferred, and the lookup is only a last resort.
+#[cfg(not(windows))]
 fn local_address() -> Option<String> {
     if let Some(address) = lan_address() {
         return Some(address);
     }
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("223.5.5.5:53").ok()?;
+    Some(socket.local_addr().ok()?.ip().to_string())
+}
+
+/// The address a phone on the same network can reach, on Windows.
+///
+/// There is no `/proc/net/route` and no `SIOCGIFADDR`, so the ranked-interface
+/// search does not exist here: the socket probe is all this build has. It is a
+/// weaker answer for the same reason the Linux version does not stop at it - a
+/// probe toward the internet reports whichever interface the uplink chose - but
+/// the alternative would be promising an address this build cannot verify. An
+/// operator whose phone cannot reach the reported address sets it by hand,
+/// which the advertisement already allows.
+#[cfg(windows)]
+fn local_address() -> Option<String> {
     let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
     socket.connect("223.5.5.5:53").ok()?;
     Some(socket.local_addr().ok()?.ip().to_string())
@@ -456,6 +473,7 @@ fn local_address() -> Option<String> {
 /// the tunnel's exit address, which nothing on the LAN can dial. The default
 /// route's interface is skipped for the same reason, and what is left is
 /// ranked so a bridge address wins over a point-to-point link.
+#[cfg(not(windows))]
 fn lan_address() -> Option<String> {
     let routes = std::fs::read_to_string("/proc/net/route").ok()?;
     for line in routes.lines().skip(1) {
@@ -496,6 +514,7 @@ fn lan_address() -> Option<String> {
 /// A phone is on the LAN, not on the host's uplink and not on an overlay: these
 /// are the names this installation gives such interfaces, plus the common
 /// tunnel prefixes.
+#[cfg(not(windows))]
 fn looks_like_exit(interface: &str) -> bool {
     const EXITS: [&str; 8] = [
         "sipa",
@@ -511,6 +530,12 @@ fn looks_like_exit(interface: &str) -> bool {
 }
 
 /// The IPv4 address of one interface, via the netlink-free `SIOCGIFADDR` call.
+///
+/// Linux only: the call is what this program has always used to find the LAN
+/// address, and it needs no dependency. Windows has no `SIOCGIFADDR` and no
+/// `/proc/net/route`, so the whole ranked-interface search is compiled out
+/// there and `local_address` falls through to the socket probe below.
+#[cfg(not(windows))]
 fn interface_address(interface: &str) -> Option<String> {
     use std::os::fd::AsRawFd;
     let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
@@ -535,7 +560,7 @@ fn interface_address(interface: &str) -> Option<String> {
 }
 
 /// `ioctl(2)`, which the standard library does not expose.
-#[cfg(target_os = "linux")]
+#[cfg(not(windows))]
 unsafe fn libc_ioctl(fd: std::os::fd::RawFd, request: u64, argument: *mut u8) -> i32 {
     unsafe extern "C" {
         fn ioctl(fd: i32, request: u64, ...) -> i32;
@@ -544,6 +569,7 @@ unsafe fn libc_ioctl(fd: std::os::fd::RawFd, request: u64, argument: *mut u8) ->
 }
 
 /// Whether an address could be the LAN side a phone sits on.
+#[cfg(not(windows))]
 fn is_lan_candidate(address: &str) -> bool {
     let Ok(std::net::IpAddr::V4(v4)) = address.parse::<std::net::IpAddr>() else {
         return false;

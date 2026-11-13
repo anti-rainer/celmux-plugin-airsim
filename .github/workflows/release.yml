@@ -29,6 +29,13 @@ jobs:
             asset: celmux-plugin-airsim-aarch64
           - target: x86_64-unknown-linux-musl
             asset: celmux-plugin-airsim-x86_64
+          # The desktop build of the server ships for Windows too, and a plugin
+          # is installed by the server it talks to: without this asset a Windows
+          # operator has no AirSIM plugin to install at all.
+          - target: x86_64-pc-windows-gnu
+            asset: celmux-plugin-airsim-win_amd64
+            suffix: .exe
+            archive: zip
     steps:
       - uses: actions/checkout@v4
 
@@ -76,23 +83,36 @@ jobs:
         run: cargo zigbuild --release --locked --target ${{ matrix.target }}
 
       - name: Package
+        # The archive format follows the platform: a Windows operator expects to
+        # unzip and run, and an `.exe` inside a tar.gz cannot be executed without
+        # a tool that is not part of a default Windows install.
         run: |
           set -euo pipefail
           staging="$(mktemp -d)"
           mkdir -p "$staging/celmux-plugin-airsim/ui"
-          cp "target/${{ matrix.target }}/release/celmux-plugin-airsim" "$staging/celmux-plugin-airsim/"
+          cp "target/${{ matrix.target }}/release/celmux-plugin-airsim${{ matrix.suffix }}" "$staging/celmux-plugin-airsim/"
           cp ui/index.html "$staging/celmux-plugin-airsim/ui/"
           cp plugin.json "$staging/celmux-plugin-airsim/"
           cp README.md "$staging/celmux-plugin-airsim/" 2>/dev/null || true
-          chmod +x "$staging/celmux-plugin-airsim/celmux-plugin-airsim"
-          tar -czf "${{ matrix.asset }}.tar.gz" -C "$staging" celmux-plugin-airsim
-          ls -la "${{ matrix.asset }}.tar.gz"
+          if [ -z "${{ matrix.suffix }}" ]; then
+            chmod +x "$staging/celmux-plugin-airsim/celmux-plugin-airsim"
+          fi
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            (cd "$staging" && zip -qr "$OLDPWD/${{ matrix.asset }}.zip" celmux-plugin-airsim)
+          else
+            tar -czf "${{ matrix.asset }}.tar.gz" -C "$staging" celmux-plugin-airsim
+          fi
+          ls -la "${{ matrix.asset }}".*
 
       - name: Upload asset
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}
-          path: ${{ matrix.asset }}.tar.gz
+          # Both extensions are listed so one step covers either platform; the
+          # one that was not produced simply matches nothing.
+          path: |
+            ${{ matrix.asset }}.tar.gz
+            ${{ matrix.asset }}.zip
 
   release:
     name: publish release
@@ -116,7 +136,11 @@ jobs:
           # The tag comes from the run's input, so the release exists even when
           # the tag was not pushed beforehand.
           tag_name: ${{ inputs.tag }}
-          files: "*.tar.gz"
+          # Every asset the build produced, in either archive format. The
+          # server picks the one matching its own machine.
+          files: |
+            *.tar.gz
+            *.zip
           generate_release_notes: true
           # The asset name carries the architecture only; the tag names the
           # version, which is what Celmux reads back.
