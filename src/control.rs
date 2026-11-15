@@ -270,7 +270,20 @@ fn percent_decode(value: &str) -> String {
 /// An empty `active` is the normal state and must be null, not an empty object:
 /// the client decodes it as an optional record and an object missing its
 /// required fields fails the whole status.
-fn active_call(value: &Value) -> Option<Value> {
+/// Where a line sits in the exposed slot list: its position, then its identity.
+type SlotPosition = (Option<u64>, Option<u64>);
+
+/// Look up the slot position of a line, by line id.
+type SlotLookup<'a> = &'a dyn Fn(&str) -> SlotPosition;
+
+/// The call the phone should show as active, with its slot resolved.
+///
+/// The slot position comes from the exposed list rather than from the call row:
+/// the row names a line, and what the app needs is where that line sits in the
+/// `sim_slots` array it was given. Resolving it through the same list keeps the
+/// two answers consistent - a call reported on a slot the picker does not list
+/// would be a card the user cannot see.
+fn active_call_with(value: &Value, slots: SlotLookup<'_>) -> Option<Value> {
     // Celmux answers a bare array of live calls; older shapes nested them. Both
     // are read here so a call in progress is never reported as idle.
     let calls = match value {
@@ -326,13 +339,36 @@ fn active_call(value: &Value) -> Option<Value> {
             _ => String::new(),
         })
         .unwrap_or_default();
+    // When it was answered, and when it ended. The app measures a call from
+    // `connected_at`, and only an incoming call that ended without one counts as
+    // missed - so a record without this reports every answered call as a missed
+    // one, and shows a duration measured from the start of ringing.
+    let connected_at = row
+        .get("answered_at")
+        .or_else(|| row.get("connected_at"))
+        .and_then(Value::as_str);
+    let ended_at = row.get("ended_at").and_then(Value::as_str);
+    let terminal = matches!(state, "ended" | "failed" | "missed");
+    let missed = terminal && direction == "incoming" && connected_at.is_none();
+    // The subscription this call used, in the app's terms. `slot_index` is the
+    // line's position in the exposed `sim_slots` list and `slot_id` its identity;
+    // the app keeps a call attached to the card it actually used through these,
+    // rather than assuming whichever card it is currently showing.
+    let (slot_index, slot_id) = slots(line);
     Some(super::control_api::call_record(
         number,
         state,
         direction,
-        started_at,
-        line,
-        &android_id,
+        &super::control_api::CallRecordFacts {
+            started_at,
+            connected_at,
+            ended_at,
+            missed,
+            line,
+            slot_index,
+            slot_id,
+            android_id: &android_id,
+        },
     ))
 }
 
@@ -364,8 +400,30 @@ pub fn handle_shared(
     // phone is connected, so neither says anything about what happened.
     let polled = request.path.starts_with("/api/events")
         || request.path.starts_with("/api/calls/events")
-        || request.path.starts_with("/v1/health")
         || request.path.starts_with("/api/health");
+    // The health probe is deliberately not in `polled`: one silent category was
+    // hiding whether the phone ever reaches this port at all. A cold launch probes
+    // `/v1/health` before anything else, so an entry here - or the absence of one -
+    // is what separates "the phone never sent it" from "it was sent and refused".
+    // It is a few lines per launch, not a per-poll flood.
+    if request.path.starts_with("/v1/health") {
+        crate::log_info!(
+            "celmux-plugin-airsim: [health] 收到 {} {} 签名={} 时间戳={} nonce={}",
+            request.method,
+            if request.query.is_empty() { request.path.clone() } else { format!("{}?{}", request.path, request.query) },
+            request
+                .headers
+                .get(crate::auth::HEADER_SIGNATURE)
+                .map(|value| value.chars().take(12).collect::<String>())
+                .unwrap_or_else(|| "(无)".to_owned()),
+            request.headers.get(crate::auth::HEADER_TIMESTAMP).cloned().unwrap_or_else(|| "(无)".to_owned()),
+            request
+                .headers
+                .get(crate::auth::HEADER_NONCE)
+                .map(|value| value.chars().take(10).collect::<String>())
+                .unwrap_or_else(|| "(无)".to_owned())
+        );
+    }
     if request.method != "GET" || !polled {
         crate::log_info!(
             "celmux-plugin-airsim: 收到 {} {} 时间戳={:?} nonce={:?} 签名={}",
@@ -587,6 +645,27 @@ impl Control {
             // earlier version, which is how a card list survived several
             // changes to the naming.
             "sim_slots": self.exposed_slots(),
+            // A mains-powered gateway, not a phone on a cell.
+            //
+            // The client models this field as `AndroidBatteryReading` - it exists
+            // so a phone acting as a relay can say how much charge it has left -
+            // and treats it as optional, showing "电量待刷新" when it is absent.
+            // Celmux has no battery at all, so the honest reading for a device on
+            // wall power is full and charging: that renders as a green full icon
+            // with the charging bolt, which is what the hardware is actually doing.
+            //
+            // `observed_at_ms` has to move with every response: the client drops a
+            // reading older than five minutes, so a frozen timestamp would make the
+            // label flicker back to "待刷新". `percent` must stay within 0...100 and
+            // the timestamp must be positive, or the same freshness check rejects it.
+            "battery": {
+                "percent": 100,
+                "charging": true,
+                "observed_at_ms": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|since| since.as_millis() as f64)
+                    .unwrap_or(0.0),
+            },
         }))
     }
 
@@ -595,6 +674,71 @@ impl Control {
     /// One place, because both the health document and the event stream answer
     /// with it and the client treats them as the same fact: a picker built from
     /// one and a send checked against the other would disagree.
+    /// The label a message on `line_id` carries, as the message list names it.
+    ///
+    /// `sim_slot` on a message is printed verbatim by the app, so it is the whole
+    /// `device · operator · number` string rather than a slot's short label. Line
+    /// data that cannot be read yields an empty label, which the client reads as
+    /// "keep whatever you already have" instead of overwriting it.
+    fn slot_label_for_line(&self, line_id: &str) -> String {
+        if line_id.is_empty() {
+            return String::new();
+        }
+        self.client
+            .lines()
+            .ok()
+            .and_then(|lines| lines.into_iter().find(|line| line.line_id == line_id))
+            .map(|line| {
+                [
+                    line.device_name.as_str(),
+                    line.operator_name.as_str(),
+                    line.local_phone.as_str(),
+                ]
+                .into_iter()
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<&str>>()
+                .join(" · ")
+            })
+            .unwrap_or_default()
+    }
+
+    /// [`active_call`] carrying the slot position this agent exposes.
+    fn active_call(&self, value: &Value) -> Option<Value> {
+        active_call_with(value, &|line| self.slot_position(line))
+    }
+
+    /// Where one line sits in the slot list the app was given.
+    ///
+    /// `slot_index` is its position and `slot_id` its identity. They travel with a
+    /// call record so the app keeps the call attached to the card that actually
+    /// carried it: with several cards behind one gateway, a call reported without
+    /// this is attributed to whichever card happens to be selected.
+    ///
+    /// The id is a stable hash of the line id rather than its position, so adding
+    /// or removing a card does not renumber the others - the app would otherwise
+    /// see an unrelated call move to a different slot.
+    fn slot_position(&self, line_id: &str) -> SlotPosition {
+        if line_id.is_empty() {
+            return (None, None);
+        }
+        let lines = match self.client.lines() {
+            Ok(lines) => lines,
+            Err(_) => return (None, None),
+        };
+        let exposed: Vec<_> = lines
+            .iter()
+            .filter(|line| self.agent.exposes(&line.line_id))
+            .collect();
+        match exposed.iter().position(|line| line.line_id == line_id) {
+            Some(index) => (
+                Some(index as u64),
+                Some(crate::control_api::slot_identity(line_id)),
+            ),
+            None => (None, None),
+        }
+    }
+
     fn exposed_slots(&self) -> Vec<Value> {
         self.client
             .lines()
@@ -610,18 +754,35 @@ impl Control {
 
     /// The number this agent's line answers on, empty when Celmux has not
     /// learned it yet.
+    ///
+    /// The routes that predate `sim_slots` want a single number, and the phone
+    /// shows it under the device name - so leaving it empty reads as
+    /// 「运营商未提供号码」 even though the number is right there in `sim_slots`.
+    ///
+    /// The first exposed line is only a starting point, not the answer: a line id
+    /// carries an ICCID suffix (`读卡器1#8963...`), while the slot list the phone
+    /// sees is keyed by the bare slot (`读卡器1`), so the id lookup misses and
+    /// this returned nothing. Falling back to the first exposed line that has a
+    /// number keeps the summary honest instead of pinning it to one id that may
+    /// have no number of its own.
     fn line_phone(&self) -> String {
-        // The first exposed line's number, for the routes that predate
-        // `sim_slots` and expect a single number.
-        self.client
-            .lines()
-            .ok()
-            .and_then(|lines| {
-                lines
-                    .into_iter()
-                    .find(|line| Some(&line.line_id) == self.agent.lines().first())
-            })
+        let Ok(lines) = self.client.lines() else {
+            return String::new();
+        };
+        let exposed: Vec<&crate::celmux::Line> = lines
+            .iter()
+            .filter(|line| self.agent.exposes(&line.line_id))
+            .collect();
+        let agent_lines = self.agent.lines();
+        let preferred = agent_lines
+            .first()
+            .and_then(|id| exposed.iter().find(|line| line.line_id == *id))
+            .map(|line| (*line).clone());
+        preferred
+            .into_iter()
+            .chain(exposed.iter().map(|line| (*line).clone()))
             .map(|line| line.local_phone)
+            .find(|phone| !phone.trim().is_empty())
             .unwrap_or_default()
     }
 
@@ -764,7 +925,7 @@ impl Control {
     /// The current call state, answered at once.
     fn call_status_now(&self) -> Response {
         let active = match self.client.calls() {
-            Ok(value) => active_call(&value),
+            Ok(value) => self.active_call(&value),
             Err(error) => {
                 return Response::error(
                     502,
@@ -871,6 +1032,11 @@ impl Control {
             content: content.to_owned(),
             code: String::new(),
             timestamp: iso_timestamp(stamp as u64),
+            // The card the message arrived on. The event names the line rather than
+            // the card, so the label is resolved from the line the same way the
+            // message list does it - the push and the list must name the same slot,
+            // or the phone files one message under two cards.
+            sim_slot: self.slot_label_for_line(&line),
         };
         let context = Arc::clone(context);
         std::thread::spawn(move || {
@@ -1067,6 +1233,10 @@ impl Control {
         // The line the message arrived on: Celmux names it, and a message belongs
         // to one line.
         let line = self.agent.lines().first().cloned().unwrap_or_default();
+        // Resolved before the thread because `self` is not available inside it, and
+        // the label needs the line's operator, which Celmux does not put on a
+        // message row.
+        let fallback_slot = self.slot_label_for_line(&line);
         std::thread::spawn(move || {
             let Ok(value) = context.client.messages(&line) else {
                 return;
@@ -1128,6 +1298,10 @@ impl Control {
                 content: text("content"),
                 code: String::new(),
                 timestamp: text("timestamp"),
+                // Which card carried it, named as the message list names it. The
+                // operator is not on a message row, so it comes from the line the
+                // message was filed against.
+                sim_slot: fallback_slot.clone(),
             };
             if context.agent.target().is_own() {
                 // Own relay: no socket. The message is delivered to the phone by
@@ -1168,7 +1342,7 @@ impl Control {
             .client
             .calls()
             .ok()
-            .and_then(|value| active_call(&value));
+            .and_then(|value| self.active_call(&value));
         // Only the lines the operator exposed. Offering the others would put
         // cards in the picker that every send and dial then refuses - a choice
         // that cannot be used is worse than one that is not offered.
@@ -1596,7 +1770,7 @@ impl Control {
             .client
             .calls()
             .ok()
-            .and_then(|value| active_call(&value));
+            .and_then(|value| self.active_call(&value));
         let (status, android_id, backend_id, call_state, ended_at) = match active {
             Some(call) => {
                 let id = call
@@ -1693,7 +1867,7 @@ impl Control {
                 .client
                 .calls()
                 .ok()
-                .and_then(|value| active_call(&value))
+                .and_then(|value| self.active_call(&value))
             {
                 Some(active) => active
                     .get("android_id")
@@ -1711,7 +1885,7 @@ impl Control {
             self.client
                 .calls()
                 .ok()
-                .and_then(|value| active_call(&value))
+                .and_then(|value| self.active_call(&value))
                 .filter(|active| active.get("id").and_then(Value::as_str) == Some(call_id.as_str()))
                 .and_then(|active| {
                     active
@@ -1732,7 +1906,10 @@ impl Control {
                 "dtmf 需要 digit 字段，且只能是单个 0-9 * # 字符",
             );
         }
-        match self.client.call_action_with_digits(action, &call_id, &digit) {
+        match self
+            .client
+            .call_action_with_digits(action, &call_id, &digit)
+        {
             Ok(_) => {
                 // The app's call screen follows the revision, so an action the
                 // phone took has to move it or the screen keeps showing the
@@ -1749,7 +1926,7 @@ impl Control {
                     && self
                         .client
                         .calls()
-                        .map_or(true, |value| active_call(&value).is_none())
+                        .map_or(true, |value| self.active_call(&value).is_none())
                 {
                     self.revision.bump();
                     return Response::ok(json!({"ok": true, "already_ended": true}));
@@ -1799,7 +1976,10 @@ impl Control {
                 "dtmf 需要 digit 字段，且只能是单个 0-9 * # 字符",
             );
         }
-        match self.client.call_action_with_digits(forwarded, call_id, digit) {
+        match self
+            .client
+            .call_action_with_digits(forwarded, call_id, digit)
+        {
             Ok(_) => Response::ok(json!({"ok": true})),
             Err(error) => Response::error(502, "Bad Gateway", "action_failed", &error.to_string()),
         }
@@ -1963,6 +2143,72 @@ mod tests {
             assert!(body.get("agent_id").is_some(), "{path}: {body}");
             assert!(body.get("phone_number").is_some(), "{path}: {body}");
         }
+    }
+
+    /// The summary number falls back to a line that actually has one.
+    ///
+    /// A line id carries an ICCID suffix while the slot list the phone sees is
+    /// keyed by the bare slot, so looking the summary number up by the first
+    /// exposed id alone finds nothing and the settings card reads
+    /// 「运营商未提供号码」 - even though `sim_slots` right beside it lists the
+    /// number. The summary has to agree with the slots it travels with.
+    #[test]
+    fn the_summary_number_comes_from_a_line_that_has_one() {
+        let control = control();
+        let body: Value =
+            serde_json::from_slice(&control.handle_verified(signed_request("GET", "/v1/health")).body)
+                .unwrap();
+        let slots = body["sim_slots"].as_array().expect("sim_slots");
+        let first_slot_number = slots
+            .iter()
+            .filter_map(|slot| slot.get("number").and_then(Value::as_str))
+            .find(|number| !number.trim().is_empty());
+        let summary = body["phone_number"].as_str().unwrap_or_default();
+        match first_slot_number {
+            // Whenever a slot has a number, the summary must not be blank.
+            Some(number) => assert_eq!(
+                summary, number,
+                "summary {summary:?} disagrees with the first numbered slot {number:?}"
+            ),
+            // With no numbered slot there is nothing to report, and an empty
+            // string is what the client reads as "not provided".
+            None => assert!(summary.is_empty(), "summary {summary:?} but no slot has a number"),
+        }
+    }
+
+    /// The battery reading is a claim about hardware Celmux does not have.
+    ///
+    /// Celmux is a mains-powered gateway, so it reports full and charging - which
+    /// the client draws as a green full icon with the charging bolt. The reading
+    /// is only accepted when `percent` sits in 0...100 and `observed_at_ms` is a
+    /// live positive timestamp: the client discards anything older than five
+    /// minutes, so a constant here would show 100% once and then flicker back to
+    /// 「电量待刷新」. The second assertion is what pins that down.
+    #[test]
+    fn the_health_document_reports_a_battery_the_client_accepts() {
+        let body = |control: &Control| -> Value {
+            serde_json::from_slice(&control.handle_verified(signed_request("GET", "/v1/health")).body)
+                .unwrap()
+        };
+        let first = body(&control());
+        let battery = first.get("battery").expect("battery present");
+        assert_eq!(battery["percent"], 100);
+        assert_eq!(battery["charging"], true);
+        let observed = battery["observed_at_ms"].as_f64().expect("numeric timestamp");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as f64;
+        // Fresh enough for the client's five-minute window, and not from the future.
+        assert!(observed > 0.0, "timestamp: {observed}");
+        assert!(now - observed < 300_000.0, "stale by {}ms", now - observed);
+        assert!(observed <= now + 60_000.0, "from the future: {observed}");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let again = body(&control());
+        assert!(
+            again["battery"]["observed_at_ms"].as_f64().unwrap() > observed,
+            "the timestamp has to advance, or the client drops the reading"
+        );
     }
 
     /// The app long-polls this and reads the call status nested inside it.
@@ -2396,7 +2642,7 @@ mod tests {
             "id": 63,
             "line_id": "读卡器1"
         }]);
-        let active = active_call(&payload).expect("振铃中的通话必须被识别");
+        let active = active_call_with(&payload, &|_| (None, None)).expect("振铃中的通话必须被识别");
         assert_eq!(
             active["state"], "incoming",
             "app 只认 incoming/waiting，ringing 会被忽略"
@@ -2415,7 +2661,74 @@ mod tests {
             "started_at": "2026-11-10T15:21:10Z",
             "id": 64
         }]);
-        let active = active_call(&payload).expect("early 也应当被识别");
+        let active = active_call_with(&payload, &|_| (None, None)).expect("early 也应当被识别");
         assert_eq!(active["state"], "incoming");
+    }
+
+    /// An answered incoming call is not a missed one, and the app measures it from
+    /// the moment it was answered.
+    ///
+    /// The client clears `missed` only for an incoming call that carries
+    /// `connected_at`, and takes the duration from it. Reporting a call without it
+    /// makes every answered call show as missed, with a duration counted from when
+    /// it started ringing.
+    #[test]
+    fn an_answered_call_carries_when_it_was_answered() {
+        let payload = json!([{
+            "peer": "+447464270820",
+            "state": "ended",
+            "direction": "incoming",
+            "started_at": "2026-11-10T15:21:10Z",
+            "answered_at": "2026-11-10T15:21:16Z",
+            "ended_at": "2026-11-10T15:22:02Z",
+            "id": 65
+        }]);
+        let record = active_call_with(&payload, &|_| (None, None)).expect("通话应被识别");
+        assert_eq!(record["connected_at"], "2026-11-10T15:21:16Z");
+        assert_eq!(record["missed"], false, "接通过的电话不是未接");
+        assert_eq!(record["ended_at"], "2026-11-10T15:22:02Z");
+    }
+
+    /// A call that never reached `answered_at` is the missed one.
+    #[test]
+    fn an_unanswered_incoming_call_is_missed() {
+        let payload = json!([{
+            "peer": "+447464270820",
+            "state": "ended",
+            "direction": "incoming",
+            "started_at": "2026-11-10T15:21:10Z",
+            "ended_at": "2026-11-10T15:21:14Z",
+            "id": 66
+        }]);
+        let record = active_call_with(&payload, &|_| (None, None)).expect("通话应被识别");
+        assert_eq!(record["connected_at"], Value::Null);
+        assert_eq!(record["missed"], true);
+    }
+
+    /// The slot a call is on travels with the record.
+    ///
+    /// With several cards behind one gateway the app keeps a call attached to the
+    /// card that carried it; a record without these two is attributed to whichever
+    /// card happens to be selected.
+    #[test]
+    fn a_call_record_names_its_slot() {
+        let payload = json!([{
+            "peer": "+447464270820",
+            "state": "active",
+            "direction": "outgoing",
+            "started_at": "2026-11-10T15:21:10Z",
+            "id": 67,
+            "line_id": "读卡器2"
+        }]);
+        let record = active_call_with(&payload, &|line| {
+            if line == "读卡器2" {
+                (Some(1), Some(9001))
+            } else {
+                (None, None)
+            }
+        })
+        .expect("通话应被识别");
+        assert_eq!(record["slot_index"], 1);
+        assert_eq!(record["slot_id"], 9001);
     }
 }

@@ -445,10 +445,19 @@ pub fn deliver_sms_locally(context: &Arc<Context>, event: &crate::relay_agent::S
             "sound": "default",
         },
         "event": "incoming_sms",
+        // Which agent this message belongs to. The phone keeps several devices in
+        // its history; without this a push is applied to whichever device is
+        // selected, so a message from the second gateway lands in the first one's
+        // conversation.
+        "agent_id": context.agent_id(),
         "sender": event.sender,
         "content": event.content,
         "delivery_id": event.delivery_id,
         "timestamp": event.timestamp,
+        // The card it arrived on. APNs is not the authoritative copy - the agent's
+        // own list is - but a push that omits the line is what made the client
+        // erase a label it already knew.
+        "sim_slot": event.sim_slot,
     });
     // An alert push is addressed to the bare bundle id, not `<bundle>.voip`: it is
     // an ordinary notification, and the wrong topic is answered `TopicDisallowed`.
@@ -1193,6 +1202,21 @@ fn report(context: &Context, fleet: &Arc<Fleet>) -> AgentReport {
         })
         .map(|line| line.local_phone)
         .unwrap_or_default();
+    // The same slot list the direct control plane reports, from the same function.
+    // Two producers of `sim_slots` would drift, and the phone reads whichever
+    // connection it happens to be on: a card missing from one path and present in
+    // the other is how a call gets placed on the wrong subscription.
+    let sim_slots = context
+        .client
+        .lines()
+        .map(|lines| {
+            lines
+                .iter()
+                .filter(|line| agent.as_ref().is_some_and(|a| a.exposes(&line.line_id)))
+                .map(crate::control_api::sim_slot)
+                .collect()
+        })
+        .unwrap_or_default();
     AgentReport {
         id: context.agent_id().clone(),
         name,
@@ -1200,6 +1224,7 @@ fn report(context: &Context, fleet: &Arc<Fleet>) -> AgentReport {
         number,
         version: context.plugin_version.clone(),
         at_ok: true,
+        sim_slots,
     }
 }
 

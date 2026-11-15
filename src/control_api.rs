@@ -28,14 +28,31 @@ use crate::celmux::Line;
 /// `id`, `index`, `direction`, `state`, `started_at` are non-optional there, so
 /// every field is always present: a record missing one makes the whole array
 /// fail to decode and the app shows nothing rather than most of it.
+/// What a call record needs beyond the call's own state.
+///
+/// Grouped because these travel together and are read from the same Celmux row;
+/// passing them positionally made every call site a list nobody could check by
+/// eye.
+pub struct CallRecordFacts<'a> {
+    pub started_at: &'a str,
+    /// When the call was answered, if it was. The app computes the connected
+    /// duration from this and clears "missed" for an incoming call that has it.
+    pub connected_at: Option<&'a str>,
+    pub ended_at: Option<&'a str>,
+    pub missed: bool,
+    pub line: &'a str,
+    pub slot_index: Option<u64>,
+    pub slot_id: Option<u64>,
+    pub android_id: &'a str,
+}
+
 pub fn call_record(
     number: &str,
     state: &str,
     direction: &str,
-    started_at: &str,
-    line: &str,
-    android_id: &str,
+    facts: &CallRecordFacts<'_>,
 ) -> Value {
+    let started_at = facts.started_at;
     json!({
         // The phone's own id for this call. It is opaque to the app, but the app
         // hands it back when it hangs up, so it has to be something this side can
@@ -46,16 +63,30 @@ pub fn call_record(
         "state": state,
         "number": number,
         "started_at": started_at,
-        "updated_at": started_at,
-        "missed": false,
+        "updated_at": facts.ended_at.unwrap_or(started_at),
+        "ended_at": facts.ended_at,
+        // When someone answered. The app treats this as the call having been
+        // taken: an incoming call that ended with a `connected_at` is not a
+        // missed one, and the duration it shows is measured from here rather than
+        // from the start of ringing. Omitting it made every answered incoming call
+        // look missed in the phone's history.
+        "connected_at": facts.connected_at,
+        "missed": facts.missed,
         // Which exposed line is ringing. The phone holds one active call and
         // reads this to name the card, so a call arriving on the second line is
         // not shown as one on the first.
-        "line_id": line,
+        "line_id": facts.line,
+        // Which subscription, in the app's own terms. `slot_index` is the
+        // position in `sim_slots` and `slot_id` is the slot's identity; both are
+        // integers on the client, and both are what it uses to keep a call or a
+        // message attached to the card it actually used rather than to whichever
+        // one it happened to be showing.
+        "slot_index": facts.slot_index,
+        "slot_id": facts.slot_id,
         // Celmux's own numeric call id. Celmux answers `answer`/`hangup` only for
         // a call it knows by that number, so it has to travel with the record
         // rather than be reconstructed from the display id.
-        "android_id": android_id,
+        "android_id": facts.android_id,
     })
 }
 
@@ -115,6 +146,22 @@ pub fn sim_slot(line: &Line) -> Value {
         "is_default_voice": false,
         "is_default_sms": false,
     })
+}
+
+/// The stable identity of a slot, as the app stores it.
+///
+/// A hash of the line id rather than its position: inserting or removing a card
+/// must not renumber the others, or a call already recorded against slot 1 would
+/// appear against a different card the next time the list is read.
+pub fn slot_identity(line_id: &str) -> u64 {
+    // FNV-1a, 64-bit. Not cryptographic - this only has to be stable and spread
+    // out across a handful of cards.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in line_id.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 /// The first two of the three things a person reads in a slot picker.
@@ -231,7 +278,7 @@ pub fn sms_message(row: &Value, operator_name: &str) -> Option<Value> {
 /// a bubble and the picker agree on which card a message came from. The number
 /// is included here, unlike a slot's label: the app prints `sim_slot` verbatim
 /// rather than composing it with a number of its own.
-fn message_slot_label(row: &Value, operator_name: &str) -> String {
+pub fn message_slot_label(row: &Value, operator_name: &str) -> String {
     let text = |key: &str| row.get(key).and_then(Value::as_str).unwrap_or("");
     let device = text("device_name");
     if device.is_empty() {
@@ -296,9 +343,16 @@ mod tests {
             "+1234",
             "active",
             "outgoing",
-            "2026-01-01T00:00:00Z",
-            "读卡器2#89441000400501246765",
-            "21",
+            &CallRecordFacts {
+                started_at: "2026-01-01T00:00:00Z",
+                connected_at: None,
+                ended_at: None,
+                missed: false,
+                line: "读卡器2#89441000400501246765",
+                slot_index: Some(0),
+                slot_id: Some(42),
+                android_id: "21",
+            },
         );
         for key in [
             "id",

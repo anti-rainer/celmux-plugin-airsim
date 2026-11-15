@@ -268,6 +268,13 @@ pub struct SmsEvent {
     /// A verification code the relay may surface separately, when one is present.
     pub code: String,
     pub timestamp: String,
+    /// The card this message arrived on, as the client names a slot.
+    ///
+    /// The push is not the authoritative copy - the agent's own message list is -
+    /// but the client merges the two, and a push carrying no line used to erase a
+    /// label it already had. Empty means the line was not known, which the client
+    /// is told to treat as "keep what you have".
+    pub sim_slot: String,
 }
 
 #[cfg(test)]

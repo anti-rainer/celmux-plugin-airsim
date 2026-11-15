@@ -663,6 +663,10 @@ impl State {
                 "cloud_online": online,
                 "command_routing_version": 1,
                 "battery": {"level": Value::Null, "charging": Value::Null},
+                // Which cards this agent can use. The phone picks one for a cloud
+                // dial or SMS from this list, so a directory entry without it can be
+                // reached but not used to place a call.
+                "sim_slots": agent.sim_slots,
             }],
             // Not part of the phone's model, but the only place an operator can
             // see how stale the heartbeat is without reading this process's log.
@@ -723,6 +727,14 @@ pub struct AgentReport {
     pub number: String,
     pub version: String,
     pub at_ok: bool,
+    /// The cards behind this agent, in the same shape the direct control plane
+    /// reports them.
+    ///
+    /// The phone reads `sim_slots` from the directory entry to decide which card a
+    /// cloud dial or SMS is for. Without it a cloud command arrives with no card
+    /// to name, and the app has nothing to offer in the picker - the direct
+    /// connection still works, so the defect only shows up over the relay.
+    pub sim_slots: Vec<Value>,
 }
 
 fn elapsed_seconds(at: std::time::SystemTime) -> u64 {
@@ -765,6 +777,7 @@ mod tests {
             number: "+447".to_owned(),
             version: env!("CARGO_PKG_VERSION").to_owned(),
             at_ok: true,
+            sim_slots: Vec::new(),
         }
     }
 
@@ -788,6 +801,15 @@ mod tests {
         let before = state.status(&report());
         assert_eq!(before["agents"].as_array().map(Vec::len), Some(1));
         assert_eq!(before["agents"][0]["agent_id"], json!("celmux"));
+        // The phone picks a card for a cloud dial or SMS from the directory entry.
+        // An entry without this list can be reached but not used to place a call,
+        // and the failure only shows over the relay - the direct connection reports
+        // its slots from a different route.
+        assert!(
+            before["agents"][0]["sim_slots"].is_array(),
+            "每个 agent 条目都必须带 sim_slots: {}",
+            before["agents"][0]
+        );
         // No heartbeat yet: present, but not online.
         assert_eq!(before["cloud_online"], json!(false));
         assert_eq!(before["heartbeat_age_seconds"], Value::Null);

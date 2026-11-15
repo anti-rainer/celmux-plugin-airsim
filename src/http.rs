@@ -75,10 +75,22 @@ pub fn serve(listener: TcpListener, handler: Arc<dyn Fn(Request) -> Response + S
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let handler = Arc::clone(&handler);
+        // Who connected, before anything is read.
+        //
+        // The health probe used to leave no trace on this port at all, so "the
+        // phone never reached us" and "it reached us and was refused" looked the
+        // same from the log. The peer address is the one fact that separates
+        // them, and a connection that arrives and then sends nothing is itself
+        // the answer.
+        let peer = stream
+            .peer_addr()
+            .map(|address| address.to_string())
+            .unwrap_or_else(|_| "(未知)".to_owned());
+        crate::log_info!("celmux-plugin-airsim: [conn] 连接来自 {peer}");
         // One thread per connection: a phone makes one call at a time, and a
         // hung client must not block the listener.
         std::thread::spawn(move || {
-            let _ = handle_connection(stream, handler);
+            let _ = handle_connection(stream, handler, &peer);
         });
     }
 }
@@ -86,16 +98,30 @@ pub fn serve(listener: TcpListener, handler: Arc<dyn Fn(Request) -> Response + S
 fn handle_connection(
     stream: TcpStream,
     handler: Arc<dyn Fn(Request) -> Response + Send + Sync>,
+    peer: &str,
 ) -> std::io::Result<()> {
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(15)));
     let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(15)));
     let mut writer = stream.try_clone()?;
     let response = match read_request(stream) {
-        Ok(request) => handler(request),
+        Ok(request) => {
+            // Said before the handler runs, so the line exists even when the
+            // request is answered 401 or the handler panics.
+            crate::log_info!(
+                "celmux-plugin-airsim: [req] {peer} {} {}",
+                request.method,
+                if request.query.is_empty() { request.path.clone() } else { format!("{}?{}", request.path, request.query) }
+            );
+            handler(request)
+        }
         Err(ReadError::TooLarge) => {
+            crate::log_warn!("celmux-plugin-airsim: [req] {peer} 请求体过大");
             Response::error(413, "Payload Too Large", "too_large", "请求体过大")
         }
-        Err(_) => Response::error(400, "Bad Request", "malformed", "请求格式错误"),
+        Err(error) => {
+            crate::log_warn!("celmux-plugin-airsim: [req] {peer} 读取失败: {error:?}");
+            Response::error(400, "Bad Request", "malformed", "请求格式错误")
+        }
     };
     write_response(&mut writer, response)
 }
