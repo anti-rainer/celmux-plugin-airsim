@@ -344,6 +344,7 @@ fn start_agents(
             relay_context: None,
             call_push: Arc::new(std::sync::Mutex::new(control::CallPush::default())),
             acked_messages: agent.acked_messages(),
+            device: None,
         };
         Arc::new(control).follow_celmux();
     }

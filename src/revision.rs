@@ -108,6 +108,77 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
 
+    /// One change wakes every waiting poll, not just the first.
+    ///
+    /// Several phones poll the same agent at once. If the revision released one
+    /// waiter, the others would sit out their whole timeout and the second phone
+    /// would show a ringing call only after it had stopped ringing - which is the
+    /// same as not showing it at all. Nothing here is a queue that a single
+    /// waiter consumes: each poll compares the revision against the one it
+    /// started from, so one bump releases all of them.
+    #[test]
+    fn one_change_releases_every_waiting_poll() {
+        let revision = std::sync::Arc::new(Revision::default());
+        let start = revision.now();
+        let waiting = 4;
+        let released = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..waiting {
+            let revision = std::sync::Arc::clone(&revision);
+            let released = std::sync::Arc::clone(&released);
+            handles.push(std::thread::spawn(move || {
+                // 2s ceiling: far longer than the bump below needs, and short
+                // enough that a failure in this test is a failure rather than a
+                // hang.
+                let began = Instant::now();
+                let seen = revision.wait_past(start, Duration::from_secs(2));
+                assert!(seen != start, "a woken poll reports the new revision");
+                // Fast means it was released by the change. Waiting out the
+                // timeout would also report a new revision - `wait_past` answers
+                // with the current one - so the elapsed time, not the value, is
+                // what tells a wakeup from a timeout.
+                assert!(
+                    began.elapsed() < Duration::from_millis(1500),
+                    "released by the change, not by its own timeout"
+                );
+                released.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }));
+        }
+        // Give them time to actually block, so the bump cannot land before any
+        // of them is waiting.
+        std::thread::sleep(Duration::from_millis(150));
+        revision.bump();
+        for handle in handles {
+            handle.join().expect("no poll panicked");
+        }
+        assert_eq!(
+            released.load(std::sync::atomic::Ordering::SeqCst),
+            waiting,
+            "every waiting poll was released by the one change"
+        );
+    }
+
+    /// A phone that arrives late still sees the change that already happened.
+    ///
+    /// A phone whose app was backgrounded polls with an `after` behind the
+    /// current revision. Answering it at once - carrying whatever is true now -
+    /// is what lets it learn about a call that started while it was away, instead
+    /// of waiting on a revision that has already moved.
+    #[test]
+    fn a_late_poll_is_answered_from_the_current_revision() {
+        let revision = Revision::default();
+        let stale = revision.now();
+        revision.bump();
+        revision.bump();
+        let started = Instant::now();
+        let seen = revision.wait_past(stale, Duration::from_secs(5));
+        assert_ne!(seen, stale, "a stale position is answered with the new one");
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "a stale poll is answered at once, not held for its timeout"
+        );
+    }
+
     /// A poll that already knows the current revision has nothing to be told, so
     /// it is held until its timeout rather than answered in a hot loop.
     #[test]

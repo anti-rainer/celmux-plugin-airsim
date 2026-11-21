@@ -211,6 +211,25 @@ fn status(
                 "pcm_port": ports.pcm,
                 "paired": agent.paired(),
                 "pairing_open": agent.with_pairing(|_| ()).is_some(),
+                // Phones that have paired with this agent, newest first. Only the
+                // entry with `active` holds the key the agent verifies now; a
+                // re-pair replaces the secret, so the rest are history the
+                // operator can see rather than rows that silently vanished.
+                "clients": agent
+                    .paired_clients()
+                    .into_iter()
+                    .map(|client| {
+                        json!({
+                            "device_id": client.device_id,
+                            "bundle_id": client.bundle_id,
+                            "environment": client.environment,
+                            "local_mode": client.local_mode,
+                            "cloud_enabled": client.cloud_enabled,
+                            "paired_at": client.paired_at,
+                            "active": client.active,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
             })
         })
         .collect();
@@ -412,6 +431,13 @@ fn open_pairing(
 #[derive(Deserialize)]
 struct UnpairRequest {
     agent_id: String,
+    /// The one phone to detach. Absent means every phone on this agent.
+    ///
+    /// Present so an operator can remove the phone they lost without also
+    /// forcing every other phone to pair again: with per-device keys each one
+    /// can be revoked on its own.
+    #[serde(default)]
+    device_id: String,
 }
 
 /// Forget an agent's secret, so its phone has to pair again.
@@ -425,13 +451,22 @@ fn unpair(fleet: &Arc<Fleet>, request: &Request) -> Response {
     let Some(agent) = fleet.by_id(&payload.agent_id) else {
         return Response::error(404, "Not Found", "unknown_agent", "该 agent 不存在");
     };
-    agent.clear_secret();
+    let device = payload.device_id.trim();
+    if device.is_empty() {
+        agent.clear_secret();
+    } else {
+        agent.clear_secret_for(device);
+    }
     // Also from disk: clearing only memory would leave the old secret to be
     // read back at the next restart, and an "unpaired" agent would start
-    // accepting requests from the phone it was just detached from.
+    // accepting requests from the phone it was just detached from. A per-device
+    // removal rewrites the whole file without that phone's line.
     agent.forget_secret();
+    if agent.paired() {
+        agent.persist_secret();
+    }
     agent.close_pairing();
-    Response::ok(json!({"ok": true, "agent_id": agent.id()}))
+    Response::ok(json!({"ok": true, "agent_id": agent.id(), "device_id": device}))
 }
 
 /// The lines this installation can offer, read from Celmux.

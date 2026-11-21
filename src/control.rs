@@ -21,6 +21,11 @@ use crate::http::{Request, Response};
 pub struct Control {
     pub client: Arc<Client>,
     pub agent: Arc<Agent>,
+    /// Which phone signed the request being answered, when the transport
+    /// verified one. `None` on the paths that answer before authentication
+    /// (health checks that are only inspected, pairing) and in tests that build
+    /// a control directly - those have a single key, so any key will do.
+    pub device: Option<String>,
     /// What a long poll compares against: bumped whenever anything the phone
     /// cares about changes.
     pub revision: Arc<crate::revision::Revision>,
@@ -410,13 +415,21 @@ pub fn handle_shared(
         crate::log_info!(
             "celmux-plugin-airsim: [health] 收到 {} {} 签名={} 时间戳={} nonce={}",
             request.method,
-            if request.query.is_empty() { request.path.clone() } else { format!("{}?{}", request.path, request.query) },
+            if request.query.is_empty() {
+                request.path.clone()
+            } else {
+                format!("{}?{}", request.path, request.query)
+            },
             request
                 .headers
                 .get(crate::auth::HEADER_SIGNATURE)
                 .map(|value| value.chars().take(12).collect::<String>())
                 .unwrap_or_else(|| "(无)".to_owned()),
-            request.headers.get(crate::auth::HEADER_TIMESTAMP).cloned().unwrap_or_else(|| "(无)".to_owned()),
+            request
+                .headers
+                .get(crate::auth::HEADER_TIMESTAMP)
+                .cloned()
+                .unwrap_or_else(|| "(无)".to_owned()),
             request
                 .headers
                 .get(crate::auth::HEADER_NONCE)
@@ -448,16 +461,13 @@ pub fn handle_shared(
         let Some(verifier) = agent.verifier() else {
             continue;
         };
-        if verifier
-            .verify(
-                &request.method,
-                &target,
-                &request.body,
-                &request.headers,
-                now,
-            )
-            .is_ok()
-        {
+        if let Ok(device) = verifier.verify(
+            &request.method,
+            &target,
+            &request.body,
+            &request.headers,
+            now,
+        ) {
             // The revision is the line's, not a fresh one: the phone's long
             // poll compares against it, and the thread following Celmux bumps
             // it. A revision created per request would never change, so every
@@ -472,6 +482,10 @@ pub fn handle_shared(
                 relay_context: relay_context.clone(),
                 call_push: Arc::new(std::sync::Mutex::new(CallPush::default())),
                 acked_messages,
+                // Which phone signed this request. Every proof this side returns
+                // is checked by that phone against its own key, so answering it
+                // with another phone's key would fail the check it earned.
+                device: Some(device),
             };
             return control.handle_verified(request);
         }
@@ -614,7 +628,7 @@ impl Control {
         let proof = self
             .agent
             .verifier()
-            .map(|verifier| verifier.health_proof(&nonce, &agent_id))
+            .map(|verifier| verifier.health_proof(&nonce, &agent_id, self.device.as_deref()))
             .unwrap_or_default();
         // The field names here are the iOS client's, not ours: it decodes
         // `identity_proof` and refuses the route without it, which is why a
@@ -2094,6 +2108,9 @@ mod tests {
             // key, and neither is what the local routes are being checked for.
             relay_context: None,
             call_push: Arc::new(std::sync::Mutex::new(CallPush::default())),
+            // No phone identified these requests: the tests call routes directly
+            // rather than through the verifier, so there is no signer to name.
+            device: None,
             // A port nothing listens on: routes that reach Celmux fail closed,
             // which is what these assertions rely on.
             client: Arc::new(Client::new(
@@ -2155,9 +2172,12 @@ mod tests {
     #[test]
     fn the_summary_number_comes_from_a_line_that_has_one() {
         let control = control();
-        let body: Value =
-            serde_json::from_slice(&control.handle_verified(signed_request("GET", "/v1/health")).body)
-                .unwrap();
+        let body: Value = serde_json::from_slice(
+            &control
+                .handle_verified(signed_request("GET", "/v1/health"))
+                .body,
+        )
+        .unwrap();
         let slots = body["sim_slots"].as_array().expect("sim_slots");
         let first_slot_number = slots
             .iter()
@@ -2172,7 +2192,10 @@ mod tests {
             ),
             // With no numbered slot there is nothing to report, and an empty
             // string is what the client reads as "not provided".
-            None => assert!(summary.is_empty(), "summary {summary:?} but no slot has a number"),
+            None => assert!(
+                summary.is_empty(),
+                "summary {summary:?} but no slot has a number"
+            ),
         }
     }
 
@@ -2187,14 +2210,20 @@ mod tests {
     #[test]
     fn the_health_document_reports_a_battery_the_client_accepts() {
         let body = |control: &Control| -> Value {
-            serde_json::from_slice(&control.handle_verified(signed_request("GET", "/v1/health")).body)
-                .unwrap()
+            serde_json::from_slice(
+                &control
+                    .handle_verified(signed_request("GET", "/v1/health"))
+                    .body,
+            )
+            .unwrap()
         };
         let first = body(&control());
         let battery = first.get("battery").expect("battery present");
         assert_eq!(battery["percent"], 100);
         assert_eq!(battery["charging"], true);
-        let observed = battery["observed_at_ms"].as_f64().expect("numeric timestamp");
+        let observed = battery["observed_at_ms"]
+            .as_f64()
+            .expect("numeric timestamp");
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()

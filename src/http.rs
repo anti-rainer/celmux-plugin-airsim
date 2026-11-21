@@ -110,7 +110,11 @@ fn handle_connection(
             crate::log_info!(
                 "celmux-plugin-airsim: [req] {peer} {} {}",
                 request.method,
-                if request.query.is_empty() { request.path.clone() } else { format!("{}?{}", request.path, request.query) }
+                if request.query.is_empty() {
+                    request.path.clone()
+                } else {
+                    format!("{}?{}", request.path, request.query)
+                }
             );
             handler(request)
         }

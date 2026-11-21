@@ -184,16 +184,26 @@ fn claim(agent: &Arc<Agent>, ports: &crate::control::Ports, request: &Request) -
             "vowlan_secret 至少需要 32 字节",
         );
     }
-    // Store the secret before answering: a proof the phone accepts while the
-    // agent cannot verify its next request would drop the very first call. It
-    // is also written to disk, because a restart that forgot the pairing would
-    // make the operator walk to the web UI and read six new digits every time.
-    agent.set_secret(secret.clone());
+    // Store the secret under the device that sent it, before answering: a proof
+    // the phone accepts while the agent cannot verify its next request would
+    // drop the very first call. Filed per device rather than replacing one slot,
+    // so a second phone pairing does not cost the first one its key - that
+    // earlier phone would simply stop being able to call or text, with no error
+    // anywhere to explain it.
+    //
+    // A phone that sent no device id cannot be filed by one; its key goes under
+    // the empty name, which still verifies. It gets no row in the list, because
+    // there is nothing to name the row with.
+    agent.set_secret_for(registration.device_id.trim(), secret.clone());
     // Written through the agent, which knows where it lives: a restart that
     // forgot the pairing would make the operator read six new digits every
     // time the plugin restarts, which is every config save and every upgrade.
     agent.persist_secret();
     agent.close_pairing();
+    // Keep the phone in the list the settings page shows, and mark it the one
+    // whose key this agent now verifies. Recorded before the response goes out
+    // so the page's next poll already lists it.
+    agent.record_pairing(&registration);
     // The phone's relay credential arrives once, here, and never again: it is
     // generated on the phone and registered with whatever relay the phone was
     // pointed at. Keeping it is what lets an external-relay installation sign its

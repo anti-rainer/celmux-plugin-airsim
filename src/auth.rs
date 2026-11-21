@@ -66,20 +66,33 @@ impl std::fmt::Display for AuthError {
 /// One verifier per agent: the nonce memo is scoped to the key that accepted it,
 /// and two agents never share a secret.
 pub struct Verifier {
-    key: Vec<u8>,
+    /// Every key this agent accepts, keyed by the device it belongs to.
+    ///
+    /// One per paired phone: each phone generates its own secret at pairing and
+    /// keeps it in its own keychain, so the agent has to hold all of them for
+    /// the phones to work at the same time. A single key would mean the phone
+    /// that paired most recently is the only one that can make a request.
+    keys: HashMap<String, Vec<u8>>,
     /// Accepted nonces, each with the instant it stops being interesting.
     seen: Mutex<HashMap<String, SystemTime>>,
 }
 
 impl Verifier {
-    pub fn new(key: Vec<u8>) -> Self {
+    /// A verifier that accepts several phones at once.
+    pub fn with_keys(keys: HashMap<String, Vec<u8>>) -> Self {
         Self {
-            key,
+            keys,
             seen: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Verify one request.
+    /// Verify one request, and say which phone signed it.
+    ///
+    /// Every key is tried, because the request carries no device name: the
+    /// phone signs its own request with its own secret and sends nothing that
+    /// identifies which phone it is. The first key that matches is the answer,
+    /// and a MAC match is proof enough to trust it - guessing a 32-byte HMAC
+    /// is not something a wrong key does by accident.
     ///
     /// `body` is the raw request body: the digest covers what was sent, not what
     /// it parsed to, so a client cannot sign one payload and send another.
@@ -90,7 +103,7 @@ impl Verifier {
         body: &[u8],
         headers: &HashMap<String, String>,
         now: SystemTime,
-    ) -> Result<(), AuthError> {
+    ) -> Result<String, AuthError> {
         let signature = header(headers, HEADER_SIGNATURE)?;
         let timestamp = header(headers, HEADER_TIMESTAMP)?;
         let nonce = header(headers, HEADER_NONCE)?;
@@ -104,29 +117,34 @@ impl Verifier {
             return Err(AuthError::OutsideWindow);
         }
         let canonical = canonical(method, path, body, timestamp, nonce);
-        let expected = sign(&self.key, canonical.as_bytes());
         let supplied =
             crate::config::base64_url_decode(signature).ok_or(AuthError::SignatureMismatch)?;
-        // The canonical string and both MACs, so a mismatch can be read instead
-        // of guessed at. The secret itself is never printed: knowing it is
-        // enough to sign as this line.
-        if expected.ct_eq(&supplied).unwrap_u8() != 1 {
+        let mut matched: Option<String> = None;
+        for (device, key) in &self.keys {
+            let expected = sign(key, canonical.as_bytes());
+            // Constant time per key: a length leak here would let an attacker
+            // learn the MAC one byte at a time.
+            if expected.ct_eq(&supplied).unwrap_u8() == 1 {
+                matched = Some(device.clone());
+                break;
+            }
+        }
+        let Some(device) = matched else {
+            // Neither the keys nor the secret are printed: knowing either is
+            // enough to sign as this line. The count is what tells "no phone has
+            // paired" from "a phone signed with a key this agent never got".
             crate::log_warn!(
-                "celmux-plugin-airsim: 签名不符 canonical={:?} 期望={} 收到={}",
+                "celmux-plugin-airsim: 签名不符（已配对密钥 {} 把）canonical={:?} 收到={}",
+                self.keys.len(),
                 canonical,
-                crate::config::base64_url_encode(&expected),
                 crate::config::base64_url_encode(&supplied)
             );
-        }
-        // Constant time: a length leak here would let an attacker learn the MAC
-        // one byte at a time.
-        if expected.ct_eq(&supplied).unwrap_u8() != 1 {
             return Err(AuthError::SignatureMismatch);
-        }
+        };
         // Only remember a nonce after its signature checked out, otherwise an
         // unauthenticated request could burn a legitimate client's nonce.
         self.remember(nonce, now)?;
-        Ok(())
+        Ok(device)
     }
 
     fn remember(&self, nonce: &str, now: SystemTime) -> Result<(), AuthError> {
@@ -145,20 +163,38 @@ impl Verifier {
         Ok(())
     }
 
-    /// The proof this plugin returns so the client can confirm it reached the
-    /// agent it thinks it reached, not something replaying that agent's port.
-    pub fn health_proof(&self, nonce: &str, agent_id: &str) -> String {
-        let message = format!("AIRSIM-HEALTH1\n{nonce}\n{agent_id}");
-        crate::config::base64_url_encode(&sign(&self.key, message.as_bytes()))
+    /// The key one device signs with, or any key when the caller has no device.
+    ///
+    /// A proof has to be signed with the key of the phone that will check it:
+    /// each phone holds its own secret, so a proof signed with another phone's
+    /// key fails to verify on the one that asked. `device` is what `verify`
+    /// returned for the request being answered.
+    fn signing_key(&self, device: Option<&str>) -> Option<&Vec<u8>> {
+        match device {
+            Some(device) => self.keys.get(device),
+            None => self.keys.values().next(),
+        }
     }
 
-    /// Sign one canonical message with this agent's secret.
+    /// The proof this plugin returns so the client can confirm it reached the
+    /// agent it thinks it reached, not something replaying that agent's port.
+    pub fn health_proof(&self, nonce: &str, agent_id: &str, device: Option<&str>) -> String {
+        let message = format!("AIRSIM-HEALTH1\n{nonce}\n{agent_id}");
+        self.signing_key(device)
+            .map(|key| crate::config::base64_url_encode(&sign(key, message.as_bytes())))
+            .unwrap_or_default()
+    }
+
+    /// Sign one canonical message with the key of the device being answered.
     ///
     /// Every proof the client checks is an HMAC over a string it builds itself -
     /// the health proof, the dial receipt - so the signing is one operation and
-    /// only the message differs.
-    pub fn proof(&self, message: &str) -> String {
-        crate::config::base64_url_encode(&sign(&self.key, message.as_bytes()))
+    /// only the message differs. The device matters because the client verifying
+    /// the proof uses its own key.
+    pub fn proof(&self, message: &str, device: Option<&str>) -> String {
+        self.signing_key(device)
+            .map(|key| crate::config::base64_url_encode(&sign(key, message.as_bytes())))
+            .unwrap_or_default()
     }
 }
 
@@ -232,7 +268,87 @@ fn hex_lower(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    /// A verifier holding one key, under the empty device name.
+    ///
+    /// The production constructors take a map because an agent holds one key per
+    /// phone; the tests that are about verification rather than about device
+    /// selection only need one.
+    /// Two phones, two keys, both accepted - the whole point of the map.
+    ///
+    /// With one key per agent, the phone that paired last would be the only one
+    /// that could make a request: the other's signature would be checked against
+    /// a key that is not its own. Each request names its signer so the proofs
+    /// returned for it can be signed with the key that phone will verify with.
+    #[test]
+    fn two_phones_each_sign_with_their_own_key() {
+        let mut keys = HashMap::new();
+        keys.insert("phone-a".to_owned(), KEY.to_vec());
+        keys.insert("phone-b".to_owned(), OTHER.to_vec());
+        let verifier = Verifier::with_keys(keys);
+        let timestamp = 1_800_000_000;
+
+        for (device, key, nonce) in [("phone-a", KEY, "nonce-a"), ("phone-b", OTHER, "nonce-b")] {
+            let signature = signed(&key, "GET", "/v1/health", b"", timestamp, nonce);
+            let request_headers = headers(&signature, timestamp, nonce);
+            let matched = verifier
+                .verify("GET", "/v1/health", b"", &request_headers, now())
+                .expect("each paired phone verifies with its own key");
+            assert_eq!(matched, device, "the signer is named");
+        }
+
+        // A phone whose key this agent never got is refused, not silently
+        // treated as one of the others.
+        let stranger_signature = signed(&STRANGER, "GET", "/v1/health", b"", timestamp, "nonce-c");
+        let stranger_headers = headers(&stranger_signature, timestamp, "nonce-c");
+        assert!(
+            verifier
+                .verify("GET", "/v1/health", b"", &stranger_headers, now())
+                .is_err()
+        );
+
+        // A replay is refused even though the key is right: one memo covers
+        // every device, so a nonce cannot be spent twice by any of them.
+        let replay_signature = signed(&KEY, "GET", "/v1/health", b"", timestamp, "nonce-a");
+        let replay_headers = headers(&replay_signature, timestamp, "nonce-a");
+        assert!(matches!(
+            verifier.verify("GET", "/v1/health", b"", &replay_headers, now()),
+            Err(AuthError::Replayed)
+        ));
+    }
+
+    /// The proof a phone checks is signed with that phone's key.
+    ///
+    /// Each phone verifies with its own secret, so answering one with another's
+    /// key fails the check it is entitled to pass - which on the phone looks like
+    /// a gateway that is not the one it paired with.
+    #[test]
+    fn a_proof_is_signed_with_the_key_of_the_phone_that_asked() {
+        let mut keys = HashMap::new();
+        keys.insert("phone-a".to_owned(), KEY.to_vec());
+        keys.insert("phone-b".to_owned(), OTHER.to_vec());
+        let verifier = Verifier::with_keys(keys);
+
+        let for_a = verifier.proof("receipt", Some("phone-a"));
+        let for_b = verifier.proof("receipt", Some("phone-b"));
+        assert_ne!(for_a, for_b, "each phone gets its own signature");
+        // Verify the way the phone does: recompute with its own key.
+        let expected_a = crate::config::base64_url_encode(&sign(&KEY, b"receipt"));
+        assert_eq!(for_a, expected_a);
+        // An unknown device gets nothing rather than somebody else's proof.
+        assert_eq!(verifier.proof("receipt", Some("phone-c")), "");
+    }
+
+    fn single(key: [u8; 32]) -> Verifier {
+        let mut keys = HashMap::new();
+        keys.insert(String::new(), key.to_vec());
+        Verifier::with_keys(keys)
+    }
+
     const KEY: [u8; 32] = [0x2a; 32];
+    /// A second phone's key, distinct from the first's.
+    const OTHER: [u8; 32] = [0x5c; 32];
+    /// A key this agent never received.
+    const STRANGER: [u8; 32] = [0xff; 32];
 
     fn headers(signature: &str, timestamp: i64, nonce: &str) -> HashMap<String, String> {
         HashMap::from([
@@ -272,7 +388,7 @@ mod tests {
 
     #[test]
     fn a_correctly_signed_request_is_accepted() {
-        let verifier = Verifier::new(KEY.to_vec());
+        let verifier = single(KEY);
         let timestamp = 1_800_000_000;
         let signature = signed(&KEY, "GET", "/v1/health", b"", timestamp, "n1");
         assert!(
@@ -293,7 +409,7 @@ mod tests {
     /// second dial.
     #[test]
     fn a_replayed_request_is_refused_by_its_nonce() {
-        let verifier = Verifier::new(KEY.to_vec());
+        let verifier = single(KEY);
         let timestamp = 1_800_000_000;
         let signature = signed(&KEY, "GET", "/v1/health", b"", timestamp, "n1");
         let headers = headers(&signature, timestamp, "n1");
@@ -312,7 +428,7 @@ mod tests {
     /// arrives, or an attacker could swap the payload of a signed dial.
     #[test]
     fn a_signature_over_another_body_does_not_authorize_this_one() {
-        let verifier = Verifier::new(KEY.to_vec());
+        let verifier = single(KEY);
         let timestamp = 1_800_000_000;
         let signature = signed(
             &KEY,
@@ -337,7 +453,7 @@ mod tests {
     /// The same signature must not authorize a different path or method.
     #[test]
     fn a_signature_is_bound_to_its_path_and_method() {
-        let verifier = Verifier::new(KEY.to_vec());
+        let verifier = single(KEY);
         let timestamp = 1_800_000_000;
         let signature = signed(&KEY, "GET", "/v1/health", b"", timestamp, "n1");
         assert!(matches!(
@@ -366,7 +482,7 @@ mod tests {
     /// usable as long as its nonce went unremembered.
     #[test]
     fn a_timestamp_outside_the_window_is_refused() {
-        let verifier = Verifier::new(KEY.to_vec());
+        let verifier = single(KEY);
         let stale = 1_800_000_000 - CLOCK_WINDOW.as_secs() as i64 - 1;
         let signature = signed(&KEY, "GET", "/v1/health", b"", stale, "n1");
         assert!(matches!(
@@ -385,7 +501,7 @@ mod tests {
     /// reach the port could pre-empt a legitimate client's next request.
     #[test]
     fn a_failed_signature_does_not_burn_the_nonce() {
-        let verifier = Verifier::new(KEY.to_vec());
+        let verifier = single(KEY);
         let timestamp = 1_800_000_000;
         let wrong = signed(
             b"not-the-key-not-the-key-not-the-k!",
@@ -424,10 +540,10 @@ mod tests {
     /// The health proof is what convinces the phone it reached the right agent.
     #[test]
     fn the_health_proof_is_bound_to_the_nonce_and_agent() {
-        let verifier = Verifier::new(KEY.to_vec());
-        let proof = verifier.health_proof("nonce-1", "celmux");
-        assert_eq!(proof, verifier.health_proof("nonce-1", "celmux"));
-        assert_ne!(proof, verifier.health_proof("nonce-2", "celmux"));
-        assert_ne!(proof, verifier.health_proof("nonce-1", "other"));
+        let verifier = single(KEY);
+        let proof = verifier.health_proof("nonce-1", "celmux", None);
+        assert_eq!(proof, verifier.health_proof("nonce-1", "celmux", None));
+        assert_ne!(proof, verifier.health_proof("nonce-2", "celmux", None));
+        assert_ne!(proof, verifier.health_proof("nonce-1", "other", None));
     }
 }

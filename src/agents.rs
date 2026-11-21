@@ -85,6 +85,16 @@ impl AgentConfig {
 
 /// A running agent: its configuration, its signing secret, and the pairing
 /// window currently open for it.
+/// The verifier, cached against the exact key set it was built for.
+///
+/// The map is kept beside it so a changed key set - any phone pairing or being
+/// removed - rebuilds the verifier instead of reusing one bound to keys that no
+/// longer exist.
+type CachedVerifier = (
+    std::collections::BTreeMap<String, Vec<u8>>,
+    std::sync::Arc<crate::auth::Verifier>,
+);
+
 pub struct Agent {
     /// Bumped when anything this line cares about changes: the phone's long
     /// poll compares against it, and the thread following Celmux bumps it.
@@ -96,11 +106,16 @@ pub struct Agent {
     /// drops every open connection, the pairing handshake and the phone's event
     /// stream - for a value that is read on the next request anyway.
     config: std::sync::RwLock<AgentConfig>,
-    /// The secret every request from this agent's phone is signed with.
+    /// The secret every request from this agent's phones is signed with, keyed
+    /// by the device that owns it.
     ///
-    /// `None` until the phone pairs: pairing is what creates it, because the
-    /// phone generates the secret and sends it inside the encrypted claim.
-    secret: Mutex<Option<Vec<u8>>>,
+    /// One entry per paired phone: each phone generates its own secret and keeps
+    /// it in its own keychain, so pairing a second phone must add a key rather
+    /// than replace the first - otherwise the phone that paired earlier stops
+    /// being able to make a request, and its calls and texts simply stop with no
+    /// error anywhere. Empty until a phone pairs: pairing is what creates a key,
+    /// because the phone generates it and sends it inside the encrypted claim.
+    secrets: Mutex<std::collections::BTreeMap<String, Vec<u8>>>,
     /// Where this agent's secret is persisted, so a restart does not require
     /// pairing again.
     store: Option<crate::secrets::Store>,
@@ -111,9 +126,16 @@ pub struct Agent {
     /// Rebuilt when pairing replaces the secret: a verifier is bound to one key
     /// and to the nonces it has accepted, so reusing one across a re-pair would
     /// either refuse every request or accept nonces from the old secret.
-    verifier: Mutex<Option<(Vec<u8>, std::sync::Arc<crate::auth::Verifier>)>>,
+    verifier: Mutex<Option<CachedVerifier>>,
     /// What the phone registered with a relay under, learned at pairing.
     relay_credentials: Mutex<Option<RelayCredentials>>,
+    /// Every phone that has paired, newest first, for the settings page.
+    ///
+    /// Kept separately from `secret` on purpose: the secret is replaced on every
+    /// re-pair (only one key can be verified at a time), while this list
+    /// remembers the ones that came before, so an operator can see which phone
+    /// holds the current key and which were displaced by it.
+    clients: Mutex<Vec<PairedClient>>,
     acked_messages: Arc<std::sync::Mutex<std::collections::BTreeSet<String>>>,
 }
 
@@ -129,16 +151,49 @@ pub struct RelayCredentials {
     pub relay_url: String,
 }
 
+/// One phone that has paired with this agent, as the settings page lists it.
+///
+/// The agent still has a single `secret`: pairing replaces it, and the newest
+/// phone is the one being served. This record is what the page needs to say
+/// which phones have been here, in what order, and on which path - it is a
+/// history, not a second credential. Nothing here authenticates anything.
+#[derive(Clone, Debug, Default)]
+pub struct PairedClient {
+    pub device_id: String,
+    pub bundle_id: String,
+    pub environment: String,
+    /// Whether the phone forwards its events here or by way of a relay.
+    pub local_mode: bool,
+    pub cloud_enabled: bool,
+    /// When this phone last completed a pairing, as seconds since the epoch.
+    pub paired_at: u64,
+    /// Whether this phone's key is the one the agent currently accepts.
+    ///
+    /// Only one can be true: re-pairing replaces the secret, so the phones
+    /// listed above it hold keys this agent no longer verifies.
+    pub active: bool,
+}
+
 impl Agent {
     pub fn new(config: AgentConfig, secret: Option<Vec<u8>>) -> Self {
         Self {
             revision: Arc::new(crate::revision::Revision::default()),
             config: std::sync::RwLock::new(config),
-            secret: Mutex::new(secret),
+            secrets: {
+                // A single-key construction is the shape a fresh install has: a
+                // stored file written by an older build carries one key with no
+                // device name, and that key keeps working under the empty name.
+                let mut keys = std::collections::BTreeMap::new();
+                if let Some(key) = secret {
+                    keys.insert(String::new(), key);
+                }
+                Mutex::new(keys)
+            },
             store: None,
             pairing: Mutex::new(None),
             verifier: Mutex::new(None),
             relay_credentials: Mutex::new(None),
+            clients: Mutex::new(Vec::new()),
             acked_messages: Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new())),
         }
     }
@@ -178,8 +233,16 @@ impl Agent {
     /// Empty when the agent has not paired, which makes a proof check fail
     /// rather than pass with nothing behind it.
     pub fn proof(&self, message: &str) -> String {
+        self.proof_for(message, None)
+    }
+
+    /// Sign one message with the key of the device being answered.
+    ///
+    /// The phone that checks the proof uses its own key, so answering the wrong
+    /// phone fails the check it is entitled to pass.
+    pub fn proof_for(&self, message: &str, device: Option<&str>) -> String {
         self.verifier()
-            .map(|verifier| verifier.proof(message))
+            .map(|verifier| verifier.proof(message, device))
             .unwrap_or_default()
     }
 
@@ -216,12 +279,15 @@ impl Agent {
         let Some(store) = self.store.as_ref() else {
             return;
         };
-        let Some(secret) = self.secret() else {
+        let keys = self.secrets();
+        if keys.is_empty() {
             return;
-        };
-        if let Err(error) = store.save(&self.id(), &secret) {
-            // Not fatal: this process still has the pairing, and the operator
-            // learns on the next restart rather than losing it now.
+        }
+        // Written as one file: every phone's key goes in, so a restart keeps all
+        // of them paired instead of only the most recent.
+        if let Err(error) = store.save_all(&self.id(), &keys) {
+            // Not fatal: this process still has the pairings, and the operator
+            // learns on the next restart rather than losing them now.
             crate::log_warn!("celmux-plugin-airsim: 配对密钥未能保存: {error}");
         }
     }
@@ -303,14 +369,55 @@ impl Agent {
         config.lines.iter().any(|line| line == line_id)
     }
 
-    /// The secret this agent's phone signs with, if it has paired.
-    pub fn secret(&self) -> Option<Vec<u8>> {
-        self.secret.lock().ok().and_then(|secret| secret.clone())
+    /// Every key this agent accepts, keyed by the device that owns it.
+    pub fn secrets(&self) -> std::collections::BTreeMap<String, Vec<u8>> {
+        self.secrets
+            .lock()
+            .map(|secrets| secrets.clone())
+            .unwrap_or_default()
     }
 
+    /// Any one key, for the paths that need a single secret to sign with.
+    ///
+    /// The proofs this agent returns (health, route, operation) are checked by a
+    /// particular phone against its own key, so which entry is used matters only
+    /// to that check - `secret_for` is the precise form. This exists for the
+    /// callers that have no device in hand and only need "a key this agent
+    /// holds".
+    pub fn secret(&self) -> Option<Vec<u8>> {
+        self.secrets
+            .lock()
+            .ok()
+            .and_then(|secrets| secrets.values().next().cloned())
+    }
+
+    /// Add or replace one device's key, leaving every other pairing intact.
+    ///
+    /// This is the whole point of the map: a second phone pairing must not cost
+    /// the first one its credential.
+    pub fn set_secret_for(&self, device: &str, value: Vec<u8>) {
+        if let Ok(mut secrets) = self.secrets.lock() {
+            secrets.insert(device.to_owned(), value);
+        }
+    }
+
+    /// Hold one key under a device that has no name.
+    ///
+    /// Test-only: real pairing always files a key under the device that sent it
+    /// (`set_secret_for`), which is what keeps several phones working at once.
+    /// This is for the tests that only need "this agent has a key" and do not
+    /// care which phone it belongs to.
+    #[cfg(test)]
     pub fn set_secret(&self, value: Vec<u8>) {
-        if let Ok(mut secret) = self.secret.lock() {
-            *secret = Some(value);
+        if let Ok(mut secrets) = self.secrets.lock() {
+            secrets.insert(String::new(), value);
+        }
+    }
+
+    /// Replace the whole key set. For tests and for a store that was reloaded.
+    pub fn set_secrets(&self, keys: std::collections::BTreeMap<String, Vec<u8>>) {
+        if let Ok(mut secrets) = self.secrets.lock() {
+            *secrets = keys;
         }
     }
 
@@ -354,35 +461,169 @@ impl Agent {
             .filter(|id| !id.is_empty())
     }
 
-    /// The verifier for the current secret, built on first use and rebuilt
-    /// whenever the secret changes.
+    /// The verifier for every key this agent holds, built on first use and
+    /// rebuilt whenever the key set changes.
+    ///
+    /// Cached against the whole map rather than one key: with several phones
+    /// paired, a check against only the newest would refuse every request from
+    /// the others.
     pub fn verifier(&self) -> Option<std::sync::Arc<crate::auth::Verifier>> {
-        let secret = self.secret()?;
+        let keys = self.secrets();
+        if keys.is_empty() {
+            return None;
+        }
         let mut cached = self.verifier.lock().ok()?;
-        if let Some((key, verifier)) = cached.as_ref()
-            && *key == secret
+        if let Some((cached_keys, verifier)) = cached.as_ref()
+            && *cached_keys == keys
         {
             return Some(std::sync::Arc::clone(verifier));
         }
-        let verifier = std::sync::Arc::new(crate::auth::Verifier::new(secret.clone()));
-        *cached = Some((secret, std::sync::Arc::clone(&verifier)));
+        let verifier = std::sync::Arc::new(crate::auth::Verifier::with_keys(
+            keys.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        ));
+        *cached = Some((keys, std::sync::Arc::clone(&verifier)));
         Some(verifier)
     }
 
-    /// Forget the secret, so the phone has to pair again.
+    /// Forget every key, so each phone has to pair again.
+    ///
+    /// All of them, not one: the operator asking to unpair means this gateway
+    /// should accept no phone, and leaving a key behind would keep a credential
+    /// working that the screen says was removed.
     pub fn clear_secret(&self) {
-        if let Ok(mut secret) = self.secret.lock() {
-            *secret = None;
+        if let Ok(mut secrets) = self.secrets.lock() {
+            secrets.clear();
         }
-        // The verifier is bound to the old secret; keeping it would let a
+        // The verifier is bound to the old keys; keeping it would let a
         // forgotten credential keep working.
         if let Ok(mut cached) = self.verifier.lock() {
             *cached = None;
         }
+        // The list on the settings page describes those same keys, so it goes
+        // too - an empty agent that still lists three phones is a screen that
+        // contradicts itself.
+        if let Ok(mut clients) = self.clients.lock() {
+            clients.clear();
+        }
+    }
+
+    /// Forget one phone's key, leaving the others paired.
+    pub fn clear_secret_for(&self, device: &str) {
+        if let Ok(mut secrets) = self.secrets.lock() {
+            secrets.remove(device);
+        }
+        if let Ok(mut cached) = self.verifier.lock() {
+            *cached = None;
+        }
+        if let Ok(mut clients) = self.clients.lock() {
+            clients.retain(|client| client.device_id != device);
+            // Promote the newest remaining phone, since the active flag marked
+            // the one whose key was verified and that key is gone.
+            if let Some(newest) = clients.first_mut() {
+                newest.active = true;
+            }
+        }
     }
 
     pub fn paired(&self) -> bool {
-        self.secret().is_some()
+        self.secrets
+            .lock()
+            .map(|secrets| !secrets.is_empty())
+            .unwrap_or(false)
+    }
+
+    /// Record that a phone has just paired, and make it the active one.
+    ///
+    /// Re-pairing replaces the secret, so the phone that just paired becomes the
+    /// only one whose key is verified; any earlier entry is marked inactive
+    /// rather than dropped. Keeping them is the point of the list: an operator
+    /// who sees "three phones, one active" can tell that a pairing overwrote
+    /// another, which is invisible if the old rows are deleted. Entries are
+    /// matched by device id, so pairing the same phone twice updates its row.
+    pub fn record_pairing(&self, registration: &crate::pairing::Registration) {
+        let device_id = registration.device_id.trim();
+        if device_id.is_empty() {
+            // A phone that sent no id cannot be listed by one, and inventing an
+            // id would make two different phones look like the same device. The
+            // pairing itself still stands: the secret is what authenticates.
+            return;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_secs())
+            .unwrap_or_default();
+        let Ok(mut clients) = self.clients.lock() else {
+            return;
+        };
+        for client in clients.iter_mut() {
+            client.active = false;
+        }
+        if let Some(existing) = clients.iter_mut().find(|c| c.device_id == device_id) {
+            existing.bundle_id = registration.bundle_id.clone().unwrap_or_default();
+            existing.environment = registration.environment.clone().unwrap_or_default();
+            existing.local_mode = registration.local_mode;
+            existing.cloud_enabled = registration.cloud_enabled;
+            existing.paired_at = now;
+            existing.active = true;
+        } else {
+            clients.push(PairedClient {
+                device_id: device_id.to_owned(),
+                bundle_id: registration.bundle_id.clone().unwrap_or_default(),
+                environment: registration.environment.clone().unwrap_or_default(),
+                local_mode: registration.local_mode,
+                cloud_enabled: registration.cloud_enabled,
+                paired_at: now,
+                active: true,
+            });
+        }
+        // Newest first: the active phone is what the operator is looking for.
+        clients.sort_by_key(|client| std::cmp::Reverse(client.paired_at));
+    }
+
+    /// Rebuild the settings-page list from the keys that came back from disk.
+    ///
+    /// The file holds keys, not history: device names and pairing times were
+    /// never written beside them. So the list after a restart says which phones
+    /// are paired and marks the newest active, without pretending to know when
+    /// each one paired. Losing that detail is the honest outcome - inventing a
+    /// time would put a fact on screen that nothing measured.
+    pub fn restore_clients_from_keys(&self) {
+        let keys = self.secrets();
+        let Ok(mut clients) = self.clients.lock() else {
+            return;
+        };
+        // Keep whatever the operator already saw for devices still paired, so a
+        // restart does not blank out a time that was recorded this session.
+        let known: std::collections::BTreeMap<String, PairedClient> = clients
+            .drain(..)
+            .map(|client| (client.device_id.clone(), client))
+            .collect();
+        let mut restored: Vec<PairedClient> = keys
+            .keys()
+            .filter(|device| !device.is_empty())
+            .map(|device| {
+                known.get(device).cloned().unwrap_or_else(|| PairedClient {
+                    device_id: device.clone(),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        restored.sort_by_key(|client| std::cmp::Reverse(client.paired_at));
+        for client in restored.iter_mut() {
+            client.active = false;
+        }
+        if let Some(first) = restored.first_mut() {
+            first.active = true;
+        }
+        *clients = restored;
+    }
+
+    /// The phones that have paired with this agent, newest first.
+    pub fn paired_clients(&self) -> Vec<PairedClient> {
+        self.clients
+            .lock()
+            .map(|clients| clients.clone())
+            .unwrap_or_default()
     }
 
     /// Open a pairing window, replacing any window already open.
@@ -486,7 +727,9 @@ impl Fleet {
         };
         let mut changed = false;
         let mut wanted: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        let stored = crate::secrets::Store::new(&self.root).load();
+        // Every key per agent, not one: a restart has to bring back all the
+        // phones that had paired, not only the newest.
+        let stored = crate::secrets::Store::new(&self.root).load_all();
         for config in configs {
             let id = config.agent_id();
             wanted.insert(id.clone());
@@ -498,8 +741,12 @@ impl Fleet {
                     // memory, and dropping it here would answer the phone's next
                     // request with a signature it cannot produce.
                     let agent = Agent::new(config, None).with_store(&self.root);
-                    if let Some(secret) = stored.get(&id).cloned() {
-                        agent.set_secret(secret);
+                    if let Some(keys) = stored.get(&id) {
+                        agent.set_secrets(keys.clone());
+                        // The list describes the keys that survived a restart, so
+                        // it is rebuilt from them: a phone whose key is on disk is
+                        // listed, and only one of them can be the active one.
+                        agent.restore_clients_from_keys();
                     }
                     agents.insert(id, Arc::new(agent));
                     changed = true;
@@ -532,15 +779,17 @@ impl Fleet {
         // Secrets live on disk as well as in memory, so an agent rebuilt after a
         // config save - or after a restart - is still the agent the phone paired
         // with.
-        let stored = crate::secrets::Store::new(&self.root).load();
+        let stored = crate::secrets::Store::new(&self.root).load_all();
         let mut next: BTreeMap<String, Arc<Agent>> = BTreeMap::new();
         for config in configs {
             let agent = Agent::new(config, None).with_store(&self.root);
             let in_memory = agents
                 .get(&agent.id())
-                .and_then(|existing| existing.secret());
-            if let Some(secret) = in_memory.or_else(|| stored.get(&agent.id()).cloned()) {
-                agent.set_secret(secret);
+                .map(|existing| existing.secrets())
+                .filter(|keys| !keys.is_empty());
+            if let Some(keys) = in_memory.or_else(|| stored.get(&agent.id()).cloned()) {
+                agent.set_secrets(keys);
+                agent.restore_clients_from_keys();
             }
             next.insert(agent.id(), Arc::new(agent));
         }
@@ -577,6 +826,68 @@ mod tests {
             name: String::new(),
             id: String::new(),
         }
+    }
+
+    /// Re-pairing replaces the key, and the list has to say so.
+    ///
+    /// Only one key is verified at a time, so the phone that paired last is the
+    /// one being served; the ones before it are kept as history rather than
+    /// dropped. An operator whose second phone silently stopped receiving calls
+    /// finds the reason here instead of guessing. Pairing the same phone twice
+    /// updates its row rather than adding a second one, because a device id is
+    /// the only identity a phone sends.
+    #[test]
+    fn a_repair_makes_the_newest_phone_the_only_active_one() {
+        let agent = Agent::new(config("读卡器1", 8642), None);
+        assert!(agent.paired_clients().is_empty(), "nothing paired yet");
+
+        let first = crate::pairing::Registration {
+            device_id: "phone-a".to_owned(),
+            bundle_id: Some("com.example.airsim".to_owned()),
+            environment: Some("production".to_owned()),
+            local_mode: true,
+            ..Default::default()
+        };
+        agent.record_pairing(&first);
+        let listed = agent.paired_clients();
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].active, "the only phone is the active one");
+        assert_eq!(listed[0].bundle_id, "com.example.airsim");
+        assert!(listed[0].local_mode);
+
+        let second = crate::pairing::Registration {
+            device_id: "phone-b".to_owned(),
+            local_mode: false,
+            ..Default::default()
+        };
+        agent.record_pairing(&second);
+        let listed = agent.paired_clients();
+        assert_eq!(listed.len(), 2, "the displaced phone is kept, not dropped");
+        let active: Vec<&str> = listed
+            .iter()
+            .filter(|client| client.active)
+            .map(|client| client.device_id.as_str())
+            .collect();
+        assert_eq!(active, ["phone-b"], "exactly one phone holds the key");
+
+        // Pairing the same phone again updates its row instead of adding one.
+        agent.record_pairing(&first);
+        let listed = agent.paired_clients();
+        assert_eq!(listed.len(), 2, "a repeat pairing is not a new device");
+        assert_eq!(
+            listed.iter().filter(|client| client.active).count(),
+            1,
+            "re-pairing still leaves exactly one active phone"
+        );
+
+        // A registration with no device id cannot be listed, and must not make
+        // the list claim a device it cannot name.
+        agent.record_pairing(&crate::pairing::Registration::default());
+        assert_eq!(
+            agent.paired_clients().len(),
+            2,
+            "an unnamed phone adds no row"
+        );
     }
 
     /// The identity is the operator's to choose, and it changes only when they

@@ -188,6 +188,18 @@ pub struct Registration {
     /// the relay the phone registered with, and using them from here would push to
     /// a token this installation's key cannot sign for.
     pub relay_url: Option<String>,
+    /// What the phone says it is, for the paired-devices list.
+    ///
+    /// Shown to the operator and nothing else: these never take part in
+    /// authentication, so a phone that sends none of them still pairs. An empty
+    /// value here means the field was absent, not that the phone is broken.
+    pub bundle_id: Option<String>,
+    /// `development` or `production`, as the phone's own push environment.
+    pub environment: Option<String>,
+    /// Whether the phone sends its events here (`local_mode`) or by way of a
+    /// relay. It decides which path an event takes, so the list says it.
+    pub local_mode: bool,
+    pub cloud_enabled: bool,
 }
 
 pub fn parse_registration(bytes: &[u8]) -> Result<Registration, String> {
@@ -210,11 +222,24 @@ pub fn parse_registration(bytes: &[u8]) -> Result<Registration, String> {
             .filter(|text| !text.is_empty())
             .map(str::to_owned)
     };
+    // Booleans default to false when absent: a phone that does not send them is
+    // not claiming either mode, and the list shows "unknown" rather than
+    // inventing one.
+    let flag = |key: &str| {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    };
     Ok(Registration {
         device_id: text("device_id"),
         vowlan_secret: optional("vowlan_secret"),
         device_secret: optional("device_secret"),
         relay_url: optional("relay_url"),
+        bundle_id: optional("bundle_id"),
+        environment: optional("environment"),
+        local_mode: flag("local_mode"),
+        cloud_enabled: flag("cloud_enabled"),
     })
 }
 

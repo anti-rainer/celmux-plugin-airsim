@@ -334,6 +334,19 @@
       <div id="pair-code" style="display:none;margin-top:14px"></div>
     </div>
 
+    <!-- Its own card, after the one it belongs to: pairing is an action with a
+         code to read and a button to press, while this is a standing list to
+         check - a phone that stopped receiving calls is answered here, and
+         burying it inside the pairing form made it look like part of pairing
+         rather than something that persists after it. -->
+    <div class="card">
+      <div class="section-head">
+        <div class="section-title">已配对设备</div>
+        <span class="tag" id="clients-count">0 台</span>
+      </div>
+      <div id="paired-clients"></div>
+    </div>
+
     <div class="card">
       <div class="section-head">
         <div class="section-title">云端 Relay</div>
@@ -937,6 +950,88 @@ function renderPairing() {
   } else {
     code.style.display = 'none';
     code.replaceChildren();
+  }
+  renderPairedClients(agent);
+}
+
+// The phones that have paired with this agent.
+//
+// One row per device id, newest first. The agent verifies exactly one key at a
+// time, so the row marked 当前 carries the credential in use and the others are
+// phones whose pairing was replaced by a later one - shown rather than hidden,
+// because "why did my other phone stop receiving calls" has this list as its
+// answer. A device id is the only identity the phone sends, so the row leads
+// with it; bundle and environment are shown when present and omitted when the
+// phone did not send them, instead of printing empty placeholders.
+function renderPairedClients(agent) {
+  const host = document.getElementById('paired-clients');
+  if (!host) return;
+  const clients = (agent && agent.clients) || [];
+  const count = document.getElementById('clients-count');
+  if (count) {
+    count.className = clients.length ? 'tag ok' : 'tag';
+    count.textContent = `${clients.length} 台`;
+  }
+  if (!clients.length) {
+    // An agent that IS paired but lists nothing paired before this build: the
+    // old secret file held only the agent id and the key, so no device identity
+    // was ever recorded and none can be recovered. Saying so is the difference
+    // between "your other phone is missing from this list" and "nothing is
+    // recorded yet", which an operator cannot tell from an empty box.
+    const text = agent && agent.paired
+      ? '这台已配对，但配对发生在本版本之前：当时只保存密钥、没有记录设备身份，重新配对一次即可出现在此列表。'
+      : '尚未配对任何设备。';
+    host.replaceChildren(el('p', { className: 'hint', style: 'margin:0' }, [text]));
+    return;
+  }
+  const rows = clients.map(client => {
+    const facts = [];
+    if (client.bundle_id) facts.push(client.bundle_id);
+    if (client.environment) facts.push(client.environment);
+    facts.push(client.local_mode ? '本地直连' : '经 Relay');
+    if (client.paired_at) {
+      const when = new Date(client.paired_at * 1000);
+      if (!Number.isNaN(when.getTime())) facts.push(when.toLocaleString());
+    }
+    return el('div', { className: 'row', style: 'justify-content:space-between' }, [
+      el('div', { style: 'min-width:0' }, [
+        el('div', { className: 'mono', style: 'font-size:12px;overflow-wrap:anywhere' }, [
+          client.device_id,
+        ]),
+        el('div', { className: 'hint', style: 'margin:2px 0 0' }, [facts.join(' · ')]),
+      ]),
+      el('span', { className: 'row', style: 'gap:8px;flex-wrap:nowrap' }, [
+        el('span', { className: client.active ? 'tag ok' : 'tag' }, [
+          client.active ? '当前' : '仍持有密钥',
+        ]),
+        // Per-device revocation: with one key per phone, the lost one can be
+        // removed without making every other phone pair again.
+        el('button', {
+          className: 'danger',
+          style: 'font-size:11px;padding:2px 8px',
+          onclick: () => void forgetClient(client.device_id),
+        }, ['移除']),
+      ]),
+    ]);
+  });
+  // The heading lives on the card now, so the body is rows only.
+  host.replaceChildren(...rows);
+}
+
+// Detach one phone, leaving the others paired.
+async function forgetClient(deviceId) {
+  const note = document.getElementById('agent-note');
+  const id = agentID();
+  if (!id) return;
+  try {
+    await pluginFetch('/api/unpair', {
+      method: 'POST',
+      body: JSON.stringify({ agent_id: id, device_id: deviceId }),
+    });
+    if (note) note.textContent = `已移除 ${deviceId}`;
+    await refresh();
+  } catch (error) {
+    if (note) note.textContent = `移除失败：${error.message || error}`;
   }
 }
 
