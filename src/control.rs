@@ -997,12 +997,16 @@ impl Control {
                             self.revision.bump();
                         }
                         "call" => {
-                            // A ringing incoming call is the one event worth a
-                            // push: the phone is asleep and nothing else would
-                            // wake it. Everything else is a state change the
-                            // phone can read on its next poll.
+                            // Two different jobs share this frame. A ringing call
+                            // needs a VoIP push, because the phone is asleep and
+                            // nothing else wakes it. Every other phase needs a
+                            // background push when the relay is in use, because
+                            // there is no shared poll across networks - that push
+                            // is the only thing that stops a second phone ringing
+                            // after the first one answered or ended the call.
                             if let Some(payload) = frame.get("payload") {
                                 self.push_ringing_call(payload);
+                                self.report_call_phase(payload);
                             }
                             self.revision.bump();
                         }
@@ -1080,6 +1084,107 @@ impl Control {
     /// an early-media update), and pushing per event would ring the phone over and
     /// over for one call. Only `incoming` + `ringing` is a push, and the call id is
     /// remembered so a repeat is dropped.
+    /// Tell the relay that a call moved to another phase, so the other phones stop.
+    ///
+    /// The direct path needs nothing here: every client long-polls the same
+    /// revision, so one hangup wakes the rest by itself. Over a relay the phones
+    /// sit behind different networks and there is no shared poll - without this,
+    /// a phone that was not the one answered keeps ringing until its own ring
+    /// timeout, which is the "另一个设备一直在响" failure.
+    ///
+    /// Only sent when the call is one this gateway pushed: an unknown call has no
+    /// `call_uuid` to name it by, and the relay rejects an event without one. That
+    /// also keeps outgoing calls out, which no phone is waiting to ring for.
+    /// Tell the relay that this phone took the call, so the others stop offering it.
+    ///
+    /// The relay pushes this to the device's *alert* token rather than its VoIP
+    /// one: the phone that answered is awake, and the ones that need the news are
+    /// the ones asleep. `iphone` is the owner name because that is the client this
+    /// gateway serves; the relay's set is `watch` / `iphone` / `android`.
+    fn report_call_owner(&self, call_id: &str) {
+        let Some(context) = self.relay_context.clone() else {
+            return;
+        };
+        let call = {
+            let Ok(push) = self.call_push.lock() else {
+                return;
+            };
+            if push.call_id != call_id || push.uuid.is_empty() {
+                return;
+            }
+            crate::relay::IncomingCall {
+                call_id: call_id.to_owned(),
+                call_uuid: push.uuid.clone(),
+                call_secret: push.secret.clone(),
+                generation: push.generation,
+                ..Default::default()
+            }
+        };
+        if let Err(error) = context.agent.call_owner(&call, "iphone", "active") {
+            crate::log_warn!(
+                "celmux-plugin-airsim: 通话归属事件发送失败 call_id={call_id}: {error}"
+            );
+            return;
+        }
+        crate::log_info!(
+            "celmux-plugin-airsim: 通话归属已送往外接 relay call_id={call_id} owner=iphone"
+        );
+    }
+
+    fn report_call_phase(&self, payload: &Value) {
+        let call_id = payload.get("call_id").and_then(Value::as_str).unwrap_or("");
+        let state = payload.get("state").and_then(Value::as_str).unwrap_or("");
+        if call_id.is_empty() || state.is_empty() {
+            return;
+        }
+        let Some(context) = self.relay_context.clone() else {
+            return;
+        };
+        // The phases the relay accepts, and the source it accepts them from.
+        // Mapping rather than forwarding: `rejected` and `missed` are this side's
+        // words for "the call is over", and the relay's set has only `ended`.
+        let phase = match state {
+            "ringing" => "ringing",
+            "active" => "active",
+            "rejected" | "missed" | "ended" => "ended",
+            "failed" => "failed",
+            _ => return,
+        };
+        // The UUID and generation belong to the call this gateway pushed. Read
+        // under the lock, and dropped if the call changed underneath: sending a
+        // stale UUID would tell the relay about a call nobody is looking at.
+        let call = {
+            let Ok(push) = self.call_push.lock() else {
+                return;
+            };
+            if push.call_id != call_id || push.uuid.is_empty() {
+                return;
+            }
+            crate::relay::IncomingCall {
+                call_id: call_id.to_owned(),
+                call_uuid: push.uuid.clone(),
+                call_secret: push.secret.clone(),
+                generation: push.generation,
+                ..Default::default()
+            }
+        };
+        // `ringing` was already carried by the VoIP push itself, so re-sending it
+        // as a state change would duplicate the same moment.
+        if phase == "ringing" {
+            return;
+        }
+        if let Err(error) = context.agent.call_state(&call, phase, "agent", "") {
+            crate::log_warn!(
+                "celmux-plugin-airsim: 通话状态事件发送失败 call_id={call_id} phase={phase}: {error}"
+            );
+            return;
+        }
+        crate::log_info!(
+            "celmux-plugin-airsim: 通话状态已送往外接 relay call_id={call_id} phase={phase} relay={}",
+            context.agent.target().base()
+        );
+    }
+
     fn push_ringing_call(&self, payload: &Value) {
         let direction = payload
             .get("direction")
@@ -1929,6 +2034,13 @@ impl Control {
                 // phone took has to move it or the screen keeps showing the
                 // state from before the tap.
                 self.revision.bump();
+                // Over a relay, the phones that did not act learn it here. Only an
+                // answer is an ownership change worth announcing: a hangup is
+                // already covered by the call's own ended state, and a reject
+                // leaves nobody owning it.
+                if action == "answer" {
+                    self.report_call_owner(&call_id);
+                }
                 Response::ok(json!({"ok": true, "call_id": call_id}))
             }
             Err(error) => {
@@ -1994,7 +2106,16 @@ impl Control {
             .client
             .call_action_with_digits(forwarded, call_id, digit)
         {
-            Ok(_) => Response::ok(json!({"ok": true})),
+            Ok(_) => {
+                // The v2 path had no revision bump, so acting through it left the
+                // phone's own screen showing the state from before the tap until
+                // something else changed. The v1 route did bump; both do now.
+                self.revision.bump();
+                if forwarded == "answer" {
+                    self.report_call_owner(call_id);
+                }
+                Response::ok(json!({"ok": true}))
+            }
             Err(error) => Response::error(502, "Bad Gateway", "action_failed", &error.to_string()),
         }
     }
