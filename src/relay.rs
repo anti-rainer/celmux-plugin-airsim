@@ -468,11 +468,43 @@ impl State {
         self.owner().map(|device| device.voip_token)
     }
 
-    /// The alert token, for an ordinary notification such as a received message.
-    pub fn alert_token(&self) -> Option<String> {
-        self.owner()
-            .map(|device| device.alert_token)
-            .filter(|token| !token.is_empty())
+    /// Every registered phone's VoIP token, in a stable order.
+    ///
+    /// One agent can serve several phones, and a ringing call has to reach all
+    /// of them: the caller does not care which handset the subscriber picks up,
+    /// and a phone that never got the push cannot ring. `voip_token` answers
+    /// "which one does this process act as", which is a different question -
+    /// events it originates are signed as one device, but a call it pushes is
+    /// for anyone listening.
+    ///
+    /// The order is by device id so a repeated push is byte-identical, which
+    /// matters because the relay deduplicates on the payload.
+    pub fn voip_tokens(&self) -> Vec<String> {
+        let Ok(inner) = self.inner.lock() else {
+            return Vec::new();
+        };
+        inner
+            .devices
+            .values()
+            .filter(|device| !device.voip_token.is_empty())
+            .map(|device| device.voip_token.clone())
+            .collect()
+    }
+
+    /// Every registered phone's alert token, in a stable order.
+    ///
+    /// Same reasoning as `voip_tokens`: a message notification is for every
+    /// phone that could show it, not only the one this process signs as.
+    pub fn alert_tokens(&self) -> Vec<String> {
+        let Ok(inner) = self.inner.lock() else {
+            return Vec::new();
+        };
+        inner
+            .devices
+            .values()
+            .filter(|device| !device.alert_token.is_empty())
+            .map(|device| device.alert_token.clone())
+            .collect()
     }
 
     fn owner(&self) -> Option<Device> {
@@ -908,6 +940,21 @@ mod tests {
             state.voip_token().as_deref(),
             Some("voip-a"),
             "本网关推的是最先登记的那台手机"
+        );
+
+        // A ringing call is for every registered handset, not only the one this
+        // process signs as. Pushing the first registration alone left the second
+        // phone silent: the caller had no way to know which handset would be
+        // picked up, and a phone that never got the push cannot ring.
+        assert_eq!(
+            state.voip_tokens(),
+            vec!["voip-b".to_owned(), "voip-a".to_owned()],
+            "两台设备的 VoIP token 都要在推送表里，顺序按 device id 稳定"
+        );
+        assert_eq!(
+            state.alert_tokens(),
+            vec!["alert-a".to_owned()],
+            "只有登记了 alert token 的设备进短信推送表"
         );
         let android_token = state
             .devices()

@@ -288,12 +288,15 @@ fn receive_call(context: &Context, request: &Request) -> Response {
     // The push itself. Everything above decided whether to send it; this is the
     // only place in the plugin that uses the APNs key, which is what makes the
     // key unnecessary when the relay is somebody else's.
-    let token = match context.state.voip_token() {
-        Some(token) if !token.is_empty() => token,
-        _ => {
-            return Response::error(409, "Conflict", "no_token", "手机尚未注册推送 token");
-        }
-    };
+    //
+    // One agent can serve several phones and a ringing call has to reach all of
+    // them: a phone that never got the push cannot ring, and the subscriber may
+    // answer on any handset. Pushing only the first registration is what left
+    // the second phone silent while the first rang.
+    let tokens = context.state.voip_tokens();
+    if tokens.is_empty() {
+        return Response::error(409, "Conflict", "no_token", "手机尚未注册推送 token");
+    }
     let mut payload = json!({
         "aps": {"content-available": 1},
         "event": "incoming_call",
@@ -311,18 +314,47 @@ fn receive_call(context: &Context, request: &Request) -> Response {
     if !call.media_url.is_empty() {
         payload["media_url"] = json!(call.media_url);
     }
-    let outcome = context
-        .pusher()
-        .push_voip(&token, &payload, &call.call_uuid, call.expires_unix);
-    if !outcome.status.is_some_and(crate::apns::Outcome::accepted) {
-        crate::log_warn!(
-            "celmux-plugin-airsim: APNs 推送未受理 call_id={} {}",
-            call.call_id,
-            outcome.describe()
-        );
-        return Response::error(502, "Bad Gateway", "push_failed", &outcome.describe());
+    // Every phone gets the same payload and the same collapse id, so the call
+    // looks like one call to each of them rather than a fresh one per push.
+    let mut accepted = 0_usize;
+    let mut failures = Vec::new();
+    for token in &tokens {
+        let outcome =
+            context
+                .pusher()
+                .push_voip(token, &payload, &call.call_uuid, call.expires_unix);
+        if outcome.status.is_some_and(crate::apns::Outcome::accepted) {
+            accepted += 1;
+        } else {
+            failures.push(outcome.describe());
+        }
     }
-    Response::ok(json!({"accepted": true, "call_id": call.call_id}))
+    if accepted == 0 {
+        crate::log_warn!(
+            "celmux-plugin-airsim: APNs 推送未受理 call_id={} 全部 {} 台设备失败: {}",
+            call.call_id,
+            tokens.len(),
+            failures.join("; ")
+        );
+        return Response::error(502, "Bad Gateway", "push_failed", &failures.join("; "));
+    }
+    // A partial delivery is still a ringing call: reporting failure would make
+    // the caller believe nobody was reached while some handset is ringing.
+    if !failures.is_empty() {
+        crate::log_warn!(
+            "celmux-plugin-airsim: APNs 部分推送失败 call_id={} 已受理 {}/{} {}",
+            call.call_id,
+            accepted,
+            tokens.len(),
+            failures.join("; ")
+        );
+    }
+    Response::ok(json!({
+        "accepted": true,
+        "call_id": call.call_id,
+        "devices": tokens.len(),
+        "delivered": accepted,
+    }))
 }
 
 /// Run one command a relay handed us, and report how it ended.
@@ -433,12 +465,16 @@ fn signing_credentials(context: &Arc<Context>) -> Option<crate::relay_agent::Cre
 /// this with its own key, and posting the event to ourselves over loopback would
 /// be the plaintext path that does not exist here.
 pub fn deliver_sms_locally(context: &Arc<Context>, event: &crate::relay_agent::SmsEvent) {
-    let token = match context.state.alert_token() {
-        Some(token) if !token.is_empty() => token,
+    // Every phone that can show a message gets it. A message is not addressed to
+    // one handset: the subscriber reads it on whichever phone is in hand, and a
+    // push to only the first registration left the others showing nothing until
+    // their next poll.
+    let tokens = context.state.alert_tokens();
+    if tokens.is_empty() {
         // Without an alert token there is no push channel for a message. The
         // phone still gets it on its next poll, so this is not an error.
-        _ => return,
-    };
+        return;
+    }
     let payload = json!({
         "aps": {
             "alert": {"title": event.sender, "body": event.content},
@@ -461,13 +497,20 @@ pub fn deliver_sms_locally(context: &Arc<Context>, event: &crate::relay_agent::S
     });
     // An alert push is addressed to the bare bundle id, not `<bundle>.voip`: it is
     // an ordinary notification, and the wrong topic is answered `TopicDisallowed`.
-    let outcome = context
-        .pusher()
-        .push_alert(&token, &payload, &event.delivery_id);
+    let mut delivered = 0_usize;
+    for token in &tokens {
+        let outcome = context
+            .pusher()
+            .push_alert(token, &payload, &event.delivery_id);
+        if outcome.status.is_some_and(crate::apns::Outcome::accepted) {
+            delivered += 1;
+        }
+    }
     crate::log_info!(
-        "celmux-plugin-airsim: 短信推送 delivery_id={} {}",
+        "celmux-plugin-airsim: 短信推送 delivery_id={} 已受理 {}/{}",
         event.delivery_id,
-        outcome.describe()
+        delivered,
+        tokens.len()
     );
 }
 
